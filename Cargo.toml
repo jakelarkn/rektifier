@@ -41,6 +41,7 @@ deadpool-postgres = "0.14"
 async-trait = "0.1"
 bytes = "1"
 base64 = "0.22"
+http = "1"
 
 [profile.dev]
 opt-level = 0
