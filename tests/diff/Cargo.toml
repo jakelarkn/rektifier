@@ -1,0 +1,8 @@
+[package]
+name = "rekt-diff-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Differential tests: compare rektifier responses against dynamodb-local"
+publish = false

@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rekt-protocol",
+    "crates/rekt-sigv4",
+    "crates/rekt-storage",
+    "crates/rekt-storage-libpq",
+    "crates/rekt-translator",
+    "crates/rekt-server",
+    "crates/rektifier",
+    "tests/diff",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.82"
+repository = "https://github.com/jake/rektifier"
+homepage = "https://github.com/jake/rektifier"
+description = "DynamoDB-compatible API in front of PostgreSQL"
+
+[workspace.metadata.rektifier]
+name = "rektifier"
+tagline = "rektify the closed API: speak DynamoDB, store in Postgres"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+hyper = "1"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "catch-panic"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+deadpool-postgres = "0.14"
+async-trait = "0.1"
+bytes = "1"
+base64 = "0.22"
+
+[profile.dev]
+opt-level = 0
+debug = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

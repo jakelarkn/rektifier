@@ -1,0 +1,6 @@
+target/
+.git/
+.direnv/
+.envrc.local
+*.swp
+.DS_Store

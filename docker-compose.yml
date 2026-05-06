@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: rektifier-postgres
+    environment:
+      POSTGRES_USER: rektifier
+      POSTGRES_PASSWORD: rektifier
+      POSTGRES_DB: rektifier
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rektifier -d rektifier"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    container_name: rektifier-ddblocal
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    ports:
+      - "8000:8000"
+
+  adminer:
+    image: adminer:latest
+    container_name: rektifier-adminer
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

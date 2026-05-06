@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+.envrc.local
+.direnv/
+.DS_Store
+*.swp
+docs/plan/
