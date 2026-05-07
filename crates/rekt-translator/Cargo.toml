@@ -4,4 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "DynamoDB op + AST -> SQL fragment + bound params (backend-neutral)"
+description = "DynamoDB op + AST -> backend-neutral plan (storage layer call shape)"
+
+[dependencies]
+rekt-protocol = { path = "../rekt-protocol" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

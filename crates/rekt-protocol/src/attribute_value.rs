@@ -32,6 +32,25 @@ pub type Item = BTreeMap<String, AttributeValue>;
 
 const VARIANTS: &[&str] = &["S", "N", "B", "BOOL", "NULL", "L", "M", "SS", "NS", "BS"];
 
+impl AttributeValue {
+    /// The wire-format tag for this variant (`"S"`, `"N"`, `"BOOL"`, ...).
+    /// Useful for error messages that report a type mismatch.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::S(_) => "S",
+            Self::N(_) => "N",
+            Self::B(_) => "B",
+            Self::Bool(_) => "BOOL",
+            Self::Null => "NULL",
+            Self::L(_) => "L",
+            Self::M(_) => "M",
+            Self::Ss(_) => "SS",
+            Self::Ns(_) => "NS",
+            Self::Bs(_) => "BS",
+        }
+    }
+}
+
 impl Serialize for AttributeValue {
     fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
         let mut m = ser.serialize_map(Some(1))?;
