@@ -5,3 +5,8 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Backend storage trait for rektifier (no concrete backend)"
+
+[dependencies]
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

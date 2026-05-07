@@ -5,3 +5,14 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "tokio-postgres-backed storage backend for rektifier"
+
+[dependencies]
+rekt-storage = { path = "../rekt-storage" }
+async-trait = { workspace = true }
+deadpool-postgres = { workspace = true }
+tokio-postgres = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
