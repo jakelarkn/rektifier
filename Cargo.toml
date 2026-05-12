@@ -10,6 +10,7 @@ members = [
     "crates/rekt-meta",
     "crates/rekt-server",
     "crates/rektifier",
+    "crates/rekt-bench",
     "tests/diff",
 ]
 
@@ -17,7 +18,7 @@ members = [
 version = "0.0.1"
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.86"
 repository = "https://github.com/jake/rektifier"
 homepage = "https://github.com/jake/rektifier"
 description = "DynamoDB-compatible API in front of PostgreSQL"
@@ -45,6 +46,10 @@ bytes = "1"
 base64 = "0.22"
 http = "1"
 toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+hdrhistogram = "7"
+humantime = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [profile.dev]
 opt-level = 0

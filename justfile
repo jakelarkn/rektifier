@@ -75,3 +75,25 @@ smoke-ref:
 # expect UnknownOperationException 400 — useful sanity check that the server is up)
 smoke-ours:
     aws dynamodb list-tables --endpoint-url http://localhost:9000
+
+# Build the release bench binary
+bench-build:
+    cargo build -p rekt-bench --release
+
+# Run a quick (10s/target/workload) bench across all three targets for put + get.
+# Assumes: docker up + bootstrap-pg applied + rektifier running + ddb-local
+# `users` table created (`./target/release/rekt-bench setup-ddb-local`).
+bench-quick: bench-build
+    ./target/release/rekt-bench setup-ddb-local
+    @echo "=========================================="
+    @echo "PutItem"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target direct-pg  --workload put --concurrency 16 --duration 10s --warmup 2s
+    ./target/release/rekt-bench run --target rektifier  --workload put --concurrency 16 --duration 10s --warmup 2s
+    ./target/release/rekt-bench run --target ddb-local  --workload put --concurrency 16 --duration 10s --warmup 2s
+    @echo "=========================================="
+    @echo "GetItem"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target direct-pg  --workload get --concurrency 16 --duration 10s --warmup 2s --working-set 1000
+    ./target/release/rekt-bench run --target rektifier  --workload get --concurrency 16 --duration 10s --warmup 2s --working-set 1000
+    ./target/release/rekt-bench run --target ddb-local  --workload get --concurrency 16 --duration 10s --warmup 2s --working-set 1000
