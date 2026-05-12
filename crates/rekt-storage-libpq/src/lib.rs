@@ -76,10 +76,11 @@ impl ToSql for Bound<'_> {
         out: &mut BytesMut,
     ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
         match self.0 {
-            // `S` -> text. `N` -> numeric on the PG side: tokio-postgres binds
-            // the &str as text and PG implicitly casts to numeric via the
-            // column's declared type. (DDB N is sent over the wire as a
-            // string already, so we pass it through verbatim.)
+            // Both `S` and `N` write UTF-8 text bytes. For `N`, the parameter
+            // is bound as TEXT at the prepare-typed layer and the SQL contains
+            // an explicit `$N::numeric` cast; PG converts text→numeric at the
+            // SQL level. DDB N is already a string on the wire, so we pass it
+            // through verbatim.
             KeyValue::S(s) | KeyValue::N(s) => s.to_sql(ty, out),
             KeyValue::B(b) => {
                 let slice: &[u8] = b.as_ref();
@@ -88,14 +89,42 @@ impl ToSql for Bound<'_> {
         }
     }
 
-    fn accepts(_ty: &Type) -> bool {
-        // We trust upstream schema validation (translator + boot-time PG
-        // check) to ensure the column type matches the value variant; if
-        // it doesn't, PG will reject at execute time with a clear error.
-        true
+    fn accepts(ty: &Type) -> bool {
+        // We bind the underlying value as either text (for `S` / `N`) or as a
+        // byte slice (for `B`). For non-text columns (`numeric`), we force the
+        // parameter's PG type to TEXT via `prepare_typed` at the call site and
+        // apply an explicit `$N::numeric` cast in the SQL — that way PG never
+        // asks us to bind into a NUMERIC parameter directly and we don't have
+        // to encode PG's numeric binary wire format ourselves.
+        matches!(
+            *ty,
+            Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN | Type::BYTEA
+        )
     }
 
     tokio_postgres::types::to_sql_checked!();
+}
+
+/// SQL-level cast a parameter placeholder needs so PG accepts our text-formatted
+/// bytes against a non-text column. `S` binds as text → matches `text` natively;
+/// `B` binds as `&[u8]` → matches `bytea` natively; `N` binds as text but the
+/// column is `numeric`, so we have to spell `$N::numeric` to coerce.
+fn param_cast(kv: &KeyValue) -> &'static str {
+    match kv {
+        KeyValue::S(_) | KeyValue::B(_) => "",
+        KeyValue::N(_) => "::numeric",
+    }
+}
+
+/// PG type to declare for a `prepare_typed` slot bound from a `KeyValue`.
+/// We force `N` to bind as TEXT (paired with a `::numeric` SQL cast) instead
+/// of letting PG infer NUMERIC, because the text→numeric path is much simpler
+/// than implementing PG's numeric binary wire format in Rust.
+fn param_pg_type(kv: &KeyValue) -> Type {
+    match kv {
+        KeyValue::S(_) | KeyValue::N(_) => Type::TEXT,
+        KeyValue::B(_) => Type::BYTEA,
+    }
 }
 
 /// Common precondition: caller passed `sk` iff shape has `sk_col`.
@@ -117,7 +146,13 @@ fn map_pg_err(table: &str, e: tokio_postgres::Error) -> BackendError {
             name: table.to_string(),
         };
     }
-    BackendError::Other(e.to_string())
+    // `e.to_string()` collapses to "db error"; drill into the underlying
+    // DbError for the actual PG message + SQLSTATE.
+    let detail = match e.as_db_error() {
+        Some(db) => format!("{} ({})", db.message(), db.code().code()),
+        None => e.to_string(),
+    };
+    BackendError::Other(detail)
 }
 
 #[async_trait]
@@ -151,8 +186,12 @@ impl Backend for PgBackend {
             }
         };
 
+        let stmt = client
+            .prepare_typed_cached(&sql, &[Type::JSONB])
+            .await
+            .map_err(|e| map_pg_err(shape.table, e))?;
         client
-            .execute(&sql, &[&Json(item)])
+            .execute(&stmt, &[&Json(item)])
             .await
             .map_err(|e| map_pg_err(shape.table, e))?;
         Ok(())
@@ -172,20 +211,32 @@ impl Backend for PgBackend {
         let jsonb_col = quote_ident(shape.jsonb_col);
 
         let pk_bound = Bound(pk);
+        let pk_cast = param_cast(pk);
+        let pk_pg = param_pg_type(pk);
 
         let query_result = match (shape.sk_col, sk) {
             (None, _) => {
-                let sql = format!("SELECT {jsonb_col} FROM {table} WHERE {pk_col} = $1");
-                client.query_opt(&sql, &[&pk_bound]).await
+                let sql = format!("SELECT {jsonb_col} FROM {table} WHERE {pk_col} = $1{pk_cast}");
+                let stmt = client
+                    .prepare_typed_cached(&sql, &[pk_pg])
+                    .await
+                    .map_err(|e| map_pg_err(shape.table, e))?;
+                client.query_opt(&stmt, &[&pk_bound]).await
             }
             (Some(sk_col_name), Some(sk_val)) => {
                 let sk_col = quote_ident(sk_col_name);
                 let sk_bound = Bound(sk_val);
+                let sk_cast = param_cast(sk_val);
+                let sk_pg = param_pg_type(sk_val);
                 let sql = format!(
                     "SELECT {jsonb_col} FROM {table} \
-                     WHERE {pk_col} = $1 AND {sk_col} = $2"
+                     WHERE {pk_col} = $1{pk_cast} AND {sk_col} = $2{sk_cast}"
                 );
-                client.query_opt(&sql, &[&pk_bound, &sk_bound]).await
+                let stmt = client
+                    .prepare_typed_cached(&sql, &[pk_pg, sk_pg])
+                    .await
+                    .map_err(|e| map_pg_err(shape.table, e))?;
+                client.query_opt(&stmt, &[&pk_bound, &sk_bound]).await
             }
             (Some(_), None) => unreachable!("rejected by check_sk_shape above"),
         };
