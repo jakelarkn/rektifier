@@ -5,3 +5,22 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "axum HTTP server dispatching DynamoDB ops to translator + backend"
+
+[dependencies]
+rekt-protocol = { path = "../rekt-protocol" }
+rekt-sigv4 = { path = "../rekt-sigv4" }
+rekt-storage = { path = "../rekt-storage" }
+rekt-translator = { path = "../rekt-translator" }
+axum = "0.7"
+tower-http = { workspace = true, features = ["limit", "trace"] }
+http = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
