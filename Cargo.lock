@@ -628,6 +628,7 @@ name = "rekt-storage"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "bytes",
  "serde_json",
  "thiserror",
 ]
@@ -637,6 +638,7 @@ name = "rekt-storage-libpq"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "bytes",
  "deadpool-postgres",
  "rekt-storage",
  "serde_json",
@@ -649,7 +651,9 @@ dependencies = [
 name = "rekt-translator"
 version = "0.0.1"
 dependencies = [
+ "bytes",
  "rekt-protocol",
+ "rekt-storage",
  "serde_json",
  "thiserror",
 ]

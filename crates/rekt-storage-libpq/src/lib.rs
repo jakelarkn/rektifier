@@ -1,15 +1,21 @@
 //! `tokio-postgres` + `deadpool-postgres` backed implementation of [`Backend`].
 //!
-//! Each rektifier-side table `<name>` maps to a Postgres table `ddb_<name>`.
-//! Names are validated against DynamoDB's character class (`[A-Za-z0-9_.-]{3,255}`)
-//! before interpolation — Postgres does not bind identifiers as parameters,
-//! so validation is what keeps SQL injection off the table here.
+//! The operator owns the PG schema. Rektifier reads `TableShape` (column
+//! names) and `KeyValue` (typed key data) on every call, builds SQL with
+//! the right column identifiers spliced in, and binds parameters by their
+//! Rust type so PG receives `text` for `S`, `numeric` for `N` (parsed from
+//! the verbatim DDB number string), and `bytea` for `B`.
+//!
+//! Column identifiers are quoted with `"..."` and any embedded quotes are
+//! doubled — Postgres can't bind identifiers as parameters, so quoting is
+//! what keeps SQL injection off the table.
 
 use async_trait::async_trait;
+use bytes::BytesMut;
 use deadpool_postgres::{Manager, Pool};
-use rekt_storage::{Backend, BackendError};
+use rekt_storage::{Backend, BackendError, KeyValue, TableShape};
 use tokio_postgres::error::SqlState;
-use tokio_postgres::types::Json;
+use tokio_postgres::types::{IsNull, Json, ToSql, Type};
 use tokio_postgres::NoTls;
 
 pub struct PgBackend {
@@ -32,26 +38,76 @@ impl PgBackend {
         Ok(Self { pool })
     }
 
-    /// Validate a DynamoDB table name (`[A-Za-z0-9_.-]{3,255}`). Returns the
-    /// fully-qualified PG table name `ddb_<table>` ready to splice into SQL.
-    fn pg_table(table: &str) -> Result<String, BackendError> {
-        let valid_len = (3..=255).contains(&table.len());
-        let valid_chars = table
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.');
-        if !valid_len || !valid_chars {
-            return Err(BackendError::InvalidTableName {
-                name: table.to_string(),
-            });
-        }
-        Ok(format!("ddb_{table}"))
-    }
-
     async fn client(&self) -> Result<deadpool_postgres::Object, BackendError> {
         self.pool
             .get()
             .await
             .map_err(|e| BackendError::Other(format!("pool get failed: {e}")))
+    }
+}
+
+/// Quote a SQL identifier per Postgres rules: wrap in `"..."` and double
+/// any embedded `"`. Combined with the operator-owned schema (rektifier
+/// never invents identifier names), this is sufficient to block injection.
+fn quote_ident(ident: &str) -> String {
+    let mut out = String::with_capacity(ident.len() + 2);
+    out.push('"');
+    for c in ident.chars() {
+        if c == '"' {
+            out.push('"');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// Newtype that lets us pass a `&KeyValue` straight into tokio-postgres'
+/// parameter slot. We can't `impl ToSql for KeyValue` directly — orphan
+/// rules — and a `&dyn ToSql` returning helper has lifetime trouble for
+/// the `B` variant, so a tiny wrapper is the cleanest path.
+#[derive(Debug)]
+struct Bound<'a>(&'a KeyValue);
+
+impl ToSql for Bound<'_> {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        match self.0 {
+            // `S` -> text. `N` -> numeric on the PG side: tokio-postgres binds
+            // the &str as text and PG implicitly casts to numeric via the
+            // column's declared type. (DDB N is sent over the wire as a
+            // string already, so we pass it through verbatim.)
+            KeyValue::S(s) | KeyValue::N(s) => s.to_sql(ty, out),
+            KeyValue::B(b) => {
+                let slice: &[u8] = b.as_ref();
+                slice.to_sql(ty, out)
+            }
+        }
+    }
+
+    fn accepts(_ty: &Type) -> bool {
+        // We trust upstream schema validation (translator + boot-time PG
+        // check) to ensure the column type matches the value variant; if
+        // it doesn't, PG will reject at execute time with a clear error.
+        true
+    }
+
+    tokio_postgres::types::to_sql_checked!();
+}
+
+/// Common precondition: caller passed `sk` iff shape has `sk_col`.
+fn check_sk_shape(shape: &TableShape<'_>, sk: Option<&KeyValue>) -> Result<(), BackendError> {
+    match (shape.sk_col, sk) {
+        (Some(_), Some(_)) | (None, None) => Ok(()),
+        (Some(_), None) => Err(BackendError::MissingSortKey {
+            name: shape.table.to_string(),
+        }),
+        (None, Some(_)) => Err(BackendError::UnexpectedSortKey {
+            name: shape.table.to_string(),
+        }),
     }
 }
 
@@ -68,39 +124,84 @@ fn map_pg_err(table: &str, e: tokio_postgres::Error) -> BackendError {
 impl Backend for PgBackend {
     async fn put_item_raw(
         &self,
-        table: &str,
-        pk: &str,
-        sk: Option<&str>,
+        shape: &TableShape<'_>,
+        pk: &KeyValue,
+        sk: Option<&KeyValue>,
         item: &serde_json::Value,
     ) -> Result<(), BackendError> {
-        let pg_table = Self::pg_table(table)?;
-        let sk = sk.unwrap_or("");
+        check_sk_shape(shape, sk)?;
         let client = self.client().await?;
-        let sql = format!(
-            "INSERT INTO {pg_table} (pk, sk, item) VALUES ($1, $2, $3) \
-             ON CONFLICT (pk, sk) DO UPDATE SET item = EXCLUDED.item"
-        );
-        client
-            .execute(&sql, &[&pk, &sk, &Json(item)])
-            .await
-            .map_err(|e| map_pg_err(table, e))?;
+
+        let table = quote_ident(shape.table);
+        let pk_col = quote_ident(shape.pk_col);
+        let jsonb_col = quote_ident(shape.jsonb_col);
+
+        let item_json = Json(item);
+        let pk_bound = Bound(pk);
+
+        let exec_result = match (shape.sk_col, sk) {
+            (None, _) => {
+                let sql = format!(
+                    "INSERT INTO {table} ({pk_col}, {jsonb_col}) \
+                     VALUES ($1, $2) \
+                     ON CONFLICT ({pk_col}) \
+                     DO UPDATE SET {jsonb_col} = EXCLUDED.{jsonb_col}"
+                );
+                client.execute(&sql, &[&pk_bound, &item_json]).await
+            }
+            (Some(sk_col_name), Some(sk_val)) => {
+                let sk_col = quote_ident(sk_col_name);
+                let sk_bound = Bound(sk_val);
+                let sql = format!(
+                    "INSERT INTO {table} ({pk_col}, {sk_col}, {jsonb_col}) \
+                     VALUES ($1, $2, $3) \
+                     ON CONFLICT ({pk_col}, {sk_col}) \
+                     DO UPDATE SET {jsonb_col} = EXCLUDED.{jsonb_col}"
+                );
+                client
+                    .execute(&sql, &[&pk_bound, &sk_bound, &item_json])
+                    .await
+            }
+            (Some(_), None) => unreachable!("rejected by check_sk_shape above"),
+        };
+
+        exec_result.map_err(|e| map_pg_err(shape.table, e))?;
         Ok(())
     }
 
     async fn get_item_raw(
         &self,
-        table: &str,
-        pk: &str,
-        sk: Option<&str>,
+        shape: &TableShape<'_>,
+        pk: &KeyValue,
+        sk: Option<&KeyValue>,
     ) -> Result<Option<serde_json::Value>, BackendError> {
-        let pg_table = Self::pg_table(table)?;
-        let sk = sk.unwrap_or("");
+        check_sk_shape(shape, sk)?;
         let client = self.client().await?;
-        let sql = format!("SELECT item FROM {pg_table} WHERE pk = $1 AND sk = $2");
-        let row = client
-            .query_opt(&sql, &[&pk, &sk])
-            .await
-            .map_err(|e| map_pg_err(table, e))?;
+
+        let table = quote_ident(shape.table);
+        let pk_col = quote_ident(shape.pk_col);
+        let jsonb_col = quote_ident(shape.jsonb_col);
+
+        let pk_bound = Bound(pk);
+
+        let query_result = match (shape.sk_col, sk) {
+            (None, _) => {
+                let sql = format!("SELECT {jsonb_col} FROM {table} WHERE {pk_col} = $1");
+                client.query_opt(&sql, &[&pk_bound]).await
+            }
+            (Some(sk_col_name), Some(sk_val)) => {
+                let sk_col = quote_ident(sk_col_name);
+                let sk_bound = Bound(sk_val);
+                let sql = format!(
+                    "SELECT {jsonb_col} FROM {table} \
+                     WHERE {pk_col} = $1 AND {sk_col} = $2"
+                );
+                client.query_opt(&sql, &[&pk_bound, &sk_bound]).await
+            }
+            (Some(_), None) => unreachable!("rejected by check_sk_shape above"),
+        };
+
+        let row = query_result.map_err(|e| map_pg_err(shape.table, e))?;
         Ok(row.map(|r| {
             let Json(v): Json<serde_json::Value> = r.get(0);
             v
@@ -111,33 +212,17 @@ impl Backend for PgBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[test]
-    fn pg_table_accepts_valid_names() {
-        assert_eq!(PgBackend::pg_table("users").unwrap(), "ddb_users");
-        assert_eq!(PgBackend::pg_table("a.b-c_d").unwrap(), "ddb_a.b-c_d");
-        assert_eq!(
-            PgBackend::pg_table(&"x".repeat(255)).unwrap(),
-            format!("ddb_{}", "x".repeat(255))
-        );
+    fn quote_ident_basic() {
+        assert_eq!(quote_ident("users"), "\"users\"");
+        assert_eq!(quote_ident("user_id"), "\"user_id\"");
     }
 
     #[test]
-    fn pg_table_rejects_invalid_names() {
-        for bad in [
-            "",
-            "ab",
-            "x".repeat(256).as_str(),
-            "has space",
-            "drop;--",
-            "a/b",
-        ] {
-            let err = PgBackend::pg_table(bad).unwrap_err();
-            assert!(
-                matches!(err, BackendError::InvalidTableName { .. }),
-                "expected InvalidTableName for {bad:?}, got {err:?}"
-            );
-        }
+    fn quote_ident_escapes_embedded_quote() {
+        assert_eq!(quote_ident("we\"ird"), "\"we\"\"ird\"");
     }
 
     fn database_url() -> String {
@@ -149,92 +234,208 @@ mod tests {
     /// run with `cargo test -p rekt-storage-libpq -- --ignored` after `just up`.
     #[tokio::test]
     #[ignore = "requires postgres on localhost:5432 (just up)"]
-    async fn round_trip_against_real_postgres() {
+    async fn round_trip_hash_only_string_pk() {
         let backend = PgBackend::connect(&database_url()).unwrap();
-
-        let table = "rekt_test_storage_roundtrip";
-        let pg_table = format!("ddb_{table}");
         let client = backend.client().await.unwrap();
 
         client
-            .batch_execute(&format!(
-                "DROP TABLE IF EXISTS {pg_table};
-                 CREATE TABLE {pg_table} (
-                   pk   text  NOT NULL,
-                   sk   text  NOT NULL DEFAULT '',
-                   item jsonb NOT NULL,
-                   PRIMARY KEY (pk, sk)
-                 );"
-            ))
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_hash_s;
+                 CREATE TABLE rekt_t_hash_s (
+                   id   text  NOT NULL PRIMARY KEY,
+                   data jsonb NOT NULL
+                 );",
+            )
             .await
             .unwrap();
 
-        // Hash-only table style: sk = None.
+        let shape = TableShape {
+            table: "rekt_t_hash_s",
+            pk_col: "id",
+            sk_col: None,
+            jsonb_col: "data",
+        };
         let item = serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice"}});
         backend
-            .put_item_raw(table, "u1", None, &item)
+            .put_item_raw(&shape, &KeyValue::S("u1".into()), None, &item)
             .await
             .unwrap();
-
-        let got = backend.get_item_raw(table, "u1", None).await.unwrap();
-        assert_eq!(got, Some(item.clone()));
-
-        // Upsert: same key, different value, should replace.
-        let item2 = serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice2"}});
-        backend
-            .put_item_raw(table, "u1", None, &item2)
+        let got = backend
+            .get_item_raw(&shape, &KeyValue::S("u1".into()), None)
             .await
             .unwrap();
-        let got2 = backend.get_item_raw(table, "u1", None).await.unwrap();
-        assert_eq!(got2, Some(item2));
-
-        // Composite-key style: same pk, different sk, two distinct rows.
-        let order_a = serde_json::json!({"order":"A"});
-        let order_b = serde_json::json!({"order":"B"});
-        backend
-            .put_item_raw(table, "u2", Some("order#001"), &order_a)
-            .await
-            .unwrap();
-        backend
-            .put_item_raw(table, "u2", Some("order#002"), &order_b)
-            .await
-            .unwrap();
-        assert_eq!(
-            backend
-                .get_item_raw(table, "u2", Some("order#001"))
-                .await
-                .unwrap(),
-            Some(order_a)
-        );
-        assert_eq!(
-            backend
-                .get_item_raw(table, "u2", Some("order#002"))
-                .await
-                .unwrap(),
-            Some(order_b)
-        );
+        assert_eq!(got, Some(item));
 
         // Missing pk -> Ok(None).
-        let missing = backend.get_item_raw(table, "nope", None).await.unwrap();
-        assert_eq!(missing, None);
-
-        // Same pk but wrong sk -> Ok(None) (sk is part of the key).
-        let wrong_sk = backend
-            .get_item_raw(table, "u2", Some("missing"))
+        let missing = backend
+            .get_item_raw(&shape, &KeyValue::S("nope".into()), None)
             .await
             .unwrap();
-        assert_eq!(wrong_sk, None);
+        assert_eq!(missing, None);
 
-        // Missing table -> TableNotFound.
+        // Sort key passed but shape is hash-only -> UnexpectedSortKey.
         let err = backend
-            .get_item_raw("rekt_test_does_not_exist", "u1", None)
+            .put_item_raw(
+                &shape,
+                &KeyValue::S("u1".into()),
+                Some(&KeyValue::S("oops".into())),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BackendError::UnexpectedSortKey { .. }));
+
+        client
+            .batch_execute("DROP TABLE rekt_t_hash_s;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn round_trip_composite_numeric_sk() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_comp_sn;
+                 CREATE TABLE rekt_t_comp_sn (
+                   device_id text    NOT NULL,
+                   ts        numeric NOT NULL,
+                   doc       jsonb   NOT NULL,
+                   PRIMARY KEY (device_id, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+
+        let shape = TableShape {
+            table: "rekt_t_comp_sn",
+            pk_col: "device_id",
+            sk_col: Some("ts"),
+            jsonb_col: "doc",
+        };
+
+        // 38-digit precision number.
+        let big_ts = "12345678901234567890.12345678901234567";
+        let item1 = serde_json::json!({"value": 1});
+        let item2 = serde_json::json!({"value": 2});
+        backend
+            .put_item_raw(
+                &shape,
+                &KeyValue::S("dev-1".into()),
+                Some(&KeyValue::N("1000".into())),
+                &item1,
+            )
+            .await
+            .unwrap();
+        backend
+            .put_item_raw(
+                &shape,
+                &KeyValue::S("dev-1".into()),
+                Some(&KeyValue::N(big_ts.into())),
+                &item2,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend
+                .get_item_raw(
+                    &shape,
+                    &KeyValue::S("dev-1".into()),
+                    Some(&KeyValue::N("1000".into()))
+                )
+                .await
+                .unwrap(),
+            Some(item1)
+        );
+        assert_eq!(
+            backend
+                .get_item_raw(
+                    &shape,
+                    &KeyValue::S("dev-1".into()),
+                    Some(&KeyValue::N(big_ts.into()))
+                )
+                .await
+                .unwrap(),
+            Some(item2)
+        );
+
+        // Missing sk on composite shape -> MissingSortKey.
+        let err = backend
+            .put_item_raw(
+                &shape,
+                &KeyValue::S("dev-1".into()),
+                None,
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BackendError::MissingSortKey { .. }));
+
+        client
+            .batch_execute("DROP TABLE rekt_t_comp_sn;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn round_trip_binary_pk() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_hash_b;
+                 CREATE TABLE rekt_t_hash_b (
+                   hash bytea NOT NULL PRIMARY KEY,
+                   meta jsonb NOT NULL
+                 );",
+            )
+            .await
+            .unwrap();
+
+        let shape = TableShape {
+            table: "rekt_t_hash_b",
+            pk_col: "hash",
+            sk_col: None,
+            jsonb_col: "meta",
+        };
+        let pk_bytes = Bytes::from_static(b"\x00\x01\x02\xff");
+        let item = serde_json::json!({"size": 4});
+        backend
+            .put_item_raw(&shape, &KeyValue::B(pk_bytes.clone()), None, &item)
+            .await
+            .unwrap();
+        let got = backend
+            .get_item_raw(&shape, &KeyValue::B(pk_bytes), None)
+            .await
+            .unwrap();
+        assert_eq!(got, Some(item));
+
+        client
+            .batch_execute("DROP TABLE rekt_t_hash_b;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn missing_table_maps_to_table_not_found() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let shape = TableShape {
+            table: "rekt_does_not_exist_anywhere",
+            pk_col: "id",
+            sk_col: None,
+            jsonb_col: "data",
+        };
+        let err = backend
+            .get_item_raw(&shape, &KeyValue::S("u1".into()), None)
             .await
             .unwrap_err();
         assert!(matches!(err, BackendError::TableNotFound { .. }));
-
-        client
-            .batch_execute(&format!("DROP TABLE {pg_table};"))
-            .await
-            .unwrap();
     }
 }
