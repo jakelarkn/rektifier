@@ -611,6 +611,18 @@ name = "rekt-diff-tests"
 version = "0.0.1"
 
 [[package]]
+name = "rekt-meta"
+version = "0.0.1"
+dependencies = [
+ "deadpool-postgres",
+ "rekt-config",
+ "rekt-storage",
+ "thiserror",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "rekt-protocol"
 version = "0.0.1"
 dependencies = [
