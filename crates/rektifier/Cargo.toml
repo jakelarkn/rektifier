@@ -9,3 +9,19 @@ description = "DynamoDB-compatible API in front of PostgreSQL (binary)"
 [[bin]]
 name = "rektifier"
 path = "src/main.rs"
+
+[dependencies]
+rekt-config = { path = "../rekt-config" }
+rekt-meta = { path = "../rekt-meta" }
+rekt-server = { path = "../rekt-server" }
+rekt-sigv4 = { path = "../rekt-sigv4" }
+rekt-storage = { path = "../rekt-storage" }
+rekt-storage-libpq = { path = "../rekt-storage-libpq" }
+rekt-translator = { path = "../rekt-translator" }
+anyhow = { workspace = true }
+axum = "0.7"
+deadpool-postgres = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

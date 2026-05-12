@@ -1,0 +1,38 @@
+# rektifier example config.
+#
+# Copy to `rektifier.toml` (gitignored by default) and edit. Point the
+# binary at it via `REKTIFIER_CONFIG=/path/to/rektifier.toml`.
+
+[server]
+listen_addr  = "127.0.0.1:9000"
+database_url = "postgres://rektifier:rektifier@localhost:5432/rektifier"
+
+# Size caps — defaults match DDB. Raise or remove ("unlimited") to use
+# rektifier as "DDB API without the artificial cliffs."
+[limits]
+max_item_size_bytes      = 409600    # 400 KB (DDB)
+max_partition_key_bytes  = 2048      # 2 KB  (DDB)
+max_sort_key_bytes       = 1024      # 1 KB  (DDB)
+max_attribute_name_bytes = 65536     # 64 KB (DDB)
+max_nesting_depth        = 32        # DDB
+
+# Hash-only S-PK table.
+[[tables]]
+name      = "users"
+pk_attr   = "id"
+jsonb_col = "data"
+
+# Composite table: S partition key + N sort key.
+[[tables]]
+name      = "device_events"
+pk_attr   = "device_id"
+sk_attr   = "ts"
+sk_type   = "N"
+jsonb_col = "doc"
+
+# Hash-only B-PK example.
+# [[tables]]
+# name      = "blobs"
+# pk_attr   = "hash"
+# pk_type   = "B"
+# jsonb_col = "meta"

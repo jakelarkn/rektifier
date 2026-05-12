@@ -48,14 +48,30 @@ lint:
 fmt:
     cargo fmt --all
 
-# Run rektifier (once the binary exists)
+# Apply the example PG schema (creates users + device_events tables)
+bootstrap-pg:
+    docker compose exec -T postgres psql -U rektifier rektifier < rektifier-bootstrap.sql
+
+# Run rektifier with the example config
 run:
-    cargo run --bin rektifier
+    REKTIFIER_CONFIG=rektifier.toml.example cargo run --bin rektifier
+
+# Smoke: PutItem then GetItem against rektifier (assumes bootstrap-pg was run).
+smoke-put-get:
+    aws dynamodb put-item \
+        --endpoint-url http://localhost:9000 \
+        --table-name users \
+        --item '{"id":{"S":"u1"},"name":{"S":"alice"}}'
+    aws dynamodb get-item \
+        --endpoint-url http://localhost:9000 \
+        --table-name users \
+        --key '{"id":{"S":"u1"}}'
 
 # Smoke test: list tables against the reference dynamodb-local
 smoke-ref:
     aws dynamodb list-tables --endpoint-url http://localhost:8000
 
-# Smoke test: list tables against rektifier (once it runs on :9000)
+# Smoke test: list tables against rektifier (MVP doesn't implement ListTables;
+# expect UnknownOperationException 400 — useful sanity check that the server is up)
 smoke-ours:
     aws dynamodb list-tables --endpoint-url http://localhost:9000

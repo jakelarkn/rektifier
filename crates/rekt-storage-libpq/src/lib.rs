@@ -23,6 +23,12 @@ pub struct PgBackend {
 }
 
 impl PgBackend {
+    /// Wrap an existing pool. Prefer this when the caller wants to share a
+    /// `Pool` with other components (e.g. `rekt-meta::verify`).
+    pub fn new(pool: Pool) -> Self {
+        Self { pool }
+    }
+
     pub fn connect(connection_string: &str) -> Result<Self, BackendError> {
         let pg_config: tokio_postgres::Config =
             connection_string
