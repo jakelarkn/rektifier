@@ -6,6 +6,7 @@ members = [
     "crates/rekt-storage",
     "crates/rekt-storage-libpq",
     "crates/rekt-translator",
+    "crates/rekt-config",
     "crates/rekt-server",
     "crates/rektifier",
     "tests/diff",
@@ -42,6 +43,7 @@ async-trait = "0.1"
 bytes = "1"
 base64 = "0.22"
 http = "1"
+toml = "0.8"
 
 [profile.dev]
 opt-level = 0
