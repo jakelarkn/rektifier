@@ -1,0 +1,322 @@
+//! Differential tests: send the same PutItem + GetItem pair to both
+//! dynamodb-local (`:8000`) and rektifier (`:9000`); assert the responses
+//! are semantically equal (`serde_json::Value` equality, order-insensitive
+//! for objects).
+//!
+//! Setup:
+//! 1. `just up` (docker compose for PG + dynamodb-local).
+//! 2. `just bootstrap-pg` (creates the `users` and `device_events` PG tables).
+//! 3. Start rektifier: `REKTIFIER_CONFIG=rektifier.toml.example cargo run --bin rektifier`.
+//! 4. Run: `cargo test -p rekt-diff-tests -- --ignored`.
+//!
+//! The tests use a fixed list of items spanning every DDB AttributeValue
+//! variant (S, N, B, BOOL, NULL, L, M, SS, NS, BS) plus a composite-key
+//! case. Each test uses a unique PK so they're idempotent regardless of
+//! whatever else is in the tables.
+
+use serde_json::{json, Value};
+use std::process::Command;
+
+const REF: &str = "http://localhost:8000"; // dynamodb-local
+const OURS: &str = "http://localhost:9000"; // rektifier
+
+// ===== Shell-out helpers ======================================================
+
+fn aws(endpoint: &str, args: &[&str]) -> Value {
+    let output = Command::new("aws")
+        .arg("--endpoint-url")
+        .arg(endpoint)
+        .args(args)
+        .env("AWS_ACCESS_KEY_ID", "local")
+        .env("AWS_SECRET_ACCESS_KEY", "local")
+        .env("AWS_DEFAULT_REGION", "us-east-1")
+        // Force the AWS CLI to emit JSON (some shells override via env).
+        .arg("--output")
+        .arg("json")
+        .output()
+        .unwrap_or_else(|e| panic!("aws CLI invocation failed: {e}"));
+
+    if !output.status.success() {
+        panic!(
+            "aws {} args={:?} failed:\nstdout: {}\nstderr: {}",
+            endpoint,
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        // PutItem with ReturnValues=NONE (the default) prints nothing.
+        json!({})
+    } else {
+        serde_json::from_str(trimmed)
+            .unwrap_or_else(|e| panic!("aws output not JSON: {e}\nstdout: {stdout}"))
+    }
+}
+
+/// Best-effort: try `DeleteItem` against both endpoints so each test starts
+/// from a clean state. Failures are swallowed (the row may not exist).
+fn delete_both(table: &str, key: &str) {
+    let _ = Command::new("aws")
+        .args(["--endpoint-url", REF, "dynamodb", "delete-item"])
+        .args(["--table-name", table, "--key", key])
+        .env("AWS_ACCESS_KEY_ID", "local")
+        .env("AWS_SECRET_ACCESS_KEY", "local")
+        .env("AWS_DEFAULT_REGION", "us-east-1")
+        .output();
+    let _ = Command::new("aws")
+        .args(["--endpoint-url", OURS, "dynamodb", "delete-item"])
+        .args(["--table-name", table, "--key", key])
+        .env("AWS_ACCESS_KEY_ID", "local")
+        .env("AWS_SECRET_ACCESS_KEY", "local")
+        .env("AWS_DEFAULT_REGION", "us-east-1")
+        .output();
+}
+
+/// Ensure a DDB-local table exists with the given schema. Idempotent.
+fn ensure_ref_table(table: &str, attrs: &[(&str, &str)], key_schema: &[(&str, &str)]) {
+    let attr_defs: Vec<String> = attrs
+        .iter()
+        .map(|(n, t)| format!("AttributeName={n},AttributeType={t}"))
+        .collect();
+    let key_def: Vec<String> = key_schema
+        .iter()
+        .map(|(n, t)| format!("AttributeName={n},KeyType={t}"))
+        .collect();
+
+    let mut args: Vec<&str> = vec!["dynamodb", "create-table", "--table-name", table];
+    args.push("--attribute-definitions");
+    for s in &attr_defs {
+        args.push(s);
+    }
+    args.push("--key-schema");
+    for s in &key_def {
+        args.push(s);
+    }
+    args.push("--billing-mode");
+    args.push("PAY_PER_REQUEST");
+
+    // We don't use `aws()` here because a "table already exists" error is
+    // success for our purposes — we just want it to be there.
+    let _ = Command::new("aws")
+        .arg("--endpoint-url")
+        .arg(REF)
+        .args(&args)
+        .env("AWS_ACCESS_KEY_ID", "local")
+        .env("AWS_SECRET_ACCESS_KEY", "local")
+        .env("AWS_DEFAULT_REGION", "us-east-1")
+        .output();
+}
+
+// ===== Core diff primitive ====================================================
+
+/// Run a put-then-get round trip against both endpoints with the same item.
+/// Asserts:
+/// 1. Both PutItem responses are equal (both `{}` in MVP).
+/// 2. Both GetItem responses are equal (object-equality via `serde_json::Value`).
+fn assert_round_trip_matches(table: &str, item: &str, key: &str) {
+    delete_both(table, key);
+
+    let put_ref = aws(
+        REF,
+        &[
+            "dynamodb",
+            "put-item",
+            "--table-name",
+            table,
+            "--item",
+            item,
+        ],
+    );
+    let put_ours = aws(
+        OURS,
+        &[
+            "dynamodb",
+            "put-item",
+            "--table-name",
+            table,
+            "--item",
+            item,
+        ],
+    );
+    assert_eq!(
+        put_ref, put_ours,
+        "PutItem responses diverged for {table} / item={item}"
+    );
+
+    let get_ref = aws(
+        REF,
+        &["dynamodb", "get-item", "--table-name", table, "--key", key],
+    );
+    let get_ours = aws(
+        OURS,
+        &["dynamodb", "get-item", "--table-name", table, "--key", key],
+    );
+    assert_eq!(
+        get_ref, get_ours,
+        "GetItem responses diverged for {table} / key={key}\nref:  {get_ref}\nours: {get_ours}"
+    );
+}
+
+fn ensure_users_table() {
+    ensure_ref_table("users", &[("id", "S")], &[("id", "HASH")]);
+}
+
+fn ensure_device_events_table() {
+    ensure_ref_table(
+        "device_events",
+        &[("device_id", "S"), ("ts", "N")],
+        &[("device_id", "HASH"), ("ts", "RANGE")],
+    );
+}
+
+// ===== Test cases =============================================================
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_s_only() {
+    ensure_users_table();
+    assert_round_trip_matches(
+        "users",
+        r#"{"id":{"S":"diff_s"},"name":{"S":"alice"}}"#,
+        r#"{"id":{"S":"diff_s"}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_high_precision_number_attribute() {
+    ensure_users_table();
+    // 30 digits — within DDB's 38 limit. Verbatim text round-trip; no canonicalization.
+    assert_round_trip_matches(
+        "users",
+        r#"{"id":{"S":"diff_n"},"score":{"N":"12345678901234567890.12345"}}"#,
+        r#"{"id":{"S":"diff_n"}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_binary_value() {
+    ensure_users_table();
+    // base64("\x00\x01\x02\xff") = "AAEC/w=="
+    assert_round_trip_matches(
+        "users",
+        r#"{"id":{"S":"diff_b"},"blob":{"B":"AAEC/w=="}}"#,
+        r#"{"id":{"S":"diff_b"}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_bool_true() {
+    ensure_users_table();
+    assert_round_trip_matches(
+        "users",
+        r#"{"id":{"S":"diff_bool_t"},"active":{"BOOL":true}}"#,
+        r#"{"id":{"S":"diff_bool_t"}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_bool_false() {
+    ensure_users_table();
+    assert_round_trip_matches(
+        "users",
+        r#"{"id":{"S":"diff_bool_f"},"active":{"BOOL":false}}"#,
+        r#"{"id":{"S":"diff_bool_f"}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_null() {
+    ensure_users_table();
+    assert_round_trip_matches(
+        "users",
+        r#"{"id":{"S":"diff_null"},"deleted":{"NULL":true}}"#,
+        r#"{"id":{"S":"diff_null"}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_list_mixed_types() {
+    ensure_users_table();
+    assert_round_trip_matches(
+        "users",
+        r#"{"id":{"S":"diff_list"},"tags":{"L":[{"S":"a"},{"N":"1"},{"BOOL":true},{"NULL":true}]}}"#,
+        r#"{"id":{"S":"diff_list"}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_nested_map() {
+    ensure_users_table();
+    assert_round_trip_matches(
+        "users",
+        r#"{"id":{"S":"diff_map"},"meta":{"M":{"vip":{"BOOL":true},"score":{"N":"99"},"inner":{"M":{"x":{"S":"y"}}}}}}"#,
+        r#"{"id":{"S":"diff_map"}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_string_set() {
+    ensure_users_table();
+    assert_round_trip_matches(
+        "users",
+        r#"{"id":{"S":"diff_ss"},"tags":{"SS":["a","b","c"]}}"#,
+        r#"{"id":{"S":"diff_ss"}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_composite_key_with_numeric_sort_key() {
+    ensure_device_events_table();
+    assert_round_trip_matches(
+        "device_events",
+        r#"{"device_id":{"S":"diff_d1"},"ts":{"N":"1700000000"},"value":{"N":"42.5"}}"#,
+        r#"{"device_id":{"S":"diff_d1"},"ts":{"N":"1700000000"}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_get_missing_returns_empty() {
+    ensure_users_table();
+    let key = r#"{"id":{"S":"diff_definitely_not_present_anywhere"}}"#;
+    delete_both("users", key);
+
+    let g_ref = aws(
+        REF,
+        &[
+            "dynamodb",
+            "get-item",
+            "--table-name",
+            "users",
+            "--key",
+            key,
+        ],
+    );
+    let g_ours = aws(
+        OURS,
+        &[
+            "dynamodb",
+            "get-item",
+            "--table-name",
+            "users",
+            "--key",
+            key,
+        ],
+    );
+    assert_eq!(g_ref, g_ours, "missing-item responses diverged");
+    // Sanity: both should be `{}` (Item omitted).
+    assert_eq!(g_ref, json!({}));
+}

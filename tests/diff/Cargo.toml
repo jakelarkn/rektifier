@@ -6,3 +6,6 @@ license.workspace = true
 rust-version.workspace = true
 description = "Differential tests: compare rektifier responses against dynamodb-local"
 publish = false
+
+[dependencies]
+serde_json = { workspace = true }
