@@ -43,9 +43,11 @@ impl TableSchema {
 
 #[derive(Debug, Clone)]
 pub struct PutItemPlan {
-    pub pk: KeyValue,
-    pub sk: Option<KeyValue>,
     /// Full item in DynamoDB-JSON form, source of truth for the jsonb column.
+    /// PG derives the typed key columns from this via `GENERATED ALWAYS AS`,
+    /// so writes don't bind pk/sk separately. The translator still validates
+    /// that the expected key attributes are present and well-typed — that's
+    /// protocol-level validation, independent of how PG stores them.
     pub item_json: serde_json::Value,
 }
 
@@ -85,14 +87,16 @@ pub fn translate_put_item(
     req: &PutItemRequest,
     schema: &TableSchema,
 ) -> Result<PutItemPlan, TranslateError> {
-    let pk = extract_key(&req.item, &schema.pk_attr, schema.pk_type, KeyRole::Pk)?;
-    let sk = match (&schema.sk_attr, schema.sk_type) {
-        (Some(attr), Some(t)) => Some(extract_key(&req.item, attr, t, KeyRole::Sk)?),
-        _ => None,
-    };
+    // Validate the key attributes for protocol correctness. We discard the
+    // extracted KeyValues — PG derives the actual key columns from the JSONB
+    // via GENERATED ALWAYS AS, so the storage layer never binds them on writes.
+    let _ = extract_key(&req.item, &schema.pk_attr, schema.pk_type, KeyRole::Pk)?;
+    if let (Some(attr), Some(t)) = (&schema.sk_attr, schema.sk_type) {
+        let _ = extract_key(&req.item, attr, t, KeyRole::Sk)?;
+    }
     let item_json =
         serde_json::to_value(&req.item).expect("AttributeValue Serialize is infallible");
-    Ok(PutItemPlan { pk, sk, item_json })
+    Ok(PutItemPlan { item_json })
 }
 
 pub fn translate_get_item(
@@ -218,8 +222,10 @@ mod tests {
             ]),
         };
         let plan = translate_put_item(&req, &schema_hash_s()).unwrap();
-        assert_eq!(plan.pk, KeyValue::S("u1".into()));
-        assert_eq!(plan.sk, None);
+        assert_eq!(
+            plan.item_json,
+            serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice"}})
+        );
     }
 
     #[test]
@@ -233,8 +239,12 @@ mod tests {
             ]),
         };
         let plan = translate_put_item(&req, &schema_composite_s_n()).unwrap();
-        assert_eq!(plan.pk, KeyValue::S("dev-1".into()));
-        assert_eq!(plan.sk, Some(KeyValue::N("1234567890".into())));
+        // PutItemPlan no longer carries pk/sk; PG derives them from the JSONB.
+        // Translator's job is still to validate the attrs are present and
+        // typed correctly (this call would error if not).
+        let stored = plan.item_json;
+        assert_eq!(stored["device_id"], serde_json::json!({"S":"dev-1"}));
+        assert_eq!(stored["ts"], serde_json::json!({"N":"1234567890"}));
     }
 
     #[test]
@@ -247,7 +257,8 @@ mod tests {
             ]),
         };
         let plan = translate_put_item(&req, &schema_hash_b()).unwrap();
-        assert_eq!(plan.pk, KeyValue::B(Bytes::from_static(b"\x00\x01")));
+        // base64 of {0x00, 0x01} is "AAE=".
+        assert_eq!(plan.item_json["hash"], serde_json::json!({"B":"AAE="}));
     }
 
     #[test]

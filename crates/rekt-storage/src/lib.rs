@@ -81,13 +81,13 @@ pub enum BackendError {
 
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
-    /// Upsert: replace the whole `item` for a given `(pk, sk)`. Matches
-    /// DynamoDB's default `PutItem` semantics (no `ConditionExpression`).
+    /// Upsert: write `item` into `shape.jsonb_col`. The PG table is expected
+    /// to derive `pk_col` (and `sk_col` if present) via `GENERATED ALWAYS
+    /// AS ... STORED` columns — rektifier never binds key values on writes.
+    /// Matches DynamoDB's default `PutItem` semantics (no `ConditionExpression`).
     async fn put_item_raw(
         &self,
         shape: &TableShape<'_>,
-        pk: &KeyValue,
-        sk: Option<&KeyValue>,
         item: &serde_json::Value,
     ) -> Result<(), BackendError>;
 

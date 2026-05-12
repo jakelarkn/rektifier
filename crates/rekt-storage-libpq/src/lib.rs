@@ -125,47 +125,36 @@ impl Backend for PgBackend {
     async fn put_item_raw(
         &self,
         shape: &TableShape<'_>,
-        pk: &KeyValue,
-        sk: Option<&KeyValue>,
         item: &serde_json::Value,
     ) -> Result<(), BackendError> {
-        check_sk_shape(shape, sk)?;
         let client = self.client().await?;
 
         let table = quote_ident(shape.table);
         let pk_col = quote_ident(shape.pk_col);
         let jsonb_col = quote_ident(shape.jsonb_col);
 
-        let item_json = Json(item);
-        let pk_bound = Bound(pk);
-
-        let exec_result = match (shape.sk_col, sk) {
-            (None, _) => {
-                let sql = format!(
-                    "INSERT INTO {table} ({pk_col}, {jsonb_col}) \
-                     VALUES ($1, $2) \
-                     ON CONFLICT ({pk_col}) \
-                     DO UPDATE SET {jsonb_col} = EXCLUDED.{jsonb_col}"
-                );
-                client.execute(&sql, &[&pk_bound, &item_json]).await
-            }
-            (Some(sk_col_name), Some(sk_val)) => {
+        // Writes never bind key values. PG derives the generated columns from
+        // the JSONB on INSERT; the ON CONFLICT target is just column names.
+        let sql = match shape.sk_col {
+            None => format!(
+                "INSERT INTO {table} ({jsonb_col}) VALUES ($1) \
+                 ON CONFLICT ({pk_col}) \
+                 DO UPDATE SET {jsonb_col} = EXCLUDED.{jsonb_col}"
+            ),
+            Some(sk_col_name) => {
                 let sk_col = quote_ident(sk_col_name);
-                let sk_bound = Bound(sk_val);
-                let sql = format!(
-                    "INSERT INTO {table} ({pk_col}, {sk_col}, {jsonb_col}) \
-                     VALUES ($1, $2, $3) \
+                format!(
+                    "INSERT INTO {table} ({jsonb_col}) VALUES ($1) \
                      ON CONFLICT ({pk_col}, {sk_col}) \
                      DO UPDATE SET {jsonb_col} = EXCLUDED.{jsonb_col}"
-                );
-                client
-                    .execute(&sql, &[&pk_bound, &sk_bound, &item_json])
-                    .await
+                )
             }
-            (Some(_), None) => unreachable!("rejected by check_sk_shape above"),
         };
 
-        exec_result.map_err(|e| map_pg_err(shape.table, e))?;
+        client
+            .execute(&sql, &[&Json(item)])
+            .await
+            .map_err(|e| map_pg_err(shape.table, e))?;
         Ok(())
     }
 
@@ -232,6 +221,10 @@ mod tests {
 
     /// End-to-end round trip against a running Postgres. Skipped by default;
     /// run with `cargo test -p rekt-storage-libpq -- --ignored` after `just up`.
+    ///
+    /// Schemas use `GENERATED ALWAYS AS ... STORED` columns derived from the
+    /// JSONB — that's the contract rektifier expects from operator-owned tables.
+    /// Writes bind only the JSONB; PG fills in the key columns.
     #[tokio::test]
     #[ignore = "requires postgres on localhost:5432 (just up)"]
     async fn round_trip_hash_only_string_pk() {
@@ -242,8 +235,8 @@ mod tests {
             .batch_execute(
                 "DROP TABLE IF EXISTS rekt_t_hash_s;
                  CREATE TABLE rekt_t_hash_s (
-                   id   text  NOT NULL PRIMARY KEY,
-                   data jsonb NOT NULL
+                   data jsonb NOT NULL,
+                   id   text  GENERATED ALWAYS AS (data#>>'{id,S}') STORED PRIMARY KEY
                  );",
             )
             .await
@@ -256,30 +249,36 @@ mod tests {
             jsonb_col: "data",
         };
         let item = serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice"}});
-        backend
-            .put_item_raw(&shape, &KeyValue::S("u1".into()), None, &item)
-            .await
-            .unwrap();
+        backend.put_item_raw(&shape, &item).await.unwrap();
+
         let got = backend
             .get_item_raw(&shape, &KeyValue::S("u1".into()), None)
             .await
             .unwrap();
-        assert_eq!(got, Some(item));
+        assert_eq!(got, Some(item.clone()));
 
-        // Missing pk -> Ok(None).
+        // Upsert: same key, different value, should replace.
+        let item2 = serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice2"}});
+        backend.put_item_raw(&shape, &item2).await.unwrap();
+        let got2 = backend
+            .get_item_raw(&shape, &KeyValue::S("u1".into()), None)
+            .await
+            .unwrap();
+        assert_eq!(got2, Some(item2));
+
+        // Missing pk on read -> Ok(None).
         let missing = backend
             .get_item_raw(&shape, &KeyValue::S("nope".into()), None)
             .await
             .unwrap();
         assert_eq!(missing, None);
 
-        // Sort key passed but shape is hash-only -> UnexpectedSortKey.
+        // Sort key passed but shape is hash-only -> UnexpectedSortKey on read.
         let err = backend
-            .put_item_raw(
+            .get_item_raw(
                 &shape,
                 &KeyValue::S("u1".into()),
                 Some(&KeyValue::S("oops".into())),
-                &serde_json::json!({}),
             )
             .await
             .unwrap_err();
@@ -301,9 +300,9 @@ mod tests {
             .batch_execute(
                 "DROP TABLE IF EXISTS rekt_t_comp_sn;
                  CREATE TABLE rekt_t_comp_sn (
-                   device_id text    NOT NULL,
-                   ts        numeric NOT NULL,
-                   doc       jsonb   NOT NULL,
+                   doc       jsonb NOT NULL,
+                   device_id text    GENERATED ALWAYS AS (doc#>>'{device_id,S}')           STORED,
+                   ts        numeric GENERATED ALWAYS AS ((doc#>>'{ts,N}')::numeric)       STORED,
                    PRIMARY KEY (device_id, ts)
                  );",
             )
@@ -319,26 +318,12 @@ mod tests {
 
         // 38-digit precision number.
         let big_ts = "12345678901234567890.12345678901234567";
-        let item1 = serde_json::json!({"value": 1});
-        let item2 = serde_json::json!({"value": 2});
-        backend
-            .put_item_raw(
-                &shape,
-                &KeyValue::S("dev-1".into()),
-                Some(&KeyValue::N("1000".into())),
-                &item1,
-            )
-            .await
-            .unwrap();
-        backend
-            .put_item_raw(
-                &shape,
-                &KeyValue::S("dev-1".into()),
-                Some(&KeyValue::N(big_ts.into())),
-                &item2,
-            )
-            .await
-            .unwrap();
+        let item1 =
+            serde_json::json!({"device_id":{"S":"dev-1"},"ts":{"N":"1000"},"value":{"N":"1"}});
+        let item2 =
+            serde_json::json!({"device_id":{"S":"dev-1"},"ts":{"N":big_ts},"value":{"N":"2"}});
+        backend.put_item_raw(&shape, &item1).await.unwrap();
+        backend.put_item_raw(&shape, &item2).await.unwrap();
 
         assert_eq!(
             backend
@@ -363,14 +348,9 @@ mod tests {
             Some(item2)
         );
 
-        // Missing sk on composite shape -> MissingSortKey.
+        // Missing sk on composite shape read -> MissingSortKey.
         let err = backend
-            .put_item_raw(
-                &shape,
-                &KeyValue::S("dev-1".into()),
-                None,
-                &serde_json::json!({}),
-            )
+            .get_item_raw(&shape, &KeyValue::S("dev-1".into()), None)
             .await
             .unwrap_err();
         assert!(matches!(err, BackendError::MissingSortKey { .. }));
@@ -391,8 +371,8 @@ mod tests {
             .batch_execute(
                 "DROP TABLE IF EXISTS rekt_t_hash_b;
                  CREATE TABLE rekt_t_hash_b (
-                   hash bytea NOT NULL PRIMARY KEY,
-                   meta jsonb NOT NULL
+                   meta jsonb NOT NULL,
+                   hash bytea GENERATED ALWAYS AS (decode(meta#>>'{hash,B}', 'base64')) STORED PRIMARY KEY
                  );",
             )
             .await
@@ -404,20 +384,62 @@ mod tests {
             sk_col: None,
             jsonb_col: "meta",
         };
-        let pk_bytes = Bytes::from_static(b"\x00\x01\x02\xff");
-        let item = serde_json::json!({"size": 4});
-        backend
-            .put_item_raw(&shape, &KeyValue::B(pk_bytes.clone()), None, &item)
-            .await
-            .unwrap();
+        // base64 of "\x00\x01\x02\xff" is "AAEC/w==".
+        let item = serde_json::json!({"hash":{"B":"AAEC/w=="},"size":{"N":"4"}});
+        backend.put_item_raw(&shape, &item).await.unwrap();
+
         let got = backend
-            .get_item_raw(&shape, &KeyValue::B(pk_bytes), None)
+            .get_item_raw(
+                &shape,
+                &KeyValue::B(Bytes::from_static(b"\x00\x01\x02\xff")),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(got, Some(item));
 
         client
             .batch_execute("DROP TABLE rekt_t_hash_b;")
+            .await
+            .unwrap();
+    }
+
+    /// PG generated columns + NOT NULL primary key act as the backstop when a
+    /// caller hands us an item whose JSONB doesn't yield the expected key.
+    /// (Translator-level validation will catch this first in production, but
+    /// the backstop matters for correctness.)
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn put_with_missing_key_attr_in_jsonb_is_rejected() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_pk_required;
+                 CREATE TABLE rekt_t_pk_required (
+                   data jsonb NOT NULL,
+                   id   text  GENERATED ALWAYS AS (data#>>'{id,S}') STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+
+        let shape = TableShape {
+            table: "rekt_t_pk_required",
+            pk_col: "id",
+            sk_col: None,
+            jsonb_col: "data",
+        };
+        // JSONB has no `id` attr — generated column yields NULL — PRIMARY KEY rejects.
+        let bad_item = serde_json::json!({"name":{"S":"alice"}});
+        let err = backend.put_item_raw(&shape, &bad_item).await.unwrap_err();
+        // PG raises a not-null-violation; we map to Other for now (translator
+        // should catch this case earlier in the real call path).
+        assert!(matches!(err, BackendError::Other(_)));
+
+        client
+            .batch_execute("DROP TABLE rekt_t_pk_required;")
             .await
             .unwrap();
     }
