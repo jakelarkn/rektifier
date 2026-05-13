@@ -1426,6 +1426,7 @@ dependencies = [
  "rekt-expressions",
  "rekt-protocol",
  "rekt-storage",
+ "rekt-translator",
  "serde_json",
  "tokio",
  "tokio-postgres",
@@ -1436,6 +1437,7 @@ dependencies = [
 name = "rekt-translator"
 version = "0.0.1"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "rekt-expressions",
  "rekt-protocol",

@@ -14,11 +14,7 @@
 use rekt_expressions::{
     ComparisonOp, Condition, Operand, Path, SetRhs, UpdateExpression,
 };
-use rekt_protocol::Item;
-// `AttributeValue` (which `Item` aliases over) is also referenced from
-// the test module; brought in there via `use super::*`.
-#[cfg(test)]
-use rekt_protocol::AttributeValue;
+use rekt_protocol::{AttributeValue, Item};
 use serde_json::{Map, Value};
 
 #[derive(Debug, thiserror::Error)]
@@ -71,7 +67,10 @@ pub fn apply_update_expression(
     }
 
     // Phase 2: start from `existing` (or synthesize `{key attrs}` for
-    // an upsert), apply SETs, then REMOVEs.
+    // an upsert), apply SETs, then REMOVEs, then ADDs, then DELETEs.
+    // The ordering of SET → REMOVE → ADD → DELETE matches DDB's
+    // documented semantics (REMOVE happens after SET; ADD/DELETE
+    // operate on the post-REMOVE state).
     let mut item: Value = match existing {
         Some(v) => v.clone(),
         None => serde_json::to_value(key).expect("Item Serialize is infallible"),
@@ -85,7 +84,158 @@ pub fn apply_update_expression(
         let attr = top_name_or_unreachable(path);
         obj.remove(attr);
     }
+    for action in &expr.add {
+        let attr = top_name_or_unreachable(&action.path);
+        let new_val = apply_add(obj.get(attr), &action.value)?;
+        obj.insert(attr.to_string(), new_val);
+    }
+    for action in &expr.delete {
+        let attr = top_name_or_unreachable(&action.path);
+        match obj.get(attr) {
+            // Path absent → no action (DDB semantics).
+            None => continue,
+            Some(existing) => match apply_delete(existing, &action.value)? {
+                Some(new_val) => {
+                    obj.insert(attr.to_string(), new_val);
+                }
+                None => {
+                    // Set became empty → attribute removed.
+                    obj.remove(attr);
+                }
+            },
+        }
+    }
     Ok(item)
+}
+
+/// `ADD path :v` over the current value of `path` (or `None` if absent).
+///
+/// - Numeric ADD: existing must be `N` (or absent → start at 0); result
+///   is `{"N": str(existing + addend)}`.
+/// - Set ADD: existing must be the same set type (or absent → start
+///   from empty); result is the union, order-preserving with dedup.
+fn apply_add(existing: Option<&Value>, addend: &AttributeValue) -> Result<Value, EvalError> {
+    match addend {
+        AttributeValue::N(n) => {
+            let lhs = match existing {
+                None => 0.0,
+                Some(v) => match single_tagged(v) {
+                    Some(("N", s)) => match s.as_str().and_then(|t| t.parse::<f64>().ok()) {
+                        Some(f) => f,
+                        None => return Err(EvalError::ArithmeticParseFailed {
+                            value: s.to_string(),
+                        }),
+                    },
+                    Some((tag, _)) => {
+                        return Err(EvalError::ArithmeticOperandNotNumber {
+                            got: static_tag(tag),
+                        });
+                    }
+                    None => {
+                        return Err(EvalError::ArithmeticOperandNotNumber {
+                            got: "non-DDB-tagged value",
+                        });
+                    }
+                },
+            };
+            let rhs = parse_decimal(n)?;
+            Ok(serde_json::json!({"N": format_decimal(lhs + rhs)}))
+        }
+        AttributeValue::Ss(addend_items) => {
+            set_union(existing, "SS", addend_items.iter().cloned())
+        }
+        AttributeValue::Ns(addend_items) => {
+            set_union(existing, "NS", addend_items.iter().cloned())
+        }
+        AttributeValue::Bs(addend_items) => {
+            // base64 the addend's bytes for the wire form so we can
+            // dedup against existing in the same encoding.
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine;
+            let strs: Vec<String> = addend_items.iter().map(|b| B64.encode(b)).collect();
+            set_union(existing, "BS", strs)
+        }
+        // Other types blocked by `check_add_value_type` in the translator;
+        // reaching here is a translator divergence.
+        _ => Err(EvalError::ArithmeticOperandNotNumber {
+            got: addend.type_name(),
+        }),
+    }
+}
+
+fn set_union<I>(existing: Option<&Value>, tag: &str, addend: I) -> Result<Value, EvalError>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut combined: Vec<String> = match existing {
+        None => Vec::new(),
+        Some(v) => match single_tagged(v) {
+            Some((existing_tag, arr)) if existing_tag == tag => arr
+                .as_array()
+                .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+                .unwrap_or_default(),
+            Some((existing_tag, _)) => {
+                return Err(EvalError::ListAppendOperandNotList {
+                    got: static_tag(existing_tag),
+                });
+            }
+            None => Vec::new(),
+        },
+    };
+    for item in addend {
+        if !combined.contains(&item) {
+            combined.push(item);
+        }
+    }
+    Ok(serde_json::json!({ tag: combined }))
+}
+
+/// Apply a `DELETE path :v` action against a present `existing` value
+/// (set difference). Returns `Some(new)` when there are still elements
+/// left, or `None` when the set has been fully drained — DDB removes
+/// the attribute outright in that case. Caller has already handled the
+/// "path absent" no-op before calling.
+fn apply_delete(
+    existing: &Value,
+    subset: &AttributeValue,
+) -> Result<Option<Value>, EvalError> {
+    let (tag, to_remove): (&str, Vec<String>) = match subset {
+        AttributeValue::Ss(items) => ("SS", items.clone()),
+        AttributeValue::Ns(items) => ("NS", items.clone()),
+        AttributeValue::Bs(items) => {
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine;
+            ("BS", items.iter().map(|b| B64.encode(b)).collect())
+        }
+        other => {
+            return Err(EvalError::ListAppendOperandNotList {
+                got: other.type_name(),
+            })
+        }
+    };
+    let (existing_tag, arr) = single_tagged(existing).ok_or(
+        EvalError::ListAppendOperandNotList {
+            got: "non-DDB-tagged value",
+        },
+    )?;
+    if existing_tag != tag {
+        return Err(EvalError::ListAppendOperandNotList {
+            got: static_tag(existing_tag),
+        });
+    }
+    let arr = arr.as_array().ok_or(EvalError::ListAppendOperandNotList {
+        got: "non-array set wrapper",
+    })?;
+    let remaining: Vec<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .filter(|s| !to_remove.contains(s))
+        .collect();
+    if remaining.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(serde_json::json!({ tag: remaining })))
+    }
 }
 
 fn compute_set_rhs(rhs: &SetRhs, existing: Option<&Value>) -> Result<Value, EvalError> {
@@ -237,10 +387,161 @@ pub fn evaluate_condition(existing: Option<&Value>, cond: &Condition) -> bool {
                 _ => false,
             }
         }
+        Condition::BeginsWith(p, o) => eval_begins_with(existing, p, o),
+        Condition::Contains(p, o) => eval_contains(existing, p, o),
+        Condition::Between(v, lo, hi) => eval_between(existing, v, lo, hi),
+        Condition::In(v, items) => eval_in(existing, v, items),
+        Condition::AttributeType(p, o) => eval_attribute_type(existing, p, o),
         Condition::And(a, b) => evaluate_condition(existing, a) && evaluate_condition(existing, b),
         Condition::Or(a, b) => evaluate_condition(existing, a) || evaluate_condition(existing, b),
         Condition::Not(inner) => !evaluate_condition(existing, inner),
     }
+}
+
+/// `begins_with(path, operand)` — true when `path` is `S` and starts
+/// with the `operand`'s `S` value. Any type mismatch or missing path
+/// returns false (DDB semantics).
+fn eval_begins_with(existing: Option<&Value>, path: &Path, operand: &Operand) -> bool {
+    let attr_val = match path
+        .top_name()
+        .and_then(|n| existing.and_then(|v| v.get(n)))
+    {
+        Some(v) => v,
+        None => return false,
+    };
+    let needle = match condition_operand_value(operand, existing) {
+        Some(v) => v,
+        None => return false,
+    };
+    match (
+        single_tagged(attr_val),
+        single_tagged(&needle),
+    ) {
+        (Some(("S", a)), Some(("S", b))) => match (a.as_str(), b.as_str()) {
+            (Some(haystack), Some(prefix)) => haystack.starts_with(prefix),
+            _ => false,
+        },
+        // DDB also defines begins_with on B (binary prefix). Skip for
+        // now — the slow path doesn't decode binary, and the use case
+        // is rare. Returns false on mismatch, which is safe-by-default.
+        _ => false,
+    }
+}
+
+/// `contains(path, operand)` — three DDB modes:
+/// - `path` is `S`: returns true iff operand is `S` and substring of path's value
+/// - `path` is a set (`SS`/`NS`/`BS`): returns true iff operand is the matching scalar
+///   (`S`/`N`/`B`) and is an element of the set
+/// - `path` is `L`: returns true iff some element of the list equals operand by value
+fn eval_contains(existing: Option<&Value>, path: &Path, operand: &Operand) -> bool {
+    let attr_val = match path
+        .top_name()
+        .and_then(|n| existing.and_then(|v| v.get(n)))
+    {
+        Some(v) => v,
+        None => return false,
+    };
+    let needle = match condition_operand_value(operand, existing) {
+        Some(v) => v,
+        None => return false,
+    };
+
+    match single_tagged(attr_val) {
+        Some(("S", haystack_v)) => match (haystack_v.as_str(), single_tagged(&needle)) {
+            (Some(haystack), Some(("S", needle_v))) => needle_v
+                .as_str()
+                .is_some_and(|n| haystack.contains(n)),
+            _ => false,
+        },
+        Some(("SS", arr)) => contains_in_set(arr, &needle, "S"),
+        Some(("NS", arr)) => contains_in_set(arr, &needle, "N"),
+        Some(("BS", arr)) => contains_in_set(arr, &needle, "B"),
+        Some(("L", arr)) => {
+            // `L` membership: any list element JSON-equals the needle.
+            arr.as_array().is_some_and(|items| items.iter().any(|i| i == &needle))
+        }
+        _ => false,
+    }
+}
+
+/// Set membership helper: `arr` is the inner array of a set wrapper
+/// (`{"SS":["a","b"]}` → `arr` is `["a","b"]`); `needle` should be a
+/// `{tag: scalar}` object where tag is the corresponding scalar type
+/// (`S` for `SS`, `N` for `NS`, `B` for `BS`).
+fn contains_in_set(arr: &Value, needle: &Value, scalar_tag: &str) -> bool {
+    let items = match arr.as_array() {
+        Some(a) => a,
+        None => return false,
+    };
+    let needle_scalar = match single_tagged(needle) {
+        Some((tag, v)) if tag == scalar_tag => v,
+        _ => return false,
+    };
+    items.iter().any(|item| item == needle_scalar)
+}
+
+/// `v BETWEEN lo AND hi` — inclusive range. Both bounds must share a
+/// tag (N or S); cross-type comparisons return false.
+fn eval_between(
+    existing: Option<&Value>,
+    v: &Operand,
+    lo: &Operand,
+    hi: &Operand,
+) -> bool {
+    let vv = match condition_operand_value(v, existing) {
+        Some(v) => v,
+        None => return false,
+    };
+    let lov = match condition_operand_value(lo, existing) {
+        Some(v) => v,
+        None => return false,
+    };
+    let hiv = match condition_operand_value(hi, existing) {
+        Some(v) => v,
+        None => return false,
+    };
+    // v >= lo AND v <= hi
+    compare_values(ComparisonOp::Ge, &vv, &lov)
+        && compare_values(ComparisonOp::Le, &vv, &hiv)
+}
+
+/// `v IN (op1, op2, ...)` — true iff any of the list members
+/// JSON-equals `v`. The list must be non-empty per DDB grammar; we
+/// don't enforce that here (parser does).
+fn eval_in(existing: Option<&Value>, v: &Operand, items: &[Operand]) -> bool {
+    let vv = match condition_operand_value(v, existing) {
+        Some(v) => v,
+        None => return false,
+    };
+    items.iter().any(|op| {
+        condition_operand_value(op, existing)
+            .as_ref()
+            .is_some_and(|iv| iv == &vv)
+    })
+}
+
+/// `attribute_type(path, :type)` — `:type` is one of the DDB tag
+/// strings (`"S"`, `"N"`, ..., `"BS"`). Returns true iff the path's
+/// top-level value uses that DDB tag.
+fn eval_attribute_type(existing: Option<&Value>, path: &Path, operand: &Operand) -> bool {
+    let attr_val = match path
+        .top_name()
+        .and_then(|n| existing.and_then(|v| v.get(n)))
+    {
+        Some(v) => v,
+        None => return false,
+    };
+    let type_str = match condition_operand_value(operand, existing) {
+        Some(v) => match single_tagged(&v) {
+            Some(("S", s)) => match s.as_str() {
+                Some(t) => t.to_string(),
+                None => return false,
+            },
+            _ => return false,
+        },
+        None => return false,
+    };
+    matches!(single_tagged(attr_val), Some((tag, _)) if tag == type_str)
 }
 
 fn condition_operand_value(op: &Operand, existing: Option<&Value>) -> Option<Value> {
@@ -639,5 +940,271 @@ mod tests {
         assert!(evaluate_condition(Some(&item), &parse_cond("a = b", &[])));
         let item2 = serde_json::json!({"id":{"S":"u1"},"a":{"S":"x"},"b":{"S":"y"}});
         assert!(!evaluate_condition(Some(&item2), &parse_cond("a = b", &[])));
+    }
+
+    // ----- Phase 4e: new condition shapes ---------------------------------
+
+    #[test]
+    fn cond_begins_with() {
+        let item = serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice"}});
+        assert!(evaluate_condition(
+            Some(&item),
+            &parse_cond("begins_with(name, :p)", &[(":p", AttributeValue::S("ali".into()))])
+        ));
+        assert!(!evaluate_condition(
+            Some(&item),
+            &parse_cond("begins_with(name, :p)", &[(":p", AttributeValue::S("bob".into()))])
+        ));
+        // Type mismatch (begins_with against N attribute) → false.
+        let item_n = serde_json::json!({"id":{"S":"u1"},"x":{"N":"42"}});
+        assert!(!evaluate_condition(
+            Some(&item_n),
+            &parse_cond("begins_with(x, :p)", &[(":p", AttributeValue::S("4".into()))])
+        ));
+    }
+
+    #[test]
+    fn cond_contains_string_substring() {
+        let item = serde_json::json!({"id":{"S":"u1"},"name":{"S":"hello world"}});
+        assert!(evaluate_condition(
+            Some(&item),
+            &parse_cond("contains(name, :p)", &[(":p", AttributeValue::S("lo wo".into()))])
+        ));
+        assert!(!evaluate_condition(
+            Some(&item),
+            &parse_cond("contains(name, :p)", &[(":p", AttributeValue::S("zzz".into()))])
+        ));
+    }
+
+    #[test]
+    fn cond_contains_set_membership() {
+        let item = serde_json::json!({"id":{"S":"u1"},"tags":{"SS":["a","b","c"]}});
+        assert!(evaluate_condition(
+            Some(&item),
+            &parse_cond("contains(tags, :p)", &[(":p", AttributeValue::S("b".into()))])
+        ));
+        assert!(!evaluate_condition(
+            Some(&item),
+            &parse_cond("contains(tags, :p)", &[(":p", AttributeValue::S("z".into()))])
+        ));
+    }
+
+    #[test]
+    fn cond_contains_list_element() {
+        let item = serde_json::json!({"id":{"S":"u1"},"items":{"L":[{"S":"a"},{"N":"7"}]}});
+        assert!(evaluate_condition(
+            Some(&item),
+            &parse_cond("contains(items, :v)", &[(":v", AttributeValue::N("7".into()))])
+        ));
+        assert!(!evaluate_condition(
+            Some(&item),
+            &parse_cond("contains(items, :v)", &[(":v", AttributeValue::N("99".into()))])
+        ));
+    }
+
+    #[test]
+    fn cond_between_numeric() {
+        let item = serde_json::json!({"id":{"S":"u1"},"score":{"N":"50"}});
+        let lo = AttributeValue::N("10".into());
+        let hi = AttributeValue::N("100".into());
+        assert!(evaluate_condition(
+            Some(&item),
+            &parse_cond("score BETWEEN :lo AND :hi", &[(":lo", lo.clone()), (":hi", hi.clone())])
+        ));
+        // Out of range.
+        let out_item = serde_json::json!({"id":{"S":"u1"},"score":{"N":"200"}});
+        assert!(!evaluate_condition(
+            Some(&out_item),
+            &parse_cond("score BETWEEN :lo AND :hi", &[(":lo", lo), (":hi", hi)])
+        ));
+    }
+
+    #[test]
+    fn cond_between_string() {
+        let item = serde_json::json!({"id":{"S":"u1"},"name":{"S":"charlie"}});
+        assert!(evaluate_condition(
+            Some(&item),
+            &parse_cond(
+                "name BETWEEN :a AND :z",
+                &[
+                    (":a", AttributeValue::S("a".into())),
+                    (":z", AttributeValue::S("d".into())),
+                ],
+            )
+        ));
+    }
+
+    #[test]
+    fn cond_in_list() {
+        let item = serde_json::json!({"id":{"S":"u1"},"status":{"S":"pending"}});
+        assert!(evaluate_condition(
+            Some(&item),
+            &parse_cond(
+                "status IN (:a, :b, :c)",
+                &[
+                    (":a", AttributeValue::S("active".into())),
+                    (":b", AttributeValue::S("pending".into())),
+                    (":c", AttributeValue::S("closed".into())),
+                ],
+            )
+        ));
+        assert!(!evaluate_condition(
+            Some(&item),
+            &parse_cond(
+                "status IN (:a, :b)",
+                &[
+                    (":a", AttributeValue::S("active".into())),
+                    (":b", AttributeValue::S("closed".into())),
+                ],
+            )
+        ));
+    }
+
+    #[test]
+    fn cond_attribute_type_matches() {
+        let item = serde_json::json!({"id":{"S":"u1"},"score":{"N":"42"}});
+        assert!(evaluate_condition(
+            Some(&item),
+            &parse_cond("attribute_type(score, :t)", &[(":t", AttributeValue::S("N".into()))])
+        ));
+        assert!(!evaluate_condition(
+            Some(&item),
+            &parse_cond("attribute_type(score, :t)", &[(":t", AttributeValue::S("S".into()))])
+        ));
+        // Missing path → false.
+        assert!(!evaluate_condition(
+            Some(&item),
+            &parse_cond("attribute_type(missing, :t)", &[(":t", AttributeValue::S("S".into()))])
+        ));
+    }
+
+    // ----- Phase 5: ADD ---------------------------------------------------
+
+    #[test]
+    fn add_numeric_on_missing_creates_with_value() {
+        let key = key_of(&[("id", AttributeValue::S("u1".into()))]);
+        let expr = parse_upd(
+            "ADD counter :inc",
+            &[(":inc", AttributeValue::N("5".into()))],
+        );
+        let got = apply_update_expression(None, &expr, &key).unwrap();
+        assert_eq!(got.get("counter"), Some(&serde_json::json!({"N":"5"})));
+    }
+
+    #[test]
+    fn add_numeric_on_existing_increments() {
+        let existing = serde_json::json!({"id":{"S":"u1"},"counter":{"N":"10"}});
+        let expr = parse_upd(
+            "ADD counter :inc",
+            &[(":inc", AttributeValue::N("3".into()))],
+        );
+        let got =
+            apply_update_expression(Some(&existing), &expr, &std::collections::BTreeMap::new())
+                .unwrap();
+        assert_eq!(got.get("counter"), Some(&serde_json::json!({"N":"13"})));
+    }
+
+    #[test]
+    fn add_numeric_existing_wrong_type_errors() {
+        let existing = serde_json::json!({"id":{"S":"u1"},"counter":{"S":"oops"}});
+        let expr = parse_upd(
+            "ADD counter :inc",
+            &[(":inc", AttributeValue::N("1".into()))],
+        );
+        let err =
+            apply_update_expression(Some(&existing), &expr, &std::collections::BTreeMap::new())
+                .unwrap_err();
+        assert!(matches!(err, EvalError::ArithmeticOperandNotNumber { .. }));
+    }
+
+    #[test]
+    fn add_set_on_missing_creates_with_set() {
+        let key = key_of(&[("id", AttributeValue::S("u1".into()))]);
+        let expr = parse_upd(
+            "ADD tags :new",
+            &[(":new", AttributeValue::Ss(vec!["a".into(), "b".into()]))],
+        );
+        let got = apply_update_expression(None, &expr, &key).unwrap();
+        // Set elements preserve insertion order in our impl; test order-
+        // insensitively by checking each item is present.
+        let tags = got["tags"]["SS"].as_array().unwrap();
+        assert_eq!(tags.len(), 2);
+        assert!(tags.iter().any(|v| v == "a"));
+        assert!(tags.iter().any(|v| v == "b"));
+    }
+
+    #[test]
+    fn add_set_unions_with_dedup() {
+        let existing = serde_json::json!({"id":{"S":"u1"},"tags":{"SS":["a","b"]}});
+        let expr = parse_upd(
+            "ADD tags :new",
+            &[(":new", AttributeValue::Ss(vec!["b".into(), "c".into()]))],
+        );
+        let got =
+            apply_update_expression(Some(&existing), &expr, &std::collections::BTreeMap::new())
+                .unwrap();
+        let tags = got["tags"]["SS"].as_array().unwrap();
+        assert_eq!(tags.len(), 3);
+        for s in ["a", "b", "c"] {
+            assert!(tags.iter().any(|v| v == s), "missing {s}");
+        }
+    }
+
+    // ----- Phase 6: DELETE -----------------------------------------------
+
+    #[test]
+    fn delete_set_removes_elements() {
+        let existing = serde_json::json!({"id":{"S":"u1"},"tags":{"SS":["a","b","c"]}});
+        let expr = parse_upd(
+            "DELETE tags :rm",
+            &[(":rm", AttributeValue::Ss(vec!["b".into()]))],
+        );
+        let got =
+            apply_update_expression(Some(&existing), &expr, &std::collections::BTreeMap::new())
+                .unwrap();
+        let tags = got["tags"]["SS"].as_array().unwrap();
+        assert_eq!(tags.len(), 2);
+        assert!(tags.iter().any(|v| v == "a"));
+        assert!(tags.iter().any(|v| v == "c"));
+    }
+
+    #[test]
+    fn delete_set_empties_attribute_when_all_removed() {
+        let existing = serde_json::json!({"id":{"S":"u1"},"tags":{"SS":["a","b"]}});
+        let expr = parse_upd(
+            "DELETE tags :rm",
+            &[(":rm", AttributeValue::Ss(vec!["a".into(), "b".into()]))],
+        );
+        let got =
+            apply_update_expression(Some(&existing), &expr, &std::collections::BTreeMap::new())
+                .unwrap();
+        // DDB: if DELETE empties the set, the attribute is removed entirely.
+        assert!(got.get("tags").is_none());
+    }
+
+    #[test]
+    fn delete_path_absent_is_noop() {
+        let existing = serde_json::json!({"id":{"S":"u1"}});
+        let expr = parse_upd(
+            "DELETE tags :rm",
+            &[(":rm", AttributeValue::Ss(vec!["x".into()]))],
+        );
+        let got =
+            apply_update_expression(Some(&existing), &expr, &std::collections::BTreeMap::new())
+                .unwrap();
+        assert_eq!(got, existing);
+    }
+
+    #[test]
+    fn delete_wrong_type_errors() {
+        let existing = serde_json::json!({"id":{"S":"u1"},"tags":{"S":"not_a_set"}});
+        let expr = parse_upd(
+            "DELETE tags :rm",
+            &[(":rm", AttributeValue::Ss(vec!["a".into()]))],
+        );
+        let err =
+            apply_update_expression(Some(&existing), &expr, &std::collections::BTreeMap::new())
+                .unwrap_err();
+        assert!(matches!(err, EvalError::ListAppendOperandNotList { .. }));
     }
 }

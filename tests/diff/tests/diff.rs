@@ -1191,6 +1191,241 @@ fn diff_update_list_append_prepends() {
     );
 }
 
+// ---- Phase 4e: slow-path condition shapes ---------------------------------
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_begins_with_condition() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_bw"}}"##,
+        Some(r##"{"id":{"S":"diff_bw"},"name":{"S":"alice"}}"##),
+        &[
+            "--update-expression",
+            "SET marker = :m",
+            "--expression-attribute-names",
+            r##"{"#n":"name"}"##,
+            "--expression-attribute-values",
+            r##"{":m":{"S":"hit"},":p":{"S":"ali"}}"##,
+            "--condition-expression",
+            "begins_with(#n, :p)",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_contains_set_membership() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_contains"}}"##,
+        Some(r##"{"id":{"S":"diff_contains"},"tags":{"SS":["alpha","beta"]}}"##),
+        &[
+            "--update-expression",
+            "SET marker = :m",
+            "--expression-attribute-values",
+            r##"{":m":{"S":"hit"},":x":{"S":"alpha"}}"##,
+            "--condition-expression",
+            "contains(tags, :x)",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_between_numeric() {
+    ensure_users_table();
+    // `score` is DDB-reserved → alias.
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_bw_n"}}"##,
+        Some(r##"{"id":{"S":"diff_bw_n"},"score":{"N":"50"}}"##),
+        &[
+            "--update-expression",
+            "SET marker = :m",
+            "--expression-attribute-names",
+            r##"{"#sc":"score"}"##,
+            "--expression-attribute-values",
+            r##"{":m":{"S":"hit"},":lo":{"N":"10"},":hi":{"N":"100"}}"##,
+            "--condition-expression",
+            "#sc BETWEEN :lo AND :hi",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_in_list() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_in"}}"##,
+        Some(r##"{"id":{"S":"diff_in"},"status":{"S":"pending"}}"##),
+        &[
+            "--update-expression",
+            "SET marker = :m",
+            "--expression-attribute-names",
+            r##"{"#s":"status"}"##,
+            "--expression-attribute-values",
+            r##"{":m":{"S":"hit"},":a":{"S":"active"},":p":{"S":"pending"},":c":{"S":"closed"}}"##,
+            "--condition-expression",
+            "#s IN (:a, :p, :c)",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_attribute_type() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_at"}}"##,
+        Some(r##"{"id":{"S":"diff_at"},"score":{"N":"42"}}"##),
+        &[
+            "--update-expression",
+            "SET marker = :m",
+            "--expression-attribute-names",
+            r##"{"#sc":"score"}"##,
+            "--expression-attribute-values",
+            r##"{":m":{"S":"hit"},":t":{"S":"N"}}"##,
+            "--condition-expression",
+            "attribute_type(#sc, :t)",
+        ],
+    );
+}
+
+// ---- Phase 5: ADD ---------------------------------------------------------
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_add_numeric_increments() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_add_n"}}"##,
+        Some(r##"{"id":{"S":"diff_add_n"},"counter":{"N":"10"}}"##),
+        &[
+            "--update-expression",
+            "ADD #c :inc",
+            "--expression-attribute-names",
+            r##"{"#c":"counter"}"##,
+            "--expression-attribute-values",
+            r##"{":inc":{"N":"5"}}"##,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_add_numeric_on_missing_row() {
+    ensure_users_table();
+    let key = r##"{"id":{"S":"diff_add_new"}}"##;
+    delete_both("users", key);
+    // No seed — ADD-numeric on missing row should create the counter.
+    let upd_args = [
+        "dynamodb",
+        "update-item",
+        "--table-name",
+        "users",
+        "--key",
+        key,
+        "--update-expression",
+        "ADD #c :inc",
+        "--expression-attribute-names",
+        r##"{"#c":"counter"}"##,
+        "--expression-attribute-values",
+        r##"{":inc":{"N":"7"}}"##,
+    ];
+    let ref_upd = strip_metadata(aws(REF, &upd_args));
+    let ours_upd = strip_metadata(aws(OURS, &upd_args));
+    assert_eq!(ref_upd, ours_upd);
+
+    let mut ref_got = aws(
+        REF,
+        &["dynamodb", "get-item", "--table-name", "users", "--key", key],
+    );
+    let mut ours_got = aws(
+        OURS,
+        &["dynamodb", "get-item", "--table-name", "users", "--key", key],
+    );
+    sort_sets(&mut ref_got);
+    sort_sets(&mut ours_got);
+    assert_eq!(ref_got, ours_got);
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_add_set_union() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_add_set"}}"##,
+        Some(r##"{"id":{"S":"diff_add_set"},"tags":{"SS":["a","b"]}}"##),
+        &[
+            "--update-expression",
+            "ADD tags :new",
+            "--expression-attribute-values",
+            r##"{":new":{"SS":["b","c"]}}"##,
+        ],
+    );
+}
+
+// ---- Phase 6: DELETE ------------------------------------------------------
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_delete_set_removes_subset() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_del_set"}}"##,
+        Some(r##"{"id":{"S":"diff_del_set"},"tags":{"SS":["a","b","c"]}}"##),
+        &[
+            "--update-expression",
+            "DELETE tags :rm",
+            "--expression-attribute-values",
+            r##"{":rm":{"SS":["b"]}}"##,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_delete_set_emptied_removes_attribute() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_del_empty"}}"##,
+        Some(r##"{"id":{"S":"diff_del_empty"},"tags":{"SS":["a","b"]},"keep":{"S":"x"}}"##),
+        &[
+            "--update-expression",
+            "DELETE tags :rm",
+            "--expression-attribute-values",
+            r##"{":rm":{"SS":["a","b"]}}"##,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_delete_path_absent_noop() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_del_absent"}}"##,
+        Some(r##"{"id":{"S":"diff_del_absent"},"keep":{"S":"x"}}"##),
+        &[
+            "--update-expression",
+            "DELETE never_existed :rm",
+            "--expression-attribute-values",
+            r##"{":rm":{"SS":["a"]}}"##,
+        ],
+    );
+}
+
 /// Best-effort run that captures stderr (where the AWS CLI puts error
 /// type names). Returns the concatenation of stdout and stderr so the
 /// caller can grep for the expected `__type`.

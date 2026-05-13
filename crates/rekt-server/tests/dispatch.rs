@@ -4,13 +4,13 @@
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use rekt_expressions::{ComparisonOp, Condition, Operand};
+use rekt_expressions::Condition;
 use rekt_server::{router, AppState};
 use rekt_sigv4::{PermissiveVerifier, Verifier};
 use rekt_storage::{
     Backend, BackendError, GeneralUpdateFn, KeyType, KeyValue, TableShape, UpdateDecision,
 };
-use rekt_translator::TableSchema;
+use rekt_translator::{evaluate_condition, TableSchema};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -179,7 +179,7 @@ impl Backend for MockBackend {
             Some(v) => v,
         };
 
-        if !eval_condition(condition, &item) {
+        if !evaluate_condition(Some(&item), condition) {
             return Err(BackendError::ConditionalCheckFailed);
         }
 
@@ -262,93 +262,9 @@ impl Backend for MockBackend {
     }
 }
 
-// ---- In-memory condition evaluator used by MockBackend ----------------------
-//
-// Implements DDB semantics for the subset of Condition we test through
-// the dispatch layer: attribute_exists / attribute_not_exists,
-// equality / inequality on jsonb-shaped DDB values, ordering on N / S
-// typed values, and boolean composition. Missing attributes evaluate
-// to "false" for every comparison (matches DDB).
-
-fn eval_condition(cond: &Condition, item: &Value) -> bool {
-    match cond {
-        Condition::AttributeExists(p) => p.top_name().is_some_and(|n| item.get(n).is_some()),
-        Condition::AttributeNotExists(p) => p.top_name().is_some_and(|n| item.get(n).is_none()),
-        Condition::Compare { op, left, right } => {
-            let l = operand_as_value(left, item);
-            let r = operand_as_value(right, item);
-            match (l, r) {
-                (Some(lv), Some(rv)) => compare_values(*op, &lv, &rv),
-                _ => false,
-            }
-        }
-        Condition::And(a, b) => eval_condition(a, item) && eval_condition(b, item),
-        Condition::Or(a, b) => eval_condition(a, item) || eval_condition(b, item),
-        Condition::Not(inner) => !eval_condition(inner, item),
-    }
-}
-
-fn operand_as_value(op: &Operand, item: &Value) -> Option<Value> {
-    match op {
-        Operand::Path(p) => item.get(p.top_name()?).cloned(),
-        Operand::Value(v) => Some(serde_json::to_value(v).expect("infallible")),
-    }
-}
-
-fn compare_values(op: ComparisonOp, l: &Value, r: &Value) -> bool {
-    match op {
-        ComparisonOp::Eq => l == r,
-        ComparisonOp::Ne => l != r,
-        ord => {
-            // Ordering: both operands must be the same DDB-tagged scalar
-            // (N or S); other types → false. Mirrors the SQL compiler's
-            // typed-extraction rule.
-            let (l_tag, l_val) = single_tagged(l);
-            let (r_tag, r_val) = single_tagged(r);
-            if l_tag != r_tag {
-                return false;
-            }
-            match l_tag {
-                Some("N") => match (
-                    l_val.and_then(Value::as_str).and_then(|s| s.parse::<f64>().ok()),
-                    r_val.and_then(Value::as_str).and_then(|s| s.parse::<f64>().ok()),
-                ) {
-                    (Some(a), Some(b)) => apply_ord(ord, a.partial_cmp(&b)),
-                    _ => false,
-                },
-                Some("S") => match (l_val.and_then(Value::as_str), r_val.and_then(Value::as_str)) {
-                    (Some(a), Some(b)) => apply_ord(ord, Some(a.cmp(b))),
-                    _ => false,
-                },
-                _ => false,
-            }
-        }
-    }
-}
-
-fn single_tagged(v: &Value) -> (Option<&str>, Option<&Value>) {
-    match v.as_object().and_then(|m| {
-        if m.len() == 1 {
-            m.iter().next()
-        } else {
-            None
-        }
-    }) {
-        Some((k, v)) => (Some(k.as_str()), Some(v)),
-        None => (None, None),
-    }
-}
-
-fn apply_ord(op: ComparisonOp, ord: Option<std::cmp::Ordering>) -> bool {
-    use std::cmp::Ordering::*;
-    matches!(
-        (op, ord),
-        (ComparisonOp::Lt, Some(Less))
-            | (ComparisonOp::Le, Some(Less | Equal))
-            | (ComparisonOp::Gt, Some(Greater))
-            | (ComparisonOp::Ge, Some(Greater | Equal))
-    )
-}
+// MockBackend's condition evaluation delegates to the public
+// `rekt_translator::evaluate_condition` so the mock and the real PG
+// path share the exact same DDB-semantics implementation.
 
 /// Pull the string value out of a DDB-JSON AttributeValue like `{"S":"u1"}`.
 fn extract_key_string(av: &Value) -> Option<String> {
@@ -1532,6 +1448,363 @@ async fn update_slow_path_via_needs_tx_condition() {
         body_json(resp).await.get("Item").unwrap().get("marker"),
         Some(&json!({"S":"ok"}))
     );
+}
+
+// ===== Phase 4e: slow-path conditions =======================================
+
+#[tokio::test]
+async fn update_begins_with_routes_through_slow_path() {
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"name":{"S":"alice"}}}),
+        ))
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET marker = :m",
+                "ExpressionAttributeValues":{":m":{"S":"ok"},":p":{"S":"ali"}},
+                "ConditionExpression":"begins_with(#n, :p)",
+                "ExpressionAttributeNames":{"#n":"name"},
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn update_contains_set_membership_via_slow_path() {
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"tags":{"SS":["a","b"]}}}),
+        ))
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET marker = :m",
+                "ExpressionAttributeValues":{":m":{"S":"ok"},":x":{"S":"a"}},
+                "ConditionExpression":"contains(tags, :x)",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn update_between_routes_through_slow_path() {
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"score":{"N":"42"}}}),
+        ))
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET marker = :m",
+                "ExpressionAttributeValues":{":m":{"S":"ok"},":lo":{"N":"10"},":hi":{"N":"100"}},
+                "ConditionExpression":"score BETWEEN :lo AND :hi",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Out of range → CCFE.
+    let resp = app
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET marker = :m",
+                "ExpressionAttributeValues":{":m":{"S":"ok"},":lo":{"N":"100"},":hi":{"N":"200"}},
+                "ConditionExpression":"score BETWEEN :lo AND :hi",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let ty = body_json(resp).await.get("__type").and_then(Value::as_str).unwrap().to_string();
+    assert!(ty.ends_with("#ConditionalCheckFailedException"));
+}
+
+#[tokio::test]
+async fn update_in_list_via_slow_path() {
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"status":{"S":"pending"}}}),
+        ))
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET marker = :m",
+                "ExpressionAttributeValues":{
+                    ":m":{"S":"ok"},
+                    ":a":{"S":"active"},
+                    ":p":{"S":"pending"},
+                    ":c":{"S":"closed"},
+                },
+                "ConditionExpression":"#s IN (:a, :p, :c)",
+                "ExpressionAttributeNames":{"#s":"status"},
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn update_attribute_type_via_slow_path() {
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"score":{"N":"42"}}}),
+        ))
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET marker = :m",
+                "ExpressionAttributeValues":{":m":{"S":"ok"},":t":{"S":"N"}},
+                "ConditionExpression":"attribute_type(score, :t)",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ===== Phase 5: ADD ========================================================
+
+#[tokio::test]
+async fn update_add_numeric_on_missing_row_creates_counter() {
+    let app = app();
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"new_counter"}},
+                "UpdateExpression":"ADD #c :one",
+                "ExpressionAttributeNames":{"#c":"counter"},
+                "ExpressionAttributeValues":{":one":{"N":"1"}},
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"new_counter"}}}),
+        ))
+        .await
+        .unwrap();
+    let got = body_json(resp).await;
+    assert_eq!(got["Item"]["counter"], json!({"N":"1"}));
+}
+
+#[tokio::test]
+async fn update_add_numeric_increments_existing() {
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"counter":{"N":"10"}}}),
+        ))
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"ADD #c :inc",
+                "ExpressionAttributeNames":{"#c":"counter"},
+                "ExpressionAttributeValues":{":inc":{"N":"5"}},
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"u1"}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["Item"]["counter"], json!({"N":"15"}));
+}
+
+#[tokio::test]
+async fn update_add_set_union() {
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"tags":{"SS":["a","b"]}}}),
+        ))
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"ADD tags :new",
+                "ExpressionAttributeValues":{":new":{"SS":["b","c"]}},
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"u1"}}}),
+        ))
+        .await
+        .unwrap();
+    let got = body_json(resp).await;
+    let tags = got["Item"]["tags"]["SS"].as_array().unwrap().clone();
+    assert_eq!(tags.len(), 3);
+    for s in ["a", "b", "c"] {
+        assert!(tags.iter().any(|v| v == s), "missing {s}");
+    }
+}
+
+// ===== Phase 6: DELETE =====================================================
+
+#[tokio::test]
+async fn update_delete_set_removes_elements() {
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"tags":{"SS":["a","b","c"]}}}),
+        ))
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"DELETE tags :rm",
+                "ExpressionAttributeValues":{":rm":{"SS":["b"]}},
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"u1"}}}),
+        ))
+        .await
+        .unwrap();
+    let tags = body_json(resp).await["Item"]["tags"]["SS"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(tags.len(), 2);
+    assert!(tags.iter().any(|v| v == "a"));
+    assert!(tags.iter().any(|v| v == "c"));
+}
+
+#[tokio::test]
+async fn update_delete_set_emptied_removes_attribute() {
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"tags":{"SS":["a","b"]},"keep":{"S":"x"}}}),
+        ))
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"DELETE tags :rm",
+                "ExpressionAttributeValues":{":rm":{"SS":["a","b"]}},
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"u1"}}}),
+        ))
+        .await
+        .unwrap();
+    let got = body_json(resp).await;
+    assert!(got["Item"].get("tags").is_none(), "tags should be removed");
+    assert_eq!(got["Item"]["keep"], json!({"S":"x"}));
 }
 
 #[tokio::test]

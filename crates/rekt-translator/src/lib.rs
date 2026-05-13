@@ -197,11 +197,19 @@ pub enum TranslateError {
     #[error("only literal SET right-hand sides are supported in this phase (got `{shape}`)")]
     UnsupportedSetRhs { shape: &'static str },
 
-    #[error("ADD clauses are not yet supported (phase 5 will add them)")]
-    UnsupportedAddClause,
+    /// ADD requires a numeric or set value. `ADD foo :s` where `:s` is
+    /// `{"S":"x"}` raises `ValidationException`.
+    #[error(
+        "An operand in the update expression has an incorrect data type: ADD requires N or SS/NS/BS (got `{got}`)"
+    )]
+    InvalidAddValueType { got: &'static str },
 
-    #[error("DELETE clauses are not yet supported (phase 6 will add them)")]
-    UnsupportedDeleteClause,
+    /// DELETE requires a set value. `DELETE foo :s` where `:s` isn't a
+    /// `SS`/`NS`/`BS` raises `ValidationException`.
+    #[error(
+        "An operand in the update expression has an incorrect data type: DELETE requires SS/NS/BS (got `{got}`)"
+    )]
+    InvalidDeleteValueType { got: &'static str },
 
     #[error("invalid ConditionExpression: {0}")]
     InvalidConditionExpression(String),
@@ -312,32 +320,23 @@ pub fn translate_update_item(
         .unwrap_or(&empty_values);
     let expression = substitute_update(raw, names, values)?;
 
-    // 4. Reject empty expressions and clauses we haven't implemented yet.
-    if expression.set.is_empty() && expression.remove.is_empty() {
-        if !expression.add.is_empty() {
-            return Err(TranslateError::UnsupportedAddClause);
-        }
-        if !expression.delete.is_empty() {
-            return Err(TranslateError::UnsupportedDeleteClause);
-        }
+    // 4. Reject empty expressions.
+    if expression.set.is_empty()
+        && expression.remove.is_empty()
+        && expression.add.is_empty()
+        && expression.delete.is_empty()
+    {
         return Err(TranslateError::EmptyUpdateExpression);
     }
-    if !expression.add.is_empty() {
-        return Err(TranslateError::UnsupportedAddClause);
-    }
-    if !expression.delete.is_empty() {
-        return Err(TranslateError::UnsupportedDeleteClause);
-    }
 
-    // 5. Per-clause validation:
-    //    - LHS path is top-level and not a key attribute
-    //    - RHS embedded paths are top-level (key attrs are OK to *read*
-    //      — `SET a = id` is permitted; only writing the key is not)
-    //    - REMOVE paths are top-level and not key attributes
+    // 5. Per-clause validation. Top-level paths only across all clauses
+    //    (Phase 8 lifts); key attrs disallowed as the LHS of any write
+    //    (SET / REMOVE / ADD / DELETE). RHS embedded paths can read key
+    //    attrs (`SET a = id` is permitted).
     //
-    // The fast path requires the literal-only RHS shape; non-literal
-    // RHS (path-ref / arithmetic / if_not_exists / list_append) routes
-    // through the slow path. `is_simple()` is the dispatcher predicate.
+    // Fast path requires `is_simple()` (top-level SET = literal + REMOVE
+    // only); non-simple SET RHS, ADD, DELETE, and slow-path-bound
+    // conditions all route through the Phase 3b read-modify-write path.
     for clause in &expression.set {
         check_top_level(&clause.path)?;
         check_not_key(&clause.path, schema)?;
@@ -346,6 +345,16 @@ pub fn translate_update_item(
     for path in &expression.remove {
         check_top_level(path)?;
         check_not_key(path, schema)?;
+    }
+    for action in &expression.add {
+        check_top_level(&action.path)?;
+        check_not_key(&action.path, schema)?;
+        check_add_value_type(&action.value)?;
+    }
+    for action in &expression.delete {
+        check_top_level(&action.path)?;
+        check_not_key(&action.path, schema)?;
+        check_delete_value_type(&action.value)?;
     }
 
     // 6. Parse + validate + classify the ConditionExpression, if any.
@@ -405,6 +414,14 @@ fn condition_fits_sql(cond: &Condition) -> bool {
                 ordering_has_typed_extraction(left, right)
             }
         },
+        // Phase 4e additions all live on the slow path. The Rust
+        // evaluator handles them in one place; promoting any to SQL
+        // can come later behind a benchmark number.
+        Condition::BeginsWith(_, _)
+        | Condition::Contains(_, _)
+        | Condition::Between(_, _, _)
+        | Condition::In(_, _)
+        | Condition::AttributeType(_, _) => false,
         Condition::And(a, b) | Condition::Or(a, b) => condition_fits_sql(a) && condition_fits_sql(b),
         Condition::Not(inner) => condition_fits_sql(inner),
     }
@@ -430,6 +447,24 @@ fn check_condition_paths_top_level(cond: &Condition) -> Result<(), TranslateErro
         Condition::Compare { left, right, .. } => {
             check_condition_operand(left)?;
             check_condition_operand(right)
+        }
+        Condition::BeginsWith(p, o)
+        | Condition::Contains(p, o)
+        | Condition::AttributeType(p, o) => {
+            check_condition_path(p)?;
+            check_condition_operand(o)
+        }
+        Condition::Between(v, lo, hi) => {
+            check_condition_operand(v)?;
+            check_condition_operand(lo)?;
+            check_condition_operand(hi)
+        }
+        Condition::In(v, items) => {
+            check_condition_operand(v)?;
+            for item in items {
+                check_condition_operand(item)?;
+            }
+            Ok(())
         }
         Condition::And(a, b) | Condition::Or(a, b) => {
             check_condition_paths_top_level(a)?;
@@ -693,6 +728,33 @@ fn check_operand_path_top_level(o: &Operand) -> Result<(), TranslateError> {
     match o {
         Operand::Path(p) => check_top_level(p),
         Operand::Value(_) => Ok(()),
+    }
+}
+
+/// `ADD path :v` requires `:v` to be a Number (numeric add) or one of
+/// the set types (set union). DDB raises ValidationException on any
+/// other type at request time, so we surface the same rejection
+/// pre-storage.
+fn check_add_value_type(v: &AttributeValue) -> Result<(), TranslateError> {
+    match v {
+        AttributeValue::N(_)
+        | AttributeValue::Ss(_)
+        | AttributeValue::Ns(_)
+        | AttributeValue::Bs(_) => Ok(()),
+        other => Err(TranslateError::InvalidAddValueType {
+            got: other.type_name(),
+        }),
+    }
+}
+
+/// `DELETE path :v` requires `:v` to be a set type — DELETE is set
+/// subtraction only.
+fn check_delete_value_type(v: &AttributeValue) -> Result<(), TranslateError> {
+    match v {
+        AttributeValue::Ss(_) | AttributeValue::Ns(_) | AttributeValue::Bs(_) => Ok(()),
+        other => Err(TranslateError::InvalidDeleteValueType {
+            got: other.type_name(),
+        }),
     }
 }
 
@@ -1461,10 +1523,10 @@ mod tests {
         assert!(matches!(err, TranslateError::UnsupportedNestedPath { .. }));
     }
 
-    // ----- Reject deferred clauses (ADD, DELETE, ConditionExpression, etc.)
+    // ----- Phase 5/6: ADD and DELETE accepted (route to slow path) -----
 
     #[test]
-    fn upd_reject_add_clause() {
+    fn upd_accept_add_numeric() {
         let req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
@@ -1472,12 +1534,55 @@ mod tests {
             &[(":one", AttributeValue::N("1".into()))],
             &[],
         );
-        let err = translate_update_item(&req, &schema_hash_s()).unwrap_err();
-        assert!(matches!(err, TranslateError::UnsupportedAddClause));
+        let plan = translate_update_item(&req, &schema_hash_s()).unwrap();
+        assert_eq!(plan.expression.add.len(), 1);
+        assert!(!plan.expression.is_simple());
     }
 
     #[test]
-    fn upd_reject_delete_clause() {
+    fn upd_accept_add_set() {
+        let req = upd(
+            "users",
+            &[("id", AttributeValue::S("u1".into()))],
+            "ADD tags :new",
+            &[(":new", AttributeValue::Ss(vec!["a".into(), "b".into()]))],
+            &[],
+        );
+        let plan = translate_update_item(&req, &schema_hash_s()).unwrap();
+        assert_eq!(plan.expression.add.len(), 1);
+    }
+
+    #[test]
+    fn upd_reject_add_with_non_numeric_non_set_value() {
+        let req = upd(
+            "users",
+            &[("id", AttributeValue::S("u1".into()))],
+            "ADD count :one",
+            &[(":one", AttributeValue::S("not_a_number".into()))],
+            &[],
+        );
+        let err = translate_update_item(&req, &schema_hash_s()).unwrap_err();
+        assert!(
+            matches!(err, TranslateError::InvalidAddValueType { got } if got == "S"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn upd_reject_add_on_key_attr() {
+        let req = upd(
+            "users",
+            &[("id", AttributeValue::S("u1".into()))],
+            "ADD id :one",
+            &[(":one", AttributeValue::N("1".into()))],
+            &[],
+        );
+        let err = translate_update_item(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(err, TranslateError::UpdateTouchesKey { ref attr } if attr == "id"));
+    }
+
+    #[test]
+    fn upd_accept_delete_set() {
         let req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
@@ -1485,8 +1590,24 @@ mod tests {
             &[(":rm", AttributeValue::Ss(vec!["x".into()]))],
             &[],
         );
+        let plan = translate_update_item(&req, &schema_hash_s()).unwrap();
+        assert_eq!(plan.expression.delete.len(), 1);
+    }
+
+    #[test]
+    fn upd_reject_delete_with_non_set_value() {
+        let req = upd(
+            "users",
+            &[("id", AttributeValue::S("u1".into()))],
+            "DELETE tags :v",
+            &[(":v", AttributeValue::S("not_a_set".into()))],
+            &[],
+        );
         let err = translate_update_item(&req, &schema_hash_s()).unwrap_err();
-        assert!(matches!(err, TranslateError::UnsupportedDeleteClause));
+        assert!(
+            matches!(err, TranslateError::InvalidDeleteValueType { got } if got == "S"),
+            "got: {err:?}"
+        );
     }
 
     // ----- ConditionExpression: parsed + classified (Phase 4b) -----------

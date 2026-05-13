@@ -411,3 +411,104 @@ fn err_substitute_missing_value() {
     let err = substitute_condition(raw, &names(&[]), &values(&[])).unwrap_err();
     assert!(matches!(err, SubstituteError::UnknownValue { ref name } if name == "missing"));
 }
+
+// ===== Phase 4e: extended grammar ============================================
+
+#[test]
+fn parse_begins_with() {
+    let got = parse_condition_expression("begins_with(name, :p)").unwrap();
+    assert_eq!(
+        got,
+        RawCondition::BeginsWith(rpath(&[pn("name")]), vref("p"))
+    );
+}
+
+#[test]
+fn parse_contains() {
+    let got = parse_condition_expression("contains(tags, :s)").unwrap();
+    assert_eq!(got, RawCondition::Contains(rpath(&[pn("tags")]), vref("s")));
+}
+
+#[test]
+fn parse_attribute_type() {
+    let got = parse_condition_expression("attribute_type(score, :t)").unwrap();
+    assert_eq!(
+        got,
+        RawCondition::AttributeType(rpath(&[pn("score")]), vref("t"))
+    );
+}
+
+#[test]
+fn parse_between() {
+    let got = parse_condition_expression("score BETWEEN :lo AND :hi").unwrap();
+    assert_eq!(
+        got,
+        RawCondition::Between(rop_path("score"), vref("lo"), vref("hi"))
+    );
+}
+
+#[test]
+fn parse_in_list() {
+    let got = parse_condition_expression("status IN (:a, :b, :c)").unwrap();
+    assert_eq!(
+        got,
+        RawCondition::In(rop_path("status"), vec![vref("a"), vref("b"), vref("c")])
+    );
+}
+
+#[test]
+fn parse_in_single_item() {
+    let got = parse_condition_expression("status IN (:a)").unwrap();
+    assert_eq!(got, RawCondition::In(rop_path("status"), vec![vref("a")]));
+}
+
+#[test]
+fn parse_keyword_word_boundary_in_not_consumed_by_inactive_ident() {
+    // `a inactive = :v` would be invalid in DDB (two operands without
+    // operator), but the parser should NOT mis-tokenize `inactive` as
+    // `IN active`. Parse should fail cleanly rather than half-consume.
+    assert!(parse_condition_expression("a inactive = :v").is_err());
+}
+
+#[test]
+fn parse_between_inside_and_composition() {
+    // The AND keyword inside BETWEEN's `BETWEEN lo AND hi` shouldn't be
+    // confused with boolean AND when followed by a separate condition.
+    let got =
+        parse_condition_expression("score BETWEEN :lo AND :hi AND attribute_exists(id)").unwrap();
+    let between = RawCondition::Between(rop_path("score"), vref("lo"), vref("hi"));
+    let exists = RawCondition::AttributeExists(rpath(&[pn("id")]));
+    assert_eq!(got, RawCondition::And(Box::new(between), Box::new(exists)));
+}
+
+#[test]
+fn parse_in_with_paths() {
+    // DDB allows paths in the IN list, not just values.
+    let got = parse_condition_expression("a IN (b, c)").unwrap();
+    assert_eq!(
+        got,
+        RawCondition::In(
+            rop_path("a"),
+            vec![rop_path("b"), rop_path("c")],
+        )
+    );
+}
+
+#[test]
+fn parse_case_insensitive_extended_keywords() {
+    // BETWEEN / IN / begins_with all case-insensitive.
+    assert!(parse_condition_expression("score between :lo and :hi").is_ok());
+    assert!(parse_condition_expression("status in (:a)").is_ok());
+    assert!(parse_condition_expression("Begins_With(name, :p)").is_ok());
+}
+
+#[test]
+fn err_in_with_empty_list() {
+    // `path IN ()` — empty list is not valid grammar.
+    assert!(parse_condition_expression("status IN ()").is_err());
+}
+
+#[test]
+fn err_between_missing_and() {
+    assert!(parse_condition_expression("score BETWEEN :lo :hi").is_err());
+}

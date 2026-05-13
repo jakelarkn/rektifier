@@ -351,7 +351,16 @@ fn not_expr(input: &mut &str) -> ModalResult<RawCondition> {
 
 fn cond_atom(input: &mut &str) -> ModalResult<RawCondition> {
     let _ = multispace0.parse_next(input)?;
-    alt((paren_group, attribute_exists_fn, attribute_not_exists_fn, comparison)).parse_next(input)
+    alt((
+        paren_group,
+        attribute_exists_fn,
+        attribute_not_exists_fn,
+        begins_with_fn,
+        contains_fn,
+        attribute_type_fn,
+        operand_based,
+    ))
+    .parse_next(input)
 }
 
 fn paren_group(input: &mut &str) -> ModalResult<RawCondition> {
@@ -377,13 +386,91 @@ fn attribute_not_exists_fn(input: &mut &str) -> ModalResult<RawCondition> {
     Ok(RawCondition::AttributeNotExists(p))
 }
 
-fn comparison(input: &mut &str) -> ModalResult<RawCondition> {
+/// Either a plain comparison (`op cmp op`), a `BETWEEN` triple, or an
+/// `IN` list — all dispatch on what follows the leading operand.
+fn operand_based(input: &mut &str) -> ModalResult<RawCondition> {
     let left = operand.parse_next(input)?;
+    if let Some((lo, hi)) = opt(between_tail).parse_next(input)? {
+        return Ok(RawCondition::Between(left, lo, hi));
+    }
+    if let Some(items) = opt(in_tail).parse_next(input)? {
+        return Ok(RawCondition::In(left, items));
+    }
     let _ = multispace0.parse_next(input)?;
     let op = comparator.parse_next(input)?;
     let _ = multispace0.parse_next(input)?;
     let right = operand.parse_next(input)?;
     Ok(RawCondition::Compare { op, left, right })
+}
+
+fn between_tail(input: &mut &str) -> ModalResult<(RawOperand, RawOperand)> {
+    let _ = multispace1.parse_next(input)?;
+    let _ = Caseless("BETWEEN").parse_next(input)?;
+    keyword_word_boundary(input)?;
+    let _ = multispace1.parse_next(input)?;
+    let lo = operand.parse_next(input)?;
+    let _ = multispace1.parse_next(input)?;
+    let _ = Caseless("AND").parse_next(input)?;
+    keyword_word_boundary(input)?;
+    let _ = multispace1.parse_next(input)?;
+    let hi = operand.parse_next(input)?;
+    Ok((lo, hi))
+}
+
+fn in_tail(input: &mut &str) -> ModalResult<Vec<RawOperand>> {
+    let _ = multispace1.parse_next(input)?;
+    let _ = Caseless("IN").parse_next(input)?;
+    keyword_word_boundary(input)?;
+    let _ = (multispace0, '(', multispace0).parse_next(input)?;
+    let mut items = vec![operand.parse_next(input)?];
+    while opt((multispace0, ',', multispace0)).parse_next(input)?.is_some() {
+        items.push(operand.parse_next(input)?);
+    }
+    let _ = (multispace0, ')').parse_next(input)?;
+    Ok(items)
+}
+
+fn begins_with_fn(input: &mut &str) -> ModalResult<RawCondition> {
+    let _ = Caseless("begins_with").parse_next(input)?;
+    keyword_word_boundary(input)?;
+    let (p, o) = two_arg_call(input)?;
+    Ok(RawCondition::BeginsWith(p, o))
+}
+
+fn contains_fn(input: &mut &str) -> ModalResult<RawCondition> {
+    let _ = Caseless("contains").parse_next(input)?;
+    keyword_word_boundary(input)?;
+    let (p, o) = two_arg_call(input)?;
+    Ok(RawCondition::Contains(p, o))
+}
+
+fn attribute_type_fn(input: &mut &str) -> ModalResult<RawCondition> {
+    let _ = Caseless("attribute_type").parse_next(input)?;
+    keyword_word_boundary(input)?;
+    let (p, o) = two_arg_call(input)?;
+    Ok(RawCondition::AttributeType(p, o))
+}
+
+/// Parse `(path, operand)` — the shape shared by begins_with, contains,
+/// attribute_type.
+fn two_arg_call(input: &mut &str) -> ModalResult<(RawPath, RawOperand)> {
+    let _ = (multispace0, '(', multispace0).parse_next(input)?;
+    let p = path.parse_next(input)?;
+    let _ = (multispace0, ',', multispace0).parse_next(input)?;
+    let o = operand.parse_next(input)?;
+    let _ = (multispace0, ')').parse_next(input)?;
+    Ok((p, o))
+}
+
+/// Fail if the next char is an identifier continuation (letter / digit /
+/// underscore). Used after `Caseless("IN")` / `BETWEEN` / function names
+/// so we don't accidentally consume the prefix of a longer identifier
+/// (e.g., `inactive` shouldn't tokenize as `IN active`).
+fn keyword_word_boundary(input: &mut &str) -> ModalResult<()> {
+    match input.chars().next() {
+        Some(c) if c.is_ascii_alphanumeric() || c == '_' => fail.parse_next(input),
+        _ => Ok(()),
+    }
 }
 
 fn comparator(input: &mut &str) -> ModalResult<ComparisonOp> {

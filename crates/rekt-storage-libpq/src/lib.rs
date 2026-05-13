@@ -846,6 +846,16 @@ fn compile_condition(
             let s = compile_condition(b, data_ref, inner)?;
             Ok(format!("(NOT {s})"))
         }
+        // Phase 4e shapes route to the slow path via the translator's
+        // `condition_fits_sql == false`; reaching the SQL compiler with
+        // one of these is a classifier divergence.
+        Condition::BeginsWith(_, _)
+        | Condition::Contains(_, _)
+        | Condition::Between(_, _, _)
+        | Condition::In(_, _)
+        | Condition::AttributeType(_, _) => Err(BackendError::Other(
+            "classifier divergence: Phase 4e shape reached SQL compiler".into(),
+        )),
     }
 }
 
@@ -2451,6 +2461,307 @@ mod tests {
 
         client
             .batch_execute("DROP TABLE rekt_t_rmw_race;")
+            .await
+            .unwrap();
+    }
+
+    // ============================================================
+    // Phase 4e/5/6: slow-path routes via update_general_rmw_raw with
+    // a closure that combines evaluator + condition eval. Tests use
+    // the rekt-translator helpers to drive the closure exactly as
+    // the server would.
+    // ============================================================
+
+    fn build_apply<'a>(
+        expr: rekt_expressions::UpdateExpression,
+        condition: Option<rekt_expressions::Condition>,
+        key: rekt_protocol::Item,
+    ) -> GeneralUpdateFn<'a> {
+        Box::new(move |existing| {
+            if let Some(c) = &condition {
+                if !rekt_translator::evaluate_condition(existing, c) {
+                    return Ok(UpdateDecision::Fail);
+                }
+            }
+            match rekt_translator::apply_update_expression(existing, &expr, &key) {
+                Ok(new) => Ok(UpdateDecision::Apply(new)),
+                Err(e) => Err(BackendError::Other(e.to_string())),
+            }
+        })
+    }
+
+    fn parse_upd_e2e(
+        src: &str,
+        values: &[(&str, rekt_protocol::AttributeValue)],
+    ) -> rekt_expressions::UpdateExpression {
+        let raw = rekt_expressions::parse_update_expression(src).unwrap();
+        let names = std::collections::BTreeMap::new();
+        let vmap: std::collections::BTreeMap<String, rekt_protocol::AttributeValue> =
+            values.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect();
+        rekt_expressions::substitute_update(raw, &names, &vmap).unwrap()
+    }
+
+    fn parse_cond_e2e(
+        src: &str,
+        values: &[(&str, rekt_protocol::AttributeValue)],
+    ) -> rekt_expressions::Condition {
+        let raw = rekt_expressions::parse_condition_expression(src).unwrap();
+        let names = std::collections::BTreeMap::new();
+        let vmap: std::collections::BTreeMap<String, rekt_protocol::AttributeValue> =
+            values.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect();
+        rekt_expressions::substitute_condition(raw, &names, &vmap).unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn slow_path_add_numeric_increments() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = setup_update_hash_table(&backend, "rekt_t_addnum").await;
+        let shape = TableShape {
+            table: "rekt_t_addnum",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+
+        backend
+            .put_item_raw(
+                &shape,
+                &serde_json::json!({"id":{"S":"u1"},"counter":{"N":"10"}}),
+            )
+            .await
+            .unwrap();
+
+        let key: rekt_protocol::Item = [(
+            "id".to_string(),
+            rekt_protocol::AttributeValue::S("u1".into()),
+        )]
+        .into_iter()
+        .collect();
+        let expr = parse_upd_e2e(
+            "ADD counter :inc",
+            &[(":inc", rekt_protocol::AttributeValue::N("5".into()))],
+        );
+        backend
+            .update_general_rmw_raw(
+                &shape,
+                &KeyValue::S("u1".into()),
+                None,
+                build_apply(expr, None, key),
+            )
+            .await
+            .unwrap();
+
+        let got = backend
+            .get_item_raw(&shape, &KeyValue::S("u1".into()), None)
+            .await
+            .unwrap();
+        assert_eq!(got.unwrap()["counter"], serde_json::json!({"N":"15"}));
+
+        client
+            .batch_execute("DROP TABLE rekt_t_addnum;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn slow_path_add_set_union() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = setup_update_hash_table(&backend, "rekt_t_addset").await;
+        let shape = TableShape {
+            table: "rekt_t_addset",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+
+        backend
+            .put_item_raw(
+                &shape,
+                &serde_json::json!({"id":{"S":"u1"},"tags":{"SS":["a","b"]}}),
+            )
+            .await
+            .unwrap();
+
+        let key: rekt_protocol::Item = [(
+            "id".to_string(),
+            rekt_protocol::AttributeValue::S("u1".into()),
+        )]
+        .into_iter()
+        .collect();
+        let expr = parse_upd_e2e(
+            "ADD tags :new",
+            &[(
+                ":new",
+                rekt_protocol::AttributeValue::Ss(vec!["b".into(), "c".into()]),
+            )],
+        );
+        backend
+            .update_general_rmw_raw(
+                &shape,
+                &KeyValue::S("u1".into()),
+                None,
+                build_apply(expr, None, key),
+            )
+            .await
+            .unwrap();
+
+        let got = backend
+            .get_item_raw(&shape, &KeyValue::S("u1".into()), None)
+            .await
+            .unwrap();
+        let tags = got.unwrap()["tags"]["SS"].as_array().unwrap().clone();
+        assert_eq!(tags.len(), 3);
+        for s in ["a", "b", "c"] {
+            assert!(tags.iter().any(|v| v == s), "missing {s}");
+        }
+
+        client
+            .batch_execute("DROP TABLE rekt_t_addset;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn slow_path_delete_set_emptied_removes_attribute() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = setup_update_hash_table(&backend, "rekt_t_del_empty").await;
+        let shape = TableShape {
+            table: "rekt_t_del_empty",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+
+        backend
+            .put_item_raw(
+                &shape,
+                &serde_json::json!({"id":{"S":"u1"},"tags":{"SS":["a","b"]},"keep":{"S":"x"}}),
+            )
+            .await
+            .unwrap();
+
+        let key: rekt_protocol::Item = [(
+            "id".to_string(),
+            rekt_protocol::AttributeValue::S("u1".into()),
+        )]
+        .into_iter()
+        .collect();
+        let expr = parse_upd_e2e(
+            "DELETE tags :rm",
+            &[(
+                ":rm",
+                rekt_protocol::AttributeValue::Ss(vec!["a".into(), "b".into()]),
+            )],
+        );
+        backend
+            .update_general_rmw_raw(
+                &shape,
+                &KeyValue::S("u1".into()),
+                None,
+                build_apply(expr, None, key),
+            )
+            .await
+            .unwrap();
+
+        let got = backend
+            .get_item_raw(&shape, &KeyValue::S("u1".into()), None)
+            .await
+            .unwrap();
+        let item = got.unwrap();
+        assert!(item.get("tags").is_none(), "tags should be removed");
+        assert_eq!(item["keep"], serde_json::json!({"S":"x"}));
+
+        client
+            .batch_execute("DROP TABLE rekt_t_del_empty;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn slow_path_begins_with_condition() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = setup_update_hash_table(&backend, "rekt_t_bw").await;
+        let shape = TableShape {
+            table: "rekt_t_bw",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+
+        backend
+            .put_item_raw(
+                &shape,
+                &serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice"}}),
+            )
+            .await
+            .unwrap();
+
+        let key: rekt_protocol::Item = [(
+            "id".to_string(),
+            rekt_protocol::AttributeValue::S("u1".into()),
+        )]
+        .into_iter()
+        .collect();
+
+        // Matching prefix → update applies.
+        let expr = parse_upd_e2e(
+            "SET marker = :m",
+            &[(":m", rekt_protocol::AttributeValue::S("hit".into()))],
+        );
+        let cond = parse_cond_e2e(
+            "begins_with(name, :p)",
+            &[(":p", rekt_protocol::AttributeValue::S("ali".into()))],
+        );
+        backend
+            .update_general_rmw_raw(
+                &shape,
+                &KeyValue::S("u1".into()),
+                None,
+                build_apply(expr, Some(cond), key.clone()),
+            )
+            .await
+            .unwrap();
+
+        // Non-matching prefix → CCFE.
+        let expr2 = parse_upd_e2e(
+            "SET marker = :m",
+            &[(":m", rekt_protocol::AttributeValue::S("nope".into()))],
+        );
+        let cond2 = parse_cond_e2e(
+            "begins_with(name, :p)",
+            &[(":p", rekt_protocol::AttributeValue::S("bob".into()))],
+        );
+        let err = backend
+            .update_general_rmw_raw(
+                &shape,
+                &KeyValue::S("u1".into()),
+                None,
+                build_apply(expr2, Some(cond2), key),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BackendError::ConditionalCheckFailed));
+
+        let got = backend
+            .get_item_raw(&shape, &KeyValue::S("u1".into()), None)
+            .await
+            .unwrap();
+        assert_eq!(got.unwrap()["marker"], serde_json::json!({"S":"hit"}));
+
+        client
+            .batch_execute("DROP TABLE rekt_t_bw;")
             .await
             .unwrap();
     }

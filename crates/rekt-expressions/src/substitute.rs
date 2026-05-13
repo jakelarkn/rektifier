@@ -177,6 +177,30 @@ pub fn substitute_condition(
         RawCondition::AttributeNotExists(p) => {
             Condition::AttributeNotExists(resolve_path(p, names)?)
         }
+        RawCondition::BeginsWith(p, o) => Condition::BeginsWith(
+            resolve_path(p, names)?,
+            resolve_operand(o, names, values)?,
+        ),
+        RawCondition::Contains(p, o) => Condition::Contains(
+            resolve_path(p, names)?,
+            resolve_operand(o, names, values)?,
+        ),
+        RawCondition::Between(v, lo, hi) => Condition::Between(
+            resolve_operand(v, names, values)?,
+            resolve_operand(lo, names, values)?,
+            resolve_operand(hi, names, values)?,
+        ),
+        RawCondition::In(v, items) => Condition::In(
+            resolve_operand(v, names, values)?,
+            items
+                .into_iter()
+                .map(|o| resolve_operand(o, names, values))
+                .collect::<Result<_, _>>()?,
+        ),
+        RawCondition::AttributeType(p, o) => Condition::AttributeType(
+            resolve_path(p, names)?,
+            resolve_operand(o, names, values)?,
+        ),
         RawCondition::And(a, b) => Condition::And(
             Box::new(substitute_condition(*a, names, values)?),
             Box::new(substitute_condition(*b, names, values)?),

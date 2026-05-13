@@ -130,6 +130,22 @@ pub enum Condition {
     AttributeExists(Path),
     /// `attribute_not_exists(path)`
     AttributeNotExists(Path),
+    /// `begins_with(path, operand)` — true if `path` is an `S` whose
+    /// value starts with `operand` (also an `S`).
+    BeginsWith(Path, Operand),
+    /// `contains(path, operand)` — true if `path` is an `S` containing
+    /// `operand` as a substring, OR if `path` is a set (`SS`/`NS`/`BS`)
+    /// containing `operand` as an element, OR if `path` is an `L`
+    /// containing `operand` (by value equality).
+    Contains(Path, Operand),
+    /// `op1 BETWEEN op2 AND op3` — inclusive range, both bounds same
+    /// type, numeric or lexicographic per DDB rules.
+    Between(Operand, Operand, Operand),
+    /// `op IN (op1, op2, ...)` — value equality against any of the list.
+    In(Operand, Vec<Operand>),
+    /// `attribute_type(path, :type)` — true if `path`'s top-level DDB
+    /// tag matches the literal `:type` string (`"S"`, `"N"`, ...).
+    AttributeType(Path, Operand),
     /// `cond AND cond`
     And(Box<Condition>, Box<Condition>),
     /// `cond OR cond`
@@ -232,6 +248,11 @@ pub enum RawCondition {
     },
     AttributeExists(RawPath),
     AttributeNotExists(RawPath),
+    BeginsWith(RawPath, RawOperand),
+    Contains(RawPath, RawOperand),
+    Between(RawOperand, RawOperand, RawOperand),
+    In(RawOperand, Vec<RawOperand>),
+    AttributeType(RawPath, RawOperand),
     And(Box<RawCondition>, Box<RawCondition>),
     Or(Box<RawCondition>, Box<RawCondition>),
     Not(Box<RawCondition>),
