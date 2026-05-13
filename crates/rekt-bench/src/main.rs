@@ -106,6 +106,44 @@ enum Workload {
     Put,
     Get,
     Mixed,
+    /// `SET counter = :v` on a working-set row. Routes through the
+    /// Phase 3a fast path (single `INSERT…ON CONFLICT DO UPDATE
+    /// jsonb_set` statement, no row lock).
+    UpdateFastSet,
+    /// `UpdateItem` with `attribute_not_exists(id)`. Each op uses a
+    /// fresh PK so the row never exists; routes through the Phase 4c
+    /// `INSERT…ON CONFLICT DO NOTHING` fast path. (Repeat runs use a
+    /// run-start epoch suffix to keep PKs unique.)
+    UpdateFastInsertOnly,
+    /// `SET counter = :v` gated on `attribute_exists(id)` — Phase 4d
+    /// SQL-WHERE fast path. Condition always passes on working-set rows;
+    /// isolates the cost of the compiled WHERE clause.
+    UpdateFastCond,
+    /// `SET counter = counter + :inc` on a working-set row. Routes
+    /// through the Phase 3b slow path (BEGIN tx → SELECT FOR UPDATE →
+    /// UPDATE → COMMIT). Keys spread, so no lock contention.
+    UpdateSlowRmw,
+    /// Same shape as `UpdateSlowRmw` but every op hits the same hot
+    /// key `bench-hot` — measures row-lock-induced serialization
+    /// under the slow path.
+    UpdateSlowRmwHot,
+}
+
+impl Workload {
+    /// True if this workload reads from a pre-populated working set
+    /// (Get / Mixed / most Update variants). False for Put and the
+    /// fresh-PK Update variant.
+    fn needs_working_set(self) -> bool {
+        match self {
+            Self::Put | Self::UpdateFastInsertOnly => false,
+            Self::Get
+            | Self::Mixed
+            | Self::UpdateFastSet
+            | Self::UpdateFastCond
+            | Self::UpdateSlowRmw => true,
+            Self::UpdateSlowRmwHot => false, // seeds one hot key separately
+        }
+    }
 }
 
 fn parse_dur(s: &str) -> Result<Duration, String> {
@@ -118,6 +156,18 @@ fn parse_dur(s: &str) -> Result<Duration, String> {
 trait Target: Send + Sync {
     async fn put(&self, pk: &str, payload: &Value) -> Result<()>;
     async fn get(&self, pk: &str) -> Result<()>;
+
+    /// `SET counter = :v` — Phase 3a fast path.
+    async fn update_fast_set(&self, pk: &str, value: i64) -> Result<()>;
+
+    /// PutItem-shaped insert-only: row must not exist. Phase 4c fast path.
+    async fn update_fast_insert_only(&self, pk: &str, payload: &Value) -> Result<()>;
+
+    /// `SET counter = :v` with `attribute_exists(id)`. Phase 4d fast path.
+    async fn update_fast_cond(&self, pk: &str, value: i64) -> Result<()>;
+
+    /// `SET counter = counter + :inc` — Phase 3b slow path.
+    async fn update_slow_rmw_inc(&self, pk: &str, by: i64) -> Result<()>;
 }
 
 // (We pull `async-trait` only as a transitive macro through reqwest's tower;
@@ -145,6 +195,61 @@ impl Target for HttpTarget {
             "Key": {"id": {"S": pk}},
         });
         self.post("DynamoDB_20120810.GetItem", &body).await
+    }
+
+    async fn update_fast_set(&self, pk: &str, value: i64) -> Result<()> {
+        // `#c` aliases `counter` (DDB-reserved); rektifier + ddb-local
+        // both accept the aliased form.
+        let body = json!({
+            "TableName": self.table,
+            "Key": {"id": {"S": pk}},
+            "UpdateExpression": "SET #c = :v",
+            "ExpressionAttributeNames": {"#c": "counter"},
+            "ExpressionAttributeValues": {":v": {"N": value.to_string()}},
+        });
+        self.post("DynamoDB_20120810.UpdateItem", &body).await
+    }
+
+    async fn update_fast_insert_only(&self, pk: &str, payload: &Value) -> Result<()> {
+        // We use UpdateItem with attribute_not_exists(id) so the
+        // workload exercises the Phase 4c branch end-to-end. The
+        // UpdateExpression sets a filler attr to keep size parity with
+        // Put.
+        let filler_value = payload
+            .get("filler")
+            .cloned()
+            .unwrap_or_else(|| json!({"S": ""}));
+        let body = json!({
+            "TableName": self.table,
+            "Key": {"id": {"S": pk}},
+            "UpdateExpression": "SET filler = :f",
+            "ExpressionAttributeValues": {":f": filler_value},
+            "ConditionExpression": "attribute_not_exists(id)",
+        });
+        self.post("DynamoDB_20120810.UpdateItem", &body).await
+    }
+
+    async fn update_fast_cond(&self, pk: &str, value: i64) -> Result<()> {
+        let body = json!({
+            "TableName": self.table,
+            "Key": {"id": {"S": pk}},
+            "UpdateExpression": "SET #c = :v",
+            "ExpressionAttributeNames": {"#c": "counter"},
+            "ExpressionAttributeValues": {":v": {"N": value.to_string()}},
+            "ConditionExpression": "attribute_exists(id)",
+        });
+        self.post("DynamoDB_20120810.UpdateItem", &body).await
+    }
+
+    async fn update_slow_rmw_inc(&self, pk: &str, by: i64) -> Result<()> {
+        let body = json!({
+            "TableName": self.table,
+            "Key": {"id": {"S": pk}},
+            "UpdateExpression": "SET #c = #c + :inc",
+            "ExpressionAttributeNames": {"#c": "counter"},
+            "ExpressionAttributeValues": {":inc": {"N": by.to_string()}},
+        });
+        self.post("DynamoDB_20120810.UpdateItem", &body).await
     }
 }
 
@@ -218,6 +323,136 @@ impl Target for PgTarget {
             .context("execute get")?;
         Ok(())
     }
+
+    async fn update_fast_set(&self, pk: &str, value: i64) -> Result<()> {
+        // Mirrors the Phase 3a fast-path SQL: INSERT…ON CONFLICT DO UPDATE
+        // SET data = jsonb_set(t.data, '{counter}', $v). The INSERT branch
+        // synthesizes a minimal `{id, counter}` row; the DO UPDATE branch
+        // jsonb_set's just the counter onto the existing row.
+        let client = self.pool.get().await.context("pool get")?;
+        let sql = format!(
+            "INSERT INTO \"{0}\" (data) VALUES ($1::jsonb) \
+             ON CONFLICT (id) DO UPDATE SET data = \
+             jsonb_set(\"{0}\".data, ARRAY[$2::text], $3::jsonb)",
+            self.table
+        );
+        let stmt = client
+            .prepare_typed_cached(&sql, &[Type::JSONB, Type::TEXT, Type::JSONB])
+            .await
+            .context("prepare update_fast_set")?;
+        let counter_value = json!({"N": value.to_string()});
+        let insert_item = json!({"id":{"S":pk}, "counter": counter_value});
+        client
+            .execute(
+                &stmt,
+                &[
+                    &Json(&insert_item),
+                    &"counter",
+                    &Json(&counter_value),
+                ],
+            )
+            .await
+            .context("execute update_fast_set")?;
+        Ok(())
+    }
+
+    async fn update_fast_insert_only(&self, pk: &str, payload: &Value) -> Result<()> {
+        let item = full_item(pk, payload);
+        let item_value = Value::Object(item.into_iter().collect());
+        let client = self.pool.get().await.context("pool get")?;
+        let sql = format!(
+            "INSERT INTO \"{0}\" (data) VALUES ($1::jsonb) \
+             ON CONFLICT (id) DO NOTHING",
+            self.table
+        );
+        let stmt = client
+            .prepare_typed_cached(&sql, &[Type::JSONB])
+            .await
+            .context("prepare update_fast_insert_only")?;
+        let rows = client
+            .execute(&stmt, &[&Json(&item_value)])
+            .await
+            .context("execute update_fast_insert_only")?;
+        if rows == 0 {
+            bail!("ConditionalCheckFailed (row already exists)");
+        }
+        Ok(())
+    }
+
+    async fn update_fast_cond(&self, pk: &str, value: i64) -> Result<()> {
+        // Phase 4d shape: UPDATE … WHERE pk = $1 AND (data ? 'id').
+        // The condition is trivially true on populated rows; the cost
+        // we're measuring is the WHERE clause overhead vs Phase 3a's
+        // unconditional upsert.
+        let client = self.pool.get().await.context("pool get")?;
+        let sql = format!(
+            "UPDATE \"{0}\" SET data = \
+             jsonb_set(data, ARRAY[$1::text], $2::jsonb) \
+             WHERE id = $3 AND (data ? 'id'::text)",
+            self.table
+        );
+        let stmt = client
+            .prepare_typed_cached(&sql, &[Type::TEXT, Type::JSONB, Type::TEXT])
+            .await
+            .context("prepare update_fast_cond")?;
+        let counter_value = json!({"N": value.to_string()});
+        let rows = client
+            .execute(&stmt, &[&"counter", &Json(&counter_value), &pk])
+            .await
+            .context("execute update_fast_cond")?;
+        if rows == 0 {
+            bail!("ConditionalCheckFailed");
+        }
+        Ok(())
+    }
+
+    async fn update_slow_rmw_inc(&self, pk: &str, by: i64) -> Result<()> {
+        // Mirror what rektifier's slow path does: BEGIN tx →
+        // SELECT FOR UPDATE → compute new counter in Rust → UPDATE →
+        // COMMIT. Same round-trip cost; same lock semantics. The
+        // direct-pg target is the latency floor for this code path.
+        let mut client = self.pool.get().await.context("pool get")?;
+        let tx = client.transaction().await.context("begin tx")?;
+        let select_sql = format!(
+            "SELECT data FROM \"{0}\" WHERE id = $1 FOR UPDATE",
+            self.table
+        );
+        let update_sql = format!("UPDATE \"{0}\" SET data = $1 WHERE id = $2", self.table);
+        let select_stmt = tx
+            .prepare_typed_cached(&select_sql, &[Type::TEXT])
+            .await
+            .context("prepare select")?;
+        let update_stmt = tx
+            .prepare_typed_cached(&update_sql, &[Type::JSONB, Type::TEXT])
+            .await
+            .context("prepare update")?;
+
+        let row = tx
+            .query_opt(&select_stmt, &[&pk])
+            .await
+            .context("select for update")?;
+        let existing: Value = row
+            .map(|r| {
+                let Json(v): Json<Value> = r.get(0);
+                v
+            })
+            .ok_or_else(|| anyhow::anyhow!("row not pre-populated: {pk}"))?;
+
+        let cur: i64 = existing["counter"]["N"]
+            .as_str()
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
+        let mut new_item = existing.clone();
+        if let Value::Object(obj) = &mut new_item {
+            obj.insert("counter".into(), json!({"N": (cur + by).to_string()}));
+        }
+        tx.execute(&update_stmt, &[&Json(&new_item), &pk])
+            .await
+            .context("execute update")?;
+        tx.commit().await.context("commit")?;
+        Ok(())
+    }
 }
 
 /// Build the full DDB-JSON item for `pk` with `payload` mixed in.
@@ -244,6 +479,16 @@ fn make_payload(target_bytes: usize) -> Value {
     json!({"filler": {"S": filler}})
 }
 
+/// Seeded payload for working-set rows used by update workloads. Same
+/// shape as `make_payload` but includes a `counter:{N:"0"}` attr so
+/// arithmetic-increment paths have something to read.
+fn seeded_payload(target_bytes: usize) -> Value {
+    let overhead = 90usize; // adds room for counter + id
+    let fill_len = target_bytes.saturating_sub(overhead).max(1);
+    let filler: String = "x".repeat(fill_len);
+    json!({"filler": {"S": filler}, "counter": {"N": "0"}})
+}
+
 // ============================== Bench runner ===================================
 
 struct Stats {
@@ -266,10 +511,13 @@ impl Stats {
 async fn run(args: RunArgs) -> Result<()> {
     let target: Arc<dyn Target> = build_target(&args).await?;
 
-    // Pre-populate for get/mixed workloads.
-    if matches!(args.workload, Workload::Get | Workload::Mixed) {
+    // Pre-populate the working set for workloads that read existing rows.
+    // Update workloads need a `counter` attr so increment paths work; we
+    // bake it into the seeded payload regardless of workload to keep the
+    // wire size comparable across runs.
+    if args.workload.needs_working_set() {
         eprintln!("populating working set ({} keys)...", args.working_set);
-        let payload = make_payload(args.item_size);
+        let payload = seeded_payload(args.item_size);
         for i in 0..args.working_set {
             let pk = format!("bench-{i:08}");
             target
@@ -277,6 +525,14 @@ async fn run(args: RunArgs) -> Result<()> {
                 .await
                 .with_context(|| format!("populating key {pk}"))?;
         }
+    }
+    if args.workload == Workload::UpdateSlowRmwHot {
+        eprintln!("populating hot key `bench-hot`...");
+        let payload = seeded_payload(args.item_size);
+        target
+            .put("bench-hot", &payload)
+            .await
+            .context("populating hot key")?;
     }
 
     // Build per-worker state.
@@ -288,15 +544,20 @@ async fn run(args: RunArgs) -> Result<()> {
 
     eprintln!(
         "running {} ops with concurrency={} for {} (after {} warmup)...",
-        match args.workload {
-            Workload::Put => "PutItem",
-            Workload::Get => "GetItem",
-            Workload::Mixed => "mixed 50/50",
-        },
+        workload_label(args.workload),
         args.concurrency,
         humantime::format_duration(args.duration),
         humantime::format_duration(args.warmup),
     );
+
+    // Unique-per-run PK prefix for the fresh-PK insert-only workload so
+    // repeated runs don't all CCFE after the first one populates the
+    // keyspace. (Workloads that target existing rows just reuse the
+    // `bench-{i}` pre-populated keys.)
+    let run_epoch_ms: u128 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
 
     let mut handles = Vec::with_capacity(args.concurrency);
     for worker_id in 0..args.concurrency {
@@ -312,6 +573,7 @@ async fn run(args: RunArgs) -> Result<()> {
                 payload,
                 workload,
                 working_set,
+                run_epoch_ms,
                 warmup_until,
                 run_until,
                 stats,
@@ -337,6 +599,7 @@ async fn worker_loop(
     payload: Arc<Value>,
     workload: Workload,
     working_set: usize,
+    run_epoch_ms: u128,
     warmup_until: Instant,
     run_until: Instant,
     stats: Arc<Mutex<Stats>>,
@@ -353,29 +616,19 @@ async fn worker_loop(
         }
         let recording = now >= warmup_until;
 
-        // Pick the op + key.
-        let do_put = match workload {
-            Workload::Put => true,
-            Workload::Get => false,
-            Workload::Mixed => counter % 2 == 0,
-        };
-        let pk = if do_put {
-            // Fresh PK per put avoids hot-key contention in the mixed mode.
-            format!("bench-w{worker_id:02}-{counter:08}")
-        } else {
-            // Sample a populated key uniformly-ish.
-            let idx = (counter as usize) % working_set;
-            format!("bench-{idx:08}")
-        };
-        counter = counter.wrapping_add(1);
-
         let started = Instant::now();
-        let result = if do_put {
-            target.put(&pk, &payload).await
-        } else {
-            target.get(&pk).await
-        };
+        let result = dispatch_op(
+            workload,
+            target.as_ref(),
+            &payload,
+            worker_id,
+            counter,
+            working_set,
+            run_epoch_ms,
+        )
+        .await;
         let elapsed_us = started.elapsed().as_micros() as u64;
+        counter = counter.wrapping_add(1);
 
         if recording {
             local_ops += 1;
@@ -394,6 +647,66 @@ async fn worker_loop(
     s.ops += local_ops;
 }
 
+/// Single-op dispatch: picks the PK strategy and target method
+/// appropriate for the workload. Kept separate from the worker loop so
+/// the latency-measuring block stays small.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_op(
+    workload: Workload,
+    target: &dyn Target,
+    payload: &Value,
+    worker_id: usize,
+    counter: u64,
+    working_set: usize,
+    run_epoch_ms: u128,
+) -> Result<()> {
+    match workload {
+        Workload::Put => {
+            let pk = format!("bench-w{worker_id:02}-{counter:08}");
+            target.put(&pk, payload).await
+        }
+        Workload::Get => {
+            let pk = working_set_key(counter, working_set);
+            target.get(&pk).await
+        }
+        Workload::Mixed => {
+            if counter % 2 == 0 {
+                let pk = format!("bench-w{worker_id:02}-{counter:08}");
+                target.put(&pk, payload).await
+            } else {
+                let pk = working_set_key(counter, working_set);
+                target.get(&pk).await
+            }
+        }
+        Workload::UpdateFastSet => {
+            let pk = working_set_key(counter, working_set);
+            target.update_fast_set(&pk, counter as i64).await
+        }
+        Workload::UpdateFastInsertOnly => {
+            // Fresh PK per op, tagged with the run epoch so re-runs
+            // don't collide with rows left over from prior runs.
+            let pk = format!("ins-{run_epoch_ms}-w{worker_id:02}-{counter:08}");
+            target.update_fast_insert_only(&pk, payload).await
+        }
+        Workload::UpdateFastCond => {
+            let pk = working_set_key(counter, working_set);
+            target.update_fast_cond(&pk, counter as i64).await
+        }
+        Workload::UpdateSlowRmw => {
+            let pk = working_set_key(counter, working_set);
+            target.update_slow_rmw_inc(&pk, 1).await
+        }
+        Workload::UpdateSlowRmwHot => {
+            target.update_slow_rmw_inc("bench-hot", 1).await
+        }
+    }
+}
+
+fn working_set_key(counter: u64, working_set: usize) -> String {
+    let idx = (counter as usize) % working_set.max(1);
+    format!("bench-{idx:08}")
+}
+
 fn print_report(args: &RunArgs, stats: &Stats, elapsed_s: f64) {
     let ops_per_sec = if elapsed_s > 0.0 {
         stats.ops as f64 / elapsed_s
@@ -406,11 +719,7 @@ fn print_report(args: &RunArgs, stats: &Stats, elapsed_s: f64) {
         TargetKind::DdbLocal => "ddb-local",
         TargetKind::DirectPg => "direct-pg",
     };
-    let workload_label = match args.workload {
-        Workload::Put => "PutItem",
-        Workload::Get => "GetItem",
-        Workload::Mixed => "mixed-50-50",
-    };
+    let workload_label = workload_label(args.workload);
     println!("\n=== rekt-bench report ===");
     println!("target       = {target_label}");
     println!("workload     = {workload_label}");
@@ -446,6 +755,19 @@ fn print_report(args: &RunArgs, stats: &Stats, elapsed_s: f64) {
 
 fn us_to_ms(us: u64) -> f64 {
     us as f64 / 1000.0
+}
+
+fn workload_label(w: Workload) -> &'static str {
+    match w {
+        Workload::Put => "PutItem",
+        Workload::Get => "GetItem",
+        Workload::Mixed => "mixed-50-50",
+        Workload::UpdateFastSet => "UpdateItem-fast-set (3a)",
+        Workload::UpdateFastInsertOnly => "UpdateItem-fast-insert-only (4c)",
+        Workload::UpdateFastCond => "UpdateItem-fast-cond (4d)",
+        Workload::UpdateSlowRmw => "UpdateItem-slow-rmw (3b spread)",
+        Workload::UpdateSlowRmwHot => "UpdateItem-slow-rmw-hot (3b hot-key)",
+    }
 }
 
 async fn build_target(args: &RunArgs) -> Result<Arc<dyn Target>> {
