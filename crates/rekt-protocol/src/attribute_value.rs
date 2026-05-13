@@ -110,6 +110,11 @@ impl<'de> Deserialize<'de> for AttributeValue {
                     }
                     "L" => AttributeValue::L(map.next_value()?),
                     "M" => AttributeValue::M(map.next_value()?),
+                    // DDB sets are unordered by spec; the API contract makes
+                    // no order promises. Rektifier preserves input order on
+                    // the production path — clients must not depend on
+                    // ordering. Tests normalize by sorting set elements
+                    // before comparing across implementations.
                     "SS" => AttributeValue::Ss(map.next_value()?),
                     "NS" => AttributeValue::Ns(map.next_value()?),
                     "BS" => {

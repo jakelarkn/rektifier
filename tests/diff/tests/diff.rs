@@ -147,18 +147,52 @@ fn assert_round_trip_matches(table: &str, item: &str, key: &str) {
         "PutItem responses diverged for {table} / item={item}"
     );
 
-    let get_ref = aws(
+    let mut get_ref = aws(
         REF,
         &["dynamodb", "get-item", "--table-name", table, "--key", key],
     );
-    let get_ours = aws(
+    let mut get_ours = aws(
         OURS,
         &["dynamodb", "get-item", "--table-name", table, "--key", key],
     );
+    // Sets are unordered by spec; normalize before comparing.
+    sort_sets(&mut get_ref);
+    sort_sets(&mut get_ours);
     assert_eq!(
         get_ref, get_ours,
         "GetItem responses diverged for {table} / key={key}\nref:  {get_ref}\nours: {get_ours}"
     );
+}
+
+/// Walk a DDB-JSON `Value` and sort the contents of every `SS`/`NS`/`BS`
+/// set in place. DDB sets are unordered — comparing across implementations
+/// requires canonicalizing the array order. Set elements are always
+/// strings on the wire (numbers as decimal strings; binaries as base64),
+/// so a lexical sort is unambiguous and identical across both endpoints.
+fn sort_sets(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            if map.len() == 1 {
+                for set_key in ["SS", "NS", "BS"] {
+                    if let Some(Value::Array(arr)) = map.get_mut(set_key) {
+                        arr.sort_by(|a, b| match (a.as_str(), b.as_str()) {
+                            (Some(a), Some(b)) => a.cmp(b),
+                            _ => std::cmp::Ordering::Equal,
+                        });
+                    }
+                }
+            }
+            for (_, child) in map.iter_mut() {
+                sort_sets(child);
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr.iter_mut() {
+                sort_sets(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn ensure_users_table() {
@@ -273,6 +307,115 @@ fn diff_string_set() {
         "users",
         r#"{"id":{"S":"diff_ss"},"tags":{"SS":["a","b","c"]}}"#,
         r#"{"id":{"S":"diff_ss"}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_number_set() {
+    ensure_users_table();
+    assert_round_trip_matches(
+        "users",
+        r#"{"id":{"S":"diff_ns"},"scores":{"NS":["1","2","3.14","-7"]}}"#,
+        r#"{"id":{"S":"diff_ns"}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_binary_set() {
+    ensure_users_table();
+    // base64("a") == "YQ==", base64("bb") == "YmI=", base64("ccc") == "Y2Nj"
+    assert_round_trip_matches(
+        "users",
+        r#"{"id":{"S":"diff_bs"},"chunks":{"BS":["YQ==","YmI=","Y2Nj"]}}"#,
+        r#"{"id":{"S":"diff_bs"}}"#,
+    );
+}
+
+// ===== Empty-collection edges ================================================
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_empty_string_value() {
+    ensure_users_table();
+    // DDB has allowed empty S values since 2020.
+    assert_round_trip_matches(
+        "users",
+        r#"{"id":{"S":"diff_empty_s"},"note":{"S":""}}"#,
+        r#"{"id":{"S":"diff_empty_s"}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_empty_binary_value() {
+    ensure_users_table();
+    // Empty base64 -> 0 bytes. DDB has allowed empty B values since 2020.
+    assert_round_trip_matches(
+        "users",
+        r#"{"id":{"S":"diff_empty_b"},"blob":{"B":""}}"#,
+        r#"{"id":{"S":"diff_empty_b"}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_empty_list() {
+    ensure_users_table();
+    assert_round_trip_matches(
+        "users",
+        r#"{"id":{"S":"diff_empty_l"},"items":{"L":[]}}"#,
+        r#"{"id":{"S":"diff_empty_l"}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_empty_map() {
+    ensure_users_table();
+    assert_round_trip_matches(
+        "users",
+        r#"{"id":{"S":"diff_empty_m"},"attrs":{"M":{}}}"#,
+        r#"{"id":{"S":"diff_empty_m"}}"#,
+    );
+}
+
+// ===== Two-layer nesting =====================================================
+//
+// `diff_nested_map` already covers M-in-M. These cover the other 2-layer
+// shapes a DDB item commonly takes (list of lists, list of maps, map of lists).
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_list_of_lists() {
+    ensure_users_table();
+    assert_round_trip_matches(
+        "users",
+        r#"{"id":{"S":"diff_l_in_l"},"matrix":{"L":[{"L":[{"S":"a"},{"N":"1"}]},{"L":[{"BOOL":true},{"NULL":true}]}]}}"#,
+        r#"{"id":{"S":"diff_l_in_l"}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_list_of_maps() {
+    ensure_users_table();
+    assert_round_trip_matches(
+        "users",
+        r#"{"id":{"S":"diff_m_in_l"},"events":{"L":[{"M":{"kind":{"S":"click"},"n":{"N":"1"}}},{"M":{"kind":{"S":"view"},"n":{"N":"7"}}}]}}"#,
+        r#"{"id":{"S":"diff_m_in_l"}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_map_of_lists() {
+    ensure_users_table();
+    assert_round_trip_matches(
+        "users",
+        r#"{"id":{"S":"diff_l_in_m"},"meta":{"M":{"tags":{"L":[{"S":"a"},{"S":"b"}]},"flags":{"L":[{"BOOL":true},{"BOOL":false}]}}}}"#,
+        r#"{"id":{"S":"diff_l_in_m"}}"#,
     );
 }
 
