@@ -47,13 +47,19 @@ impl KeyValue {
     }
 }
 
-/// Underlying-backend table shape. For PG: real table name + column names.
-/// `sk_col = None` means hash-only — no sort-key column in the PG schema.
+/// Underlying-backend table shape. For PG: real table name + column names
+/// + declared key types. `sk_col = None` means hash-only.
+///
+/// `pk_type` and `sk_type` are present so backends can pre-resolve SQL
+/// (parameter casts, prepared-statement type vectors) at shape-load time
+/// rather than per-call from a runtime `KeyValue`.
 #[derive(Debug, Clone)]
 pub struct TableShape<'a> {
     pub table: &'a str,
     pub pk_col: &'a str,
+    pub pk_type: KeyType,
     pub sk_col: Option<&'a str>,
+    pub sk_type: Option<KeyType>,
     pub jsonb_col: &'a str,
 }
 

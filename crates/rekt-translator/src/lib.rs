@@ -35,7 +35,9 @@ impl TableSchema {
         TableShape {
             table: &self.pg_table,
             pk_col: &self.pk_attr,
+            pk_type: self.pk_type,
             sk_col: self.sk_attr.as_deref(),
+            sk_type: self.sk_type,
             jsonb_col: &self.jsonb_col,
         }
     }

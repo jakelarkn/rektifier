@@ -13,7 +13,9 @@
 use async_trait::async_trait;
 use bytes::BytesMut;
 use deadpool_postgres::{Manager, Pool};
-use rekt_storage::{Backend, BackendError, KeyValue, TableShape};
+use rekt_storage::{Backend, BackendError, KeyType, KeyValue, TableShape};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::{IsNull, Json, ToSql, Type};
 use tokio_postgres::NoTls;
@@ -21,13 +23,34 @@ use tracing::Instrument;
 
 pub struct PgBackend {
     pool: Pool,
+    /// Per-table cache of pre-formatted SQL and prepared-statement type
+    /// vectors. Populated lazily on first touch from a `TableShape`. Keyed
+    /// by `shape.table` (the PG table name).
+    sql_cache: RwLock<HashMap<String, Arc<ShapeSql>>>,
+}
+
+/// All the per-shape SQL state that used to be rebuilt every call.
+/// Computed once per distinct `TableShape`, then handed out as an `Arc`.
+struct ShapeSql {
+    put_sql: String,
+    get_sql: String,
+    /// Parameter types for `put_item_raw`'s `prepare_typed_cached`: always
+    /// `[JSONB]` since writes only bind the jsonb column.
+    put_types: Vec<Type>,
+    /// Parameter types for `get_item_raw`'s `prepare_typed_cached`: `[pk]`
+    /// for hash-only, `[pk, sk]` for composite. Each is `TEXT` (for `S`/`N`
+    /// keys; the SQL contains the `::numeric` cast) or `BYTEA` (for `B`).
+    get_types: Vec<Type>,
 }
 
 impl PgBackend {
     /// Wrap an existing pool. Prefer this when the caller wants to share a
     /// `Pool` with other components (e.g. `rekt-meta::verify`).
     pub fn new(pool: Pool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            sql_cache: RwLock::new(HashMap::new()),
+        }
     }
 
     pub fn connect(connection_string: &str) -> Result<Self, BackendError> {
@@ -42,7 +65,7 @@ impl PgBackend {
             .max_size(16)
             .build()
             .map_err(|e| BackendError::Other(format!("pool build failed: {e}")))?;
-        Ok(Self { pool })
+        Ok(Self::new(pool))
     }
 
     async fn client(&self) -> Result<deadpool_postgres::Object, BackendError> {
@@ -51,6 +74,22 @@ impl PgBackend {
             .instrument(tracing::debug_span!("pg.pool_get"))
             .await
             .map_err(|e| BackendError::Other(format!("pool get failed: {e}")))
+    }
+
+    /// Get or lazily-build the cached SQL for `shape`. Read-locks for the
+    /// common (hit) case; takes the write lock only on first touch per table.
+    fn shape_sql(&self, shape: &TableShape<'_>) -> Arc<ShapeSql> {
+        if let Some(s) = self.sql_cache.read().unwrap().get(shape.table) {
+            return Arc::clone(s);
+        }
+        let built = Arc::new(ShapeSql::build(shape));
+        let mut w = self.sql_cache.write().unwrap();
+        // Double-check: another thread may have inserted while we were
+        // acquiring the write lock.
+        Arc::clone(
+            w.entry(shape.table.to_string())
+                .or_insert_with(|| built.clone()),
+        )
     }
 }
 
@@ -113,25 +152,67 @@ impl ToSql for Bound<'_> {
     tokio_postgres::types::to_sql_checked!();
 }
 
-/// SQL-level cast a parameter placeholder needs so PG accepts our text-formatted
-/// bytes against a non-text column. `S` binds as text → matches `text` natively;
-/// `B` binds as `&[u8]` → matches `bytea` natively; `N` binds as text but the
-/// column is `numeric`, so we have to spell `$N::numeric` to coerce.
-fn param_cast(kv: &KeyValue) -> &'static str {
-    match kv {
-        KeyValue::S(_) | KeyValue::B(_) => "",
-        KeyValue::N(_) => "::numeric",
+/// SQL-level cast suffix for a parameter declared as `KeyType`. `S` and `B`
+/// match their target column types natively; `N` is bound as text and cast
+/// to numeric at the SQL level.
+fn cast_for_keytype(t: KeyType) -> &'static str {
+    match t {
+        KeyType::S | KeyType::B => "",
+        KeyType::N => "::numeric",
     }
 }
 
-/// PG type to declare for a `prepare_typed` slot bound from a `KeyValue`.
-/// We force `N` to bind as TEXT (paired with a `::numeric` SQL cast) instead
-/// of letting PG infer NUMERIC, because the text→numeric path is much simpler
-/// than implementing PG's numeric binary wire format in Rust.
-fn param_pg_type(kv: &KeyValue) -> Type {
-    match kv {
-        KeyValue::S(_) | KeyValue::N(_) => Type::TEXT,
-        KeyValue::B(_) => Type::BYTEA,
+/// PG `prepare_typed` type for a declared `KeyType`. `S`/`N` both bind as
+/// TEXT (the SQL contains the `::numeric` cast for `N`); `B` binds as BYTEA.
+fn pg_type_for_keytype(t: KeyType) -> Type {
+    match t {
+        KeyType::S | KeyType::N => Type::TEXT,
+        KeyType::B => Type::BYTEA,
+    }
+}
+
+impl ShapeSql {
+    fn build(shape: &TableShape<'_>) -> Self {
+        let table = quote_ident(shape.table);
+        let pk_col = quote_ident(shape.pk_col);
+        let jsonb_col = quote_ident(shape.jsonb_col);
+        let pk_cast = cast_for_keytype(shape.pk_type);
+        let pk_pg = pg_type_for_keytype(shape.pk_type);
+
+        match (shape.sk_col, shape.sk_type) {
+            (None, _) => Self {
+                put_sql: format!(
+                    "INSERT INTO {table} ({jsonb_col}) VALUES ($1) \
+                     ON CONFLICT ({pk_col}) \
+                     DO UPDATE SET {jsonb_col} = EXCLUDED.{jsonb_col}"
+                ),
+                get_sql: format!("SELECT {jsonb_col} FROM {table} WHERE {pk_col} = $1{pk_cast}"),
+                put_types: vec![Type::JSONB],
+                get_types: vec![pk_pg],
+            },
+            (Some(sk_col_name), Some(sk_type)) => {
+                let sk_col = quote_ident(sk_col_name);
+                let sk_cast = cast_for_keytype(sk_type);
+                let sk_pg = pg_type_for_keytype(sk_type);
+                Self {
+                    put_sql: format!(
+                        "INSERT INTO {table} ({jsonb_col}) VALUES ($1) \
+                         ON CONFLICT ({pk_col}, {sk_col}) \
+                         DO UPDATE SET {jsonb_col} = EXCLUDED.{jsonb_col}"
+                    ),
+                    get_sql: format!(
+                        "SELECT {jsonb_col} FROM {table} \
+                         WHERE {pk_col} = $1{pk_cast} AND {sk_col} = $2{sk_cast}"
+                    ),
+                    put_types: vec![Type::JSONB],
+                    get_types: vec![pk_pg, sk_pg],
+                }
+            }
+            (Some(_), None) => panic!(
+                "TableShape `{}`: sk_col is Some but sk_type is None — invariant violation",
+                shape.table
+            ),
+        }
     }
 }
 
@@ -171,32 +252,10 @@ impl Backend for PgBackend {
         shape: &TableShape<'_>,
         item: &serde_json::Value,
     ) -> Result<(), BackendError> {
+        let sql = self.shape_sql(shape);
         let client = self.client().await?;
-
-        let table = quote_ident(shape.table);
-        let pk_col = quote_ident(shape.pk_col);
-        let jsonb_col = quote_ident(shape.jsonb_col);
-
-        // Writes never bind key values. PG derives the generated columns from
-        // the JSONB on INSERT; the ON CONFLICT target is just column names.
-        let sql = match shape.sk_col {
-            None => format!(
-                "INSERT INTO {table} ({jsonb_col}) VALUES ($1) \
-                 ON CONFLICT ({pk_col}) \
-                 DO UPDATE SET {jsonb_col} = EXCLUDED.{jsonb_col}"
-            ),
-            Some(sk_col_name) => {
-                let sk_col = quote_ident(sk_col_name);
-                format!(
-                    "INSERT INTO {table} ({jsonb_col}) VALUES ($1) \
-                     ON CONFLICT ({pk_col}, {sk_col}) \
-                     DO UPDATE SET {jsonb_col} = EXCLUDED.{jsonb_col}"
-                )
-            }
-        };
-
         let stmt = client
-            .prepare_typed_cached(&sql, &[Type::JSONB])
+            .prepare_typed_cached(&sql.put_sql, &sql.put_types)
             .instrument(tracing::debug_span!("pg.prepare"))
             .await
             .map_err(|e| map_pg_err(shape.table, e))?;
@@ -216,49 +275,29 @@ impl Backend for PgBackend {
         sk: Option<&KeyValue>,
     ) -> Result<Option<serde_json::Value>, BackendError> {
         check_sk_shape(shape, sk)?;
+        let sql = self.shape_sql(shape);
         let client = self.client().await?;
-
-        let table = quote_ident(shape.table);
-        let pk_col = quote_ident(shape.pk_col);
-        let jsonb_col = quote_ident(shape.jsonb_col);
+        let stmt = client
+            .prepare_typed_cached(&sql.get_sql, &sql.get_types)
+            .instrument(tracing::debug_span!("pg.prepare"))
+            .await
+            .map_err(|e| map_pg_err(shape.table, e))?;
 
         let pk_bound = Bound(pk);
-        let pk_cast = param_cast(pk);
-        let pk_pg = param_pg_type(pk);
-
-        let query_result = match (shape.sk_col, sk) {
-            (None, _) => {
-                let sql = format!("SELECT {jsonb_col} FROM {table} WHERE {pk_col} = $1{pk_cast}");
-                let stmt = client
-                    .prepare_typed_cached(&sql, &[pk_pg])
-                    .instrument(tracing::debug_span!("pg.prepare"))
-                    .await
-                    .map_err(|e| map_pg_err(shape.table, e))?;
+        let query_result = match sk {
+            None => {
                 client
                     .query_opt(&stmt, &[&pk_bound])
                     .instrument(tracing::debug_span!("pg.query"))
                     .await
             }
-            (Some(sk_col_name), Some(sk_val)) => {
-                let sk_col = quote_ident(sk_col_name);
+            Some(sk_val) => {
                 let sk_bound = Bound(sk_val);
-                let sk_cast = param_cast(sk_val);
-                let sk_pg = param_pg_type(sk_val);
-                let sql = format!(
-                    "SELECT {jsonb_col} FROM {table} \
-                     WHERE {pk_col} = $1{pk_cast} AND {sk_col} = $2{sk_cast}"
-                );
-                let stmt = client
-                    .prepare_typed_cached(&sql, &[pk_pg, sk_pg])
-                    .instrument(tracing::debug_span!("pg.prepare"))
-                    .await
-                    .map_err(|e| map_pg_err(shape.table, e))?;
                 client
                     .query_opt(&stmt, &[&pk_bound, &sk_bound])
                     .instrument(tracing::debug_span!("pg.query"))
                     .await
             }
-            (Some(_), None) => unreachable!("rejected by check_sk_shape above"),
         };
 
         let row = query_result.map_err(|e| map_pg_err(shape.table, e))?;
@@ -316,7 +355,9 @@ mod tests {
         let shape = TableShape {
             table: "rekt_t_hash_s",
             pk_col: "id",
+            pk_type: KeyType::S,
             sk_col: None,
+            sk_type: None,
             jsonb_col: "data",
         };
         let item = serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice"}});
@@ -383,7 +424,9 @@ mod tests {
         let shape = TableShape {
             table: "rekt_t_comp_sn",
             pk_col: "device_id",
+            pk_type: KeyType::S,
             sk_col: Some("ts"),
+            sk_type: Some(KeyType::N),
             jsonb_col: "doc",
         };
 
@@ -452,7 +495,9 @@ mod tests {
         let shape = TableShape {
             table: "rekt_t_hash_b",
             pk_col: "hash",
+            pk_type: KeyType::B,
             sk_col: None,
+            sk_type: None,
             jsonb_col: "meta",
         };
         // base64 of "\x00\x01\x02\xff" is "AAEC/w==".
@@ -499,7 +544,9 @@ mod tests {
         let shape = TableShape {
             table: "rekt_t_pk_required",
             pk_col: "id",
+            pk_type: KeyType::S,
             sk_col: None,
+            sk_type: None,
             jsonb_col: "data",
         };
         // JSONB has no `id` attr — generated column yields NULL — PRIMARY KEY rejects.
@@ -522,7 +569,9 @@ mod tests {
         let shape = TableShape {
             table: "rekt_does_not_exist_anywhere",
             pk_col: "id",
+            pk_type: KeyType::S,
             sk_col: None,
+            sk_type: None,
             jsonb_col: "data",
         };
         let err = backend
