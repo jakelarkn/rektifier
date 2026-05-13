@@ -109,37 +109,37 @@ enum Workload {
     /// `SET counter = :v` on a working-set row. Routes through the
     /// Phase 3a fast path (single `INSERT…ON CONFLICT DO UPDATE
     /// jsonb_set` statement, no row lock).
-    UpdateFastSet,
+    UpdateDirectSet,
     /// `UpdateItem` with `attribute_not_exists(id)`. Each op uses a
     /// fresh PK so the row never exists; routes through the Phase 4c
     /// `INSERT…ON CONFLICT DO NOTHING` fast path. (Repeat runs use a
     /// run-start epoch suffix to keep PKs unique.)
-    UpdateFastInsertOnly,
+    UpdateDirectInsertOnly,
     /// `SET counter = :v` gated on `attribute_exists(id)` — Phase 4d
     /// SQL-WHERE fast path. Condition always passes on working-set rows;
     /// isolates the cost of the compiled WHERE clause.
-    UpdateFastCond,
+    UpdateDirectCond,
     /// `SET counter = counter + :inc` on a working-set row. Routes
     /// through the Phase 3b slow path (BEGIN tx → SELECT FOR UPDATE →
     /// UPDATE → COMMIT). Keys spread, so no lock contention.
-    UpdateSlowRmw,
-    /// Same shape as `UpdateSlowRmw` but every op hits the same hot
+    UpdateTxRmw,
+    /// Same shape as `UpdateTxRmw` but every op hits the same hot
     /// key `bench-hot` — measures row-lock-induced serialization
     /// under the slow path.
-    UpdateSlowRmwHot,
+    UpdateTxRmwHot,
     /// `ADD counter :inc` — Phase 5 numeric ADD. Same end-state as
-    /// `UpdateSlowRmw` (`SET counter = counter + :inc`); pairing the
+    /// `UpdateTxRmw` (`SET counter = counter + :inc`); pairing the
     /// two answers "does the ADD clause cost the same as the
     /// equivalent SET-arithmetic?"
-    UpdateSlowAddNum,
+    UpdateTxAddNum,
     /// `ADD tags :new` — Phase 5 set union. Different Rust path from
     /// numeric ADD (set dedup) but same Tx envelope.
-    UpdateSlowAddSet,
+    UpdateTxAddSet,
     /// `SET marker = :v` gated on `begins_with(name, :p)` — Phase 4e
     /// representative. Condition always true on seeded rows; isolates
     /// the cost of the in-Rust condition evaluator on top of the
     /// slow-path RMW round-trip.
-    UpdateSlowCondBeginsWith,
+    UpdateTxCondBeginsWith,
 }
 
 impl Workload {
@@ -148,16 +148,16 @@ impl Workload {
     /// fresh-PK Update variant.
     fn needs_working_set(self) -> bool {
         match self {
-            Self::Put | Self::UpdateFastInsertOnly => false,
+            Self::Put | Self::UpdateDirectInsertOnly => false,
             Self::Get
             | Self::Mixed
-            | Self::UpdateFastSet
-            | Self::UpdateFastCond
-            | Self::UpdateSlowRmw
-            | Self::UpdateSlowAddNum
-            | Self::UpdateSlowAddSet
-            | Self::UpdateSlowCondBeginsWith => true,
-            Self::UpdateSlowRmwHot => false, // seeds one hot key separately
+            | Self::UpdateDirectSet
+            | Self::UpdateDirectCond
+            | Self::UpdateTxRmw
+            | Self::UpdateTxAddNum
+            | Self::UpdateTxAddSet
+            | Self::UpdateTxCondBeginsWith => true,
+            Self::UpdateTxRmwHot => false, // seeds one hot key separately
         }
     }
 }
@@ -719,7 +719,7 @@ async fn run(args: RunArgs) -> Result<()> {
                 .with_context(|| format!("populating key {pk}"))?;
         }
     }
-    if args.workload == Workload::UpdateSlowRmwHot {
+    if args.workload == Workload::UpdateTxRmwHot {
         eprintln!("populating hot key `bench-hot`...");
         let payload = seeded_payload(args.item_size);
         target
@@ -871,39 +871,39 @@ async fn dispatch_op(
                 target.get(&pk).await
             }
         }
-        Workload::UpdateFastSet => {
+        Workload::UpdateDirectSet => {
             let pk = working_set_key(counter, working_set);
             target.update_fast_set(&pk, counter as i64).await
         }
-        Workload::UpdateFastInsertOnly => {
+        Workload::UpdateDirectInsertOnly => {
             // Fresh PK per op, tagged with the run epoch so re-runs
             // don't collide with rows left over from prior runs.
             let pk = format!("ins-{run_epoch_ms}-w{worker_id:02}-{counter:08}");
             target.update_fast_insert_only(&pk, payload).await
         }
-        Workload::UpdateFastCond => {
+        Workload::UpdateDirectCond => {
             let pk = working_set_key(counter, working_set);
             target.update_fast_cond(&pk, counter as i64).await
         }
-        Workload::UpdateSlowRmw => {
+        Workload::UpdateTxRmw => {
             let pk = working_set_key(counter, working_set);
             target.update_slow_rmw_inc(&pk, 1).await
         }
-        Workload::UpdateSlowRmwHot => {
+        Workload::UpdateTxRmwHot => {
             target.update_slow_rmw_inc("bench-hot", 1).await
         }
-        Workload::UpdateSlowAddNum => {
+        Workload::UpdateTxAddNum => {
             let pk = working_set_key(counter, working_set);
             target.update_slow_add_num(&pk, 1).await
         }
-        Workload::UpdateSlowAddSet => {
+        Workload::UpdateTxAddSet => {
             let pk = working_set_key(counter, working_set);
             // Use the counter to generate a unique item; sometimes hits
             // an existing element (forcing dedup), sometimes adds new.
             let item = format!("tag-{}", counter % 16);
             target.update_slow_add_set(&pk, &[item]).await
         }
-        Workload::UpdateSlowCondBeginsWith => {
+        Workload::UpdateTxCondBeginsWith => {
             let pk = working_set_key(counter, working_set);
             // Seeded name is "alice"; prefix "ali" always matches.
             let marker = format!("m{counter}");
@@ -972,14 +972,14 @@ fn workload_label(w: Workload) -> &'static str {
         Workload::Put => "PutItem",
         Workload::Get => "GetItem",
         Workload::Mixed => "mixed-50-50",
-        Workload::UpdateFastSet => "UpdateItem-fast-set (3a)",
-        Workload::UpdateFastInsertOnly => "UpdateItem-fast-insert-only (4c)",
-        Workload::UpdateFastCond => "UpdateItem-fast-cond (4d)",
-        Workload::UpdateSlowRmw => "UpdateItem-slow-rmw (3b spread)",
-        Workload::UpdateSlowRmwHot => "UpdateItem-slow-rmw-hot (3b hot-key)",
-        Workload::UpdateSlowAddNum => "UpdateItem-slow-add-num (5)",
-        Workload::UpdateSlowAddSet => "UpdateItem-slow-add-set (5)",
-        Workload::UpdateSlowCondBeginsWith => "UpdateItem-slow-cond-begins-with (4e)",
+        Workload::UpdateDirectSet => "UpdateItem-direct-set (3a)",
+        Workload::UpdateDirectInsertOnly => "UpdateItem-direct-insert-only (4c)",
+        Workload::UpdateDirectCond => "UpdateItem-direct-cond (4d)",
+        Workload::UpdateTxRmw => "UpdateItem-tx-rmw (3b spread)",
+        Workload::UpdateTxRmwHot => "UpdateItem-tx-rmw-hot (3b hot-key)",
+        Workload::UpdateTxAddNum => "UpdateItem-tx-add-num (5)",
+        Workload::UpdateTxAddSet => "UpdateItem-tx-add-set (5)",
+        Workload::UpdateTxCondBeginsWith => "UpdateItem-tx-cond-begins-with (4e)",
     }
 }
 
