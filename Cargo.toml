@@ -6,6 +6,7 @@ members = [
     "crates/rekt-storage",
     "crates/rekt-storage-libpq",
     "crates/rekt-translator",
+    "crates/rekt-expressions",
     "crates/rekt-config",
     "crates/rekt-meta",
     "crates/rekt-server",
@@ -51,6 +52,7 @@ clap = { version = "4", features = ["derive"] }
 hdrhistogram = "7"
 humantime = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+winnow = "0.7"
 
 [profile.dev]
 opt-level = 0

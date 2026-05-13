@@ -1343,6 +1343,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rekt-expressions"
+version = "0.0.1"
+dependencies = [
+ "bytes",
+ "rekt-protocol",
+ "thiserror 1.0.69",
+ "winnow",
+]
+
+[[package]]
 name = "rekt-meta"
 version = "0.0.1"
 dependencies = [

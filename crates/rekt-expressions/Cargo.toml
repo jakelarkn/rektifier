@@ -1,0 +1,15 @@
+[package]
+name = "rekt-expressions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Parser + AST for DynamoDB expression languages (UpdateExpression, ConditionExpression, FilterExpression, KeyConditionExpression)"
+
+[dependencies]
+rekt-protocol = { path = "../rekt-protocol" }
+thiserror = { workspace = true }
+winnow = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
