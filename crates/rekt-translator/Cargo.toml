@@ -9,6 +9,7 @@ description = "DynamoDB op + AST -> backend-neutral plan (storage layer call sha
 [dependencies]
 rekt-protocol = { path = "../rekt-protocol" }
 rekt-storage = { path = "../rekt-storage" }
+rekt-expressions = { path = "../rekt-expressions" }
 bytes = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

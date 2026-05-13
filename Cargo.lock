@@ -1433,6 +1433,7 @@ name = "rekt-translator"
 version = "0.0.1"
 dependencies = [
  "bytes",
+ "rekt-expressions",
  "rekt-protocol",
  "rekt-storage",
  "serde_json",
