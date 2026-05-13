@@ -83,6 +83,22 @@ impl Backend for MockBackend {
             .get(&(shape.table.to_string(), pk_value, sk_value))
             .cloned())
     }
+
+    async fn delete_item_raw(
+        &self,
+        shape: &TableShape<'_>,
+        pk: &KeyValue,
+        sk: Option<&KeyValue>,
+    ) -> Result<(), BackendError> {
+        let pk_value = kv_to_string(pk);
+        let sk_value = sk.map(kv_to_string).unwrap_or_default();
+        self.store
+            .lock()
+            .unwrap()
+            .remove(&(shape.table.to_string(), pk_value, sk_value));
+        // DDB DeleteItem is idempotent — Ok regardless of whether the row existed.
+        Ok(())
+    }
 }
 
 /// Pull the string value out of a DDB-JSON AttributeValue like `{"S":"u1"}`.
@@ -347,6 +363,91 @@ async fn put_item_returns_empty_object_and_correct_content_type() {
     assert_eq!(ct, "application/x-amz-json-1.0");
     let body = body_json(resp).await;
     assert_eq!(body, json!({}));
+}
+
+#[tokio::test]
+async fn delete_then_get_returns_empty() {
+    let app = app();
+    // Put first
+    let item = json!({"id":{"S":"to_delete"},"name":{"S":"alice"}});
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item": item}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Confirm present
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"to_delete"}}}),
+        ))
+        .await
+        .unwrap();
+    let got = body_json(resp).await;
+    assert!(
+        got.get("Item").is_some(),
+        "expected Item before delete: {got}"
+    );
+
+    // Delete
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "DeleteItem",
+            json!({"TableName":"users","Key":{"id":{"S":"to_delete"}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let del_body = body_json(resp).await;
+    assert_eq!(del_body, json!({}));
+
+    // Confirm gone
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"to_delete"}}}),
+        ))
+        .await
+        .unwrap();
+    let got = body_json(resp).await;
+    assert_eq!(got, json!({}), "expected empty Item after delete: {got}");
+}
+
+#[tokio::test]
+async fn delete_nonexistent_is_ok() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "DeleteItem",
+            json!({"TableName":"users","Key":{"id":{"S":"never_existed"}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await, json!({}));
+}
+
+#[tokio::test]
+async fn delete_with_extra_key_attr_is_validation_error() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "DeleteItem",
+            json!({"TableName":"users","Key":{"id":{"S":"u1"},"extra":{"S":"x"}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let ty = body.get("__type").and_then(Value::as_str).unwrap();
+    assert!(ty.ends_with("#ValidationException"), "got: {ty}");
 }
 
 #[tokio::test]

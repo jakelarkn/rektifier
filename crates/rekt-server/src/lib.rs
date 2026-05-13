@@ -26,10 +26,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 use bytes::Bytes;
-use rekt_protocol::{GetItemRequest, GetItemResponse, Item, PutItemRequest, PutItemResponse};
+use rekt_protocol::{
+    DeleteItemRequest, DeleteItemResponse, GetItemRequest, GetItemResponse, Item, PutItemRequest,
+    PutItemResponse,
+};
 use rekt_sigv4::{SigV4Error, Verifier};
 use rekt_storage::{Backend, BackendError};
-use rekt_translator::{translate_get_item, translate_put_item, TableSchema, TranslateError};
+use rekt_translator::{
+    translate_delete_item, translate_get_item, translate_put_item, TableSchema, TranslateError,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -206,6 +211,7 @@ async fn dispatch(State(state): State<AppState>, req: Request) -> Result<Respons
     match op {
         "PutItem" => handle_put_item(&state, &body).await,
         "GetItem" => handle_get_item(&state, &body).await,
+        "DeleteItem" => handle_delete_item(&state, &body).await,
         _ => Err(ApiError::UnknownOperation(format!(
             "operation `{op}` not implemented"
         ))),
@@ -256,6 +262,26 @@ async fn handle_get_item(state: &AppState, body: &Bytes) -> Result<Response, Api
     };
 
     let resp = GetItemResponse { item };
+    Ok(json_ok(&resp))
+}
+
+#[tracing::instrument(level = "debug", skip_all, name = "server.delete_item", fields(table = tracing::field::Empty))]
+async fn handle_delete_item(state: &AppState, body: &Bytes) -> Result<Response, ApiError> {
+    let req: DeleteItemRequest = serde_json::from_slice(body)
+        .map_err(|e| ApiError::Serialization(format!("invalid DeleteItem body: {e}")))?;
+    tracing::Span::current().record("table", req.table_name.as_str());
+
+    let schema = state.schemas.get(&req.table_name).ok_or_else(|| {
+        ApiError::ResourceNotFound(format!("Table not found: {}", req.table_name))
+    })?;
+
+    let plan = translate_delete_item(&req, schema)?;
+    state
+        .backend
+        .delete_item_raw(&schema.shape(), &plan.pk, plan.sk.as_ref())
+        .await?;
+
+    let resp = DeleteItemResponse::default();
     Ok(json_ok(&resp))
 }
 

@@ -106,4 +106,14 @@ pub trait Backend: Send + Sync + 'static {
         pk: &KeyValue,
         sk: Option<&KeyValue>,
     ) -> Result<Option<serde_json::Value>, BackendError>;
+
+    /// Delete one row by full key. Idempotent: returns `Ok(())` whether
+    /// the row existed or not, matching DynamoDB's default DeleteItem
+    /// semantics (`ReturnValues=NONE` and no `ConditionExpression`).
+    async fn delete_item_raw(
+        &self,
+        shape: &TableShape<'_>,
+        pk: &KeyValue,
+        sk: Option<&KeyValue>,
+    ) -> Result<(), BackendError>;
 }

@@ -289,6 +289,123 @@ fn diff_composite_key_with_numeric_sort_key() {
 
 #[test]
 #[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_delete_then_get_returns_empty() {
+    ensure_users_table();
+    let table = "users";
+    let item = r#"{"id":{"S":"diff_delete"},"name":{"S":"alice"}}"#;
+    let key = r#"{"id":{"S":"diff_delete"}}"#;
+
+    // Clean start, then put.
+    delete_both(table, key);
+    let _ = aws(
+        REF,
+        &[
+            "dynamodb",
+            "put-item",
+            "--table-name",
+            table,
+            "--item",
+            item,
+        ],
+    );
+    let _ = aws(
+        OURS,
+        &[
+            "dynamodb",
+            "put-item",
+            "--table-name",
+            table,
+            "--item",
+            item,
+        ],
+    );
+
+    // Both delete responses should match (both should be `{}`).
+    let del_ref = aws(
+        REF,
+        &[
+            "dynamodb",
+            "delete-item",
+            "--table-name",
+            table,
+            "--key",
+            key,
+        ],
+    );
+    let del_ours = aws(
+        OURS,
+        &[
+            "dynamodb",
+            "delete-item",
+            "--table-name",
+            table,
+            "--key",
+            key,
+        ],
+    );
+    assert_eq!(del_ref, del_ours, "DeleteItem responses diverged");
+
+    // Both get-item responses should be the empty `{}` form.
+    let g_ref = aws(
+        REF,
+        &["dynamodb", "get-item", "--table-name", table, "--key", key],
+    );
+    let g_ours = aws(
+        OURS,
+        &["dynamodb", "get-item", "--table-name", table, "--key", key],
+    );
+    assert_eq!(g_ref, g_ours, "post-delete GetItem responses diverged");
+    assert_eq!(g_ref, json!({}), "expected empty post-delete: {g_ref}");
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_delete_nonexistent_is_idempotent() {
+    ensure_users_table();
+    let key = r#"{"id":{"S":"diff_delete_never_existed"}}"#;
+    delete_both("users", key);
+    let del_ref = strip_metadata(aws(
+        REF,
+        &[
+            "dynamodb",
+            "delete-item",
+            "--table-name",
+            "users",
+            "--key",
+            key,
+        ],
+    ));
+    let del_ours = strip_metadata(aws(
+        OURS,
+        &[
+            "dynamodb",
+            "delete-item",
+            "--table-name",
+            "users",
+            "--key",
+            key,
+        ],
+    ));
+    // Both should be the empty object after stripping. DDB-local sometimes
+    // emits a stray ConsumedCapacity even without --return-consumed-capacity.
+    assert_eq!(del_ref, del_ours, "idempotent-delete responses diverged");
+    assert_eq!(del_ref, json!({}));
+}
+
+/// Strip bookkeeping metadata fields DDB-local sometimes includes but real
+/// DDB doesn't (unless requested via `--return-consumed-capacity` /
+/// `--return-item-collection-metrics`). We don't ship these from rektifier
+/// and don't request them in tests; filter so diffs reflect data shape only.
+fn strip_metadata(mut v: Value) -> Value {
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("ConsumedCapacity");
+        obj.remove("ItemCollectionMetrics");
+    }
+    v
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
 fn diff_get_missing_returns_empty() {
     ensure_users_table();
     let key = r#"{"id":{"S":"diff_definitely_not_present_anywhere"}}"#;

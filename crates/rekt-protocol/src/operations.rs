@@ -30,3 +30,13 @@ pub struct GetItemResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub item: Option<Item>,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct DeleteItemRequest {
+    pub table_name: String,
+    pub key: Item,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DeleteItemResponse {}

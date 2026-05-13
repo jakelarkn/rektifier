@@ -34,13 +34,14 @@ pub struct PgBackend {
 struct ShapeSql {
     put_sql: String,
     get_sql: String,
+    delete_sql: String,
     /// Parameter types for `put_item_raw`'s `prepare_typed_cached`: always
     /// `[JSONB]` since writes only bind the jsonb column.
     put_types: Vec<Type>,
-    /// Parameter types for `get_item_raw`'s `prepare_typed_cached`: `[pk]`
-    /// for hash-only, `[pk, sk]` for composite. Each is `TEXT` (for `S`/`N`
-    /// keys; the SQL contains the `::numeric` cast) or `BYTEA` (for `B`).
-    get_types: Vec<Type>,
+    /// Parameter types for `get_item_raw` and `delete_item_raw`: `[pk]` for
+    /// hash-only, `[pk, sk]` for composite. Each is `TEXT` (for `S`/`N` keys;
+    /// the SQL contains the `::numeric` cast) or `BYTEA` (for `B`).
+    key_types: Vec<Type>,
 }
 
 impl PgBackend {
@@ -187,8 +188,9 @@ impl ShapeSql {
                      DO UPDATE SET {jsonb_col} = EXCLUDED.{jsonb_col}"
                 ),
                 get_sql: format!("SELECT {jsonb_col} FROM {table} WHERE {pk_col} = $1{pk_cast}"),
+                delete_sql: format!("DELETE FROM {table} WHERE {pk_col} = $1{pk_cast}"),
                 put_types: vec![Type::JSONB],
-                get_types: vec![pk_pg],
+                key_types: vec![pk_pg],
             },
             (Some(sk_col_name), Some(sk_type)) => {
                 let sk_col = quote_ident(sk_col_name);
@@ -204,8 +206,12 @@ impl ShapeSql {
                         "SELECT {jsonb_col} FROM {table} \
                          WHERE {pk_col} = $1{pk_cast} AND {sk_col} = $2{sk_cast}"
                     ),
+                    delete_sql: format!(
+                        "DELETE FROM {table} \
+                         WHERE {pk_col} = $1{pk_cast} AND {sk_col} = $2{sk_cast}"
+                    ),
                     put_types: vec![Type::JSONB],
-                    get_types: vec![pk_pg, sk_pg],
+                    key_types: vec![pk_pg, sk_pg],
                 }
             }
             (Some(_), None) => panic!(
@@ -278,7 +284,7 @@ impl Backend for PgBackend {
         let sql = self.shape_sql(shape);
         let client = self.client().await?;
         let stmt = client
-            .prepare_typed_cached(&sql.get_sql, &sql.get_types)
+            .prepare_typed_cached(&sql.get_sql, &sql.key_types)
             .instrument(tracing::debug_span!("pg.prepare"))
             .await
             .map_err(|e| map_pg_err(shape.table, e))?;
@@ -305,6 +311,45 @@ impl Backend for PgBackend {
             let Json(v): Json<serde_json::Value> = r.get(0);
             v
         }))
+    }
+
+    #[tracing::instrument(level = "debug", skip_all, name = "pg.delete_item_raw", fields(table = %shape.table))]
+    async fn delete_item_raw(
+        &self,
+        shape: &TableShape<'_>,
+        pk: &KeyValue,
+        sk: Option<&KeyValue>,
+    ) -> Result<(), BackendError> {
+        check_sk_shape(shape, sk)?;
+        let sql = self.shape_sql(shape);
+        let client = self.client().await?;
+        let stmt = client
+            .prepare_typed_cached(&sql.delete_sql, &sql.key_types)
+            .instrument(tracing::debug_span!("pg.prepare"))
+            .await
+            .map_err(|e| map_pg_err(shape.table, e))?;
+
+        let pk_bound = Bound(pk);
+        let exec_result = match sk {
+            None => {
+                client
+                    .execute(&stmt, &[&pk_bound])
+                    .instrument(tracing::debug_span!("pg.execute"))
+                    .await
+            }
+            Some(sk_val) => {
+                let sk_bound = Bound(sk_val);
+                client
+                    .execute(&stmt, &[&pk_bound, &sk_bound])
+                    .instrument(tracing::debug_span!("pg.execute"))
+                    .await
+            }
+        };
+
+        // DDB DeleteItem is idempotent — `Ok(())` whether 0 or 1 rows deleted.
+        // Errors map normally (TableNotFound, etc.).
+        exec_result.map_err(|e| map_pg_err(shape.table, e))?;
+        Ok(())
     }
 }
 
@@ -558,6 +603,137 @@ mod tests {
 
         client
             .batch_execute("DROP TABLE rekt_t_pk_required;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn delete_round_trip_hash_only() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_delete_s;
+                 CREATE TABLE rekt_t_delete_s (
+                   data jsonb NOT NULL,
+                   id   text  GENERATED ALWAYS AS (data#>>'{id,S}') STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+
+        let shape = TableShape {
+            table: "rekt_t_delete_s",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        let item = serde_json::json!({"id":{"S":"alice"},"name":{"S":"A"}});
+        backend.put_item_raw(&shape, &item).await.unwrap();
+        // Sanity: item is present.
+        assert_eq!(
+            backend
+                .get_item_raw(&shape, &KeyValue::S("alice".into()), None)
+                .await
+                .unwrap(),
+            Some(item)
+        );
+
+        // Delete: item gone.
+        backend
+            .delete_item_raw(&shape, &KeyValue::S("alice".into()), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .get_item_raw(&shape, &KeyValue::S("alice".into()), None)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Idempotent: deleting again is Ok.
+        backend
+            .delete_item_raw(&shape, &KeyValue::S("alice".into()), None)
+            .await
+            .unwrap();
+
+        client
+            .batch_execute("DROP TABLE rekt_t_delete_s;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn delete_round_trip_composite() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_delete_sn;
+                 CREATE TABLE rekt_t_delete_sn (
+                   doc       jsonb NOT NULL,
+                   device_id text    GENERATED ALWAYS AS (doc#>>'{device_id,S}')           STORED,
+                   ts        numeric GENERATED ALWAYS AS ((doc#>>'{ts,N}')::numeric)       STORED,
+                   PRIMARY KEY (device_id, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+
+        let shape = TableShape {
+            table: "rekt_t_delete_sn",
+            pk_col: "device_id",
+            pk_type: KeyType::S,
+            sk_col: Some("ts"),
+            sk_type: Some(KeyType::N),
+            jsonb_col: "doc",
+        };
+        let item_a = serde_json::json!({"device_id":{"S":"d1"},"ts":{"N":"100"},"v":{"N":"1"}});
+        let item_b = serde_json::json!({"device_id":{"S":"d1"},"ts":{"N":"200"},"v":{"N":"2"}});
+        backend.put_item_raw(&shape, &item_a).await.unwrap();
+        backend.put_item_raw(&shape, &item_b).await.unwrap();
+
+        // Delete only the (d1, 100) row; (d1, 200) survives.
+        backend
+            .delete_item_raw(
+                &shape,
+                &KeyValue::S("d1".into()),
+                Some(&KeyValue::N("100".into())),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .get_item_raw(
+                    &shape,
+                    &KeyValue::S("d1".into()),
+                    Some(&KeyValue::N("100".into()))
+                )
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            backend
+                .get_item_raw(
+                    &shape,
+                    &KeyValue::S("d1".into()),
+                    Some(&KeyValue::N("200".into()))
+                )
+                .await
+                .unwrap(),
+            Some(item_b)
+        );
+
+        client
+            .batch_execute("DROP TABLE rekt_t_delete_sn;")
             .await
             .unwrap();
     }

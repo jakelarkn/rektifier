@@ -9,4 +9,7 @@ mod attribute_value;
 pub mod operations;
 
 pub use attribute_value::{AttributeValue, Item};
-pub use operations::{GetItemRequest, GetItemResponse, PutItemRequest, PutItemResponse};
+pub use operations::{
+    DeleteItemRequest, DeleteItemResponse, GetItemRequest, GetItemResponse, PutItemRequest,
+    PutItemResponse,
+};

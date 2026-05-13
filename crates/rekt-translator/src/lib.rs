@@ -7,7 +7,7 @@
 //! No expressions, no projections, no conditions yet — those live in their
 //! own crate.
 
-use rekt_protocol::{AttributeValue, GetItemRequest, Item, PutItemRequest};
+use rekt_protocol::{AttributeValue, DeleteItemRequest, GetItemRequest, Item, PutItemRequest};
 use rekt_storage::{KeyType, KeyValue, TableShape};
 
 /// Description of a table that the translator and the storage layer agree on.
@@ -55,6 +55,12 @@ pub struct PutItemPlan {
 
 #[derive(Debug, Clone)]
 pub struct GetItemPlan {
+    pub pk: KeyValue,
+    pub sk: Option<KeyValue>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteItemPlan {
     pub pk: KeyValue,
     pub sk: Option<KeyValue>,
 }
@@ -114,6 +120,20 @@ pub fn translate_get_item(
     };
     reject_extra_key_attrs(&req.key, schema)?;
     Ok(GetItemPlan { pk, sk })
+}
+
+#[tracing::instrument(level = "debug", skip_all, name = "translate.delete_item", fields(table = %schema.name))]
+pub fn translate_delete_item(
+    req: &DeleteItemRequest,
+    schema: &TableSchema,
+) -> Result<DeleteItemPlan, TranslateError> {
+    let pk = extract_key(&req.key, &schema.pk_attr, schema.pk_type, KeyRole::Pk)?;
+    let sk = match (&schema.sk_attr, schema.sk_type) {
+        (Some(attr), Some(t)) => Some(extract_key(&req.key, attr, t, KeyRole::Sk)?),
+        _ => None,
+    };
+    reject_extra_key_attrs(&req.key, schema)?;
+    Ok(DeleteItemPlan { pk, sk })
 }
 
 #[derive(Copy, Clone)]
