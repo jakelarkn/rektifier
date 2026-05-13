@@ -1382,6 +1382,7 @@ dependencies = [
  "axum",
  "bytes",
  "http",
+ "rekt-expressions",
  "rekt-protocol",
  "rekt-sigv4",
  "rekt-storage",
@@ -1410,6 +1411,7 @@ version = "0.0.1"
 dependencies = [
  "async-trait",
  "bytes",
+ "rekt-expressions",
  "serde_json",
  "thiserror 1.0.69",
 ]
@@ -1421,6 +1423,8 @@ dependencies = [
  "async-trait",
  "bytes",
  "deadpool-postgres",
+ "rekt-expressions",
+ "rekt-protocol",
  "rekt-storage",
  "serde_json",
  "tokio",

@@ -28,12 +28,15 @@ use axum::Router;
 use bytes::Bytes;
 use rekt_protocol::{
     DeleteItemRequest, DeleteItemResponse, GetItemRequest, GetItemResponse, Item, PutItemRequest,
-    PutItemResponse,
+    PutItemResponse, UpdateItemRequest, UpdateItemResponse,
 };
 use rekt_sigv4::{SigV4Error, Verifier};
-use rekt_storage::{Backend, BackendError};
+use rekt_storage::{Backend, BackendError, UpdateDecision};
 use rekt_translator::{
-    translate_delete_item, translate_get_item, translate_put_item, TableSchema, TranslateError,
+    apply_update_expression, evaluate_condition, materialize_insert_only_update,
+    materialize_simple_sql_update, materialize_simple_update, translate_delete_item,
+    translate_get_item, translate_put_item, translate_update_item, ConditionRouting, TableSchema,
+    TranslateError,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -88,6 +91,9 @@ pub enum ApiError {
     #[error("AccessDeniedException: {0}")]
     AccessDenied(String),
 
+    #[error("ConditionalCheckFailedException: {0}")]
+    ConditionalCheckFailed(String),
+
     #[error("InternalServerError: {0}")]
     Internal(String),
 }
@@ -100,6 +106,7 @@ impl ApiError {
             Self::Validation(_) => "ValidationException",
             Self::ResourceNotFound(_) => "ResourceNotFoundException",
             Self::AccessDenied(_) => "AccessDeniedException",
+            Self::ConditionalCheckFailed(_) => "ConditionalCheckFailedException",
             Self::Internal(_) => "InternalServerError",
         }
     }
@@ -120,6 +127,7 @@ impl ApiError {
             | Self::Validation(m)
             | Self::ResourceNotFound(m)
             | Self::AccessDenied(m)
+            | Self::ConditionalCheckFailed(m)
             | Self::Internal(m) => m.clone(),
         }
     }
@@ -167,6 +175,9 @@ impl From<BackendError> for ApiError {
             } => ApiError::Validation(format!(
                 "Key column `{col}`: expected {expected:?}, got {actual:?}"
             )),
+            BackendError::ConditionalCheckFailed => {
+                ApiError::ConditionalCheckFailed("The conditional request failed".into())
+            }
             BackendError::Other(m) => ApiError::Internal(m),
         }
     }
@@ -212,6 +223,7 @@ async fn dispatch(State(state): State<AppState>, req: Request) -> Result<Respons
         "PutItem" => handle_put_item(&state, &body).await,
         "GetItem" => handle_get_item(&state, &body).await,
         "DeleteItem" => handle_delete_item(&state, &body).await,
+        "UpdateItem" => handle_update_item(&state, &body).await,
         _ => Err(ApiError::UnknownOperation(format!(
             "operation `{op}` not implemented"
         ))),
@@ -282,6 +294,137 @@ async fn handle_delete_item(state: &AppState, body: &Bytes) -> Result<Response, 
         .await?;
 
     let resp = DeleteItemResponse::default();
+    Ok(json_ok(&resp))
+}
+
+#[tracing::instrument(level = "debug", skip_all, name = "server.update_item", fields(table = tracing::field::Empty))]
+async fn handle_update_item(state: &AppState, body: &Bytes) -> Result<Response, ApiError> {
+    let req: UpdateItemRequest = serde_json::from_slice(body)
+        .map_err(|e| ApiError::Serialization(format!("invalid UpdateItem body: {e}")))?;
+    tracing::Span::current().record("table", req.table_name.as_str());
+
+    let schema = state.schemas.get(&req.table_name).ok_or_else(|| {
+        ApiError::ResourceNotFound(format!("Table not found: {}", req.table_name))
+    })?;
+
+    let plan = translate_update_item(&req, schema)?;
+
+    // Slow-path predicate: the fast paths require *both* a simple
+    // UpdateExpression (top-level SET=literal + REMOVE only) *and* a
+    // SQL-expressible condition shape. Anything outside that —
+    // non-simple SET RHS or NeedsTx-classified condition — falls to
+    // the Tx-based read-modify-write path.
+    let needs_slow_path = !plan.expression.is_simple()
+        || plan
+            .condition
+            .as_ref()
+            .is_some_and(|c| c.routing == ConditionRouting::NeedsTx);
+
+    if needs_slow_path {
+        return dispatch_slow_path(state, schema, &plan, &req.key).await;
+    }
+
+    // Dispatch on ConditionExpression routing. Phase 3a handles the no-
+    // condition case; Phase 4c handles `attribute_not_exists(pk)`; Phase
+    // 4d handles SimpleSql; the slow-path branch above caught NeedsTx.
+    match plan.condition.as_ref().map(|c| c.routing) {
+        None => {
+            let prims = materialize_simple_update(&plan, &req.key)?;
+            let sets_borrowed: Vec<(&str, &serde_json::Value)> = prims
+                .sets
+                .iter()
+                .map(|(name, val)| (name.as_str(), val))
+                .collect();
+            let removes_borrowed: Vec<&str> = prims.removes.iter().map(String::as_str).collect();
+            state
+                .backend
+                .update_simple_raw(
+                    &schema.shape(),
+                    &prims.insert_item,
+                    &sets_borrowed,
+                    &removes_borrowed,
+                )
+                .await?;
+        }
+        Some(ConditionRouting::InsertOnlyOnPk) => {
+            let insert_item = materialize_insert_only_update(&plan, &req.key)?;
+            state
+                .backend
+                .update_insert_only_raw(&schema.shape(), &insert_item)
+                .await?;
+        }
+        Some(ConditionRouting::SimpleSql) => {
+            let prims = materialize_simple_sql_update(&plan)?;
+            let sets_borrowed: Vec<(&str, &serde_json::Value)> = prims
+                .sets
+                .iter()
+                .map(|(name, val)| (name.as_str(), val))
+                .collect();
+            let removes_borrowed: Vec<&str> = prims.removes.iter().map(String::as_str).collect();
+            // `plan.condition` is guaranteed Some by the outer match arm;
+            // unwrap is safe.
+            let cond = &plan
+                .condition
+                .as_ref()
+                .expect("SimpleSql arm implies condition.is_some()")
+                .condition;
+            state
+                .backend
+                .update_with_simple_condition_raw(
+                    &schema.shape(),
+                    &plan.pk,
+                    plan.sk.as_ref(),
+                    &sets_borrowed,
+                    &removes_borrowed,
+                    cond,
+                )
+                .await?;
+        }
+        Some(ConditionRouting::NeedsTx) => unreachable!(
+            "NeedsTx is handled by the slow-path branch above"
+        ),
+    }
+
+    // ReturnValues=NONE (Phase 2's only supported variant) → empty body.
+    let resp = UpdateItemResponse::default();
+    Ok(json_ok(&resp))
+}
+
+/// Slow-path orchestration (Phase 3b): builds a closure that, given the
+/// row the backend reads under `SELECT FOR UPDATE`, evaluates the
+/// ConditionExpression (if any) and applies the UpdateExpression. The
+/// backend's transaction handles atomicity + race-on-insert retry.
+async fn dispatch_slow_path(
+    state: &AppState,
+    schema: &TableSchema,
+    plan: &rekt_translator::UpdateItemPlan,
+    key: &rekt_protocol::Item,
+) -> Result<Response, ApiError> {
+    // Move-by-clone into the closure; the backend may invoke it multiple
+    // times on a race. Borrowed lifetimes are awkward through dyn Fn, so
+    // we pay the small clone cost.
+    let expr = plan.expression.clone();
+    let condition = plan.condition.as_ref().map(|c| c.condition.clone());
+    let key_owned = key.clone();
+
+    let apply = move |existing: Option<&serde_json::Value>| {
+        if let Some(c) = &condition {
+            if !evaluate_condition(existing, c) {
+                return Ok(UpdateDecision::Fail);
+            }
+        }
+        match apply_update_expression(existing, &expr, &key_owned) {
+            Ok(new_item) => Ok(UpdateDecision::Apply(new_item)),
+            Err(e) => Err(BackendError::Other(e.to_string())),
+        }
+    };
+
+    state
+        .backend
+        .update_general_rmw_raw(&schema.shape(), &plan.pk, plan.sk.as_ref(), Box::new(apply))
+        .await?;
+
+    let resp = UpdateItemResponse::default();
     Ok(json_ok(&resp))
 }
 

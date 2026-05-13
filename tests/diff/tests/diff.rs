@@ -580,3 +580,651 @@ fn diff_get_missing_returns_empty() {
     // Sanity: both should be `{}` (Item omitted).
     assert_eq!(g_ref, json!({}));
 }
+
+// ===== UpdateItem diffs =======================================================
+//
+// Each test deletes the row on both endpoints, optionally seeds it via
+// PutItem, runs UpdateItem on both, then GETs and compares. Phase 3
+// supports the simple subset only: top-level `SET attr = literal` and
+// `REMOVE attr`, no ConditionExpression, ReturnValues=NONE.
+
+/// Run `UpdateItem` on both endpoints and compare. `seed_item` is an
+/// optional PutItem run before the update (`None` exercises the upsert
+/// path); the update arguments use `aws dynamodb update-item` flag form.
+fn assert_update_round_trip_matches(
+    table: &str,
+    key: &str,
+    seed_item: Option<&str>,
+    update_args: &[&str],
+) {
+    delete_both(table, key);
+
+    if let Some(item) = seed_item {
+        aws(
+            REF,
+            &["dynamodb", "put-item", "--table-name", table, "--item", item],
+        );
+        aws(
+            OURS,
+            &["dynamodb", "put-item", "--table-name", table, "--item", item],
+        );
+    }
+
+    let mut upd_args: Vec<&str> = vec!["dynamodb", "update-item", "--table-name", table, "--key", key];
+    upd_args.extend_from_slice(update_args);
+
+    let upd_ref = strip_metadata(aws(REF, &upd_args));
+    let upd_ours = strip_metadata(aws(OURS, &upd_args));
+    assert_eq!(
+        upd_ref, upd_ours,
+        "UpdateItem responses diverged for {table} / key={key}"
+    );
+
+    let mut get_ref = aws(
+        REF,
+        &["dynamodb", "get-item", "--table-name", table, "--key", key],
+    );
+    let mut get_ours = aws(
+        OURS,
+        &["dynamodb", "get-item", "--table-name", table, "--key", key],
+    );
+    sort_sets(&mut get_ref);
+    sort_sets(&mut get_ours);
+    assert_eq!(
+        get_ref, get_ours,
+        "GetItem after UpdateItem diverged for {table} / key={key}\nref:  {get_ref}\nours: {get_ours}"
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_set_on_missing_row_upserts() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_upsert"}}"##,
+        None,
+        &[
+            "--update-expression",
+            "SET #n = :name, score = :s",
+            "--expression-attribute-names",
+            r##"{"#n":"name"}"##,
+            "--expression-attribute-values",
+            r##"{":name":{"S":"alice"},":s":{"N":"7"}}"##,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_set_on_existing_row_merges() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_merge"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_merge"},"name":{"S":"alice"},"keep":{"S":"x"}}"##),
+        &[
+            "--update-expression",
+            "SET #n = :name, active = :a",
+            "--expression-attribute-names",
+            r##"{"#n":"name"}"##,
+            "--expression-attribute-values",
+            r##"{":name":{"S":"alice2"},":a":{"BOOL":true}}"##,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_remove_present_attribute() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_remove"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_remove"},"keep":{"S":"x"},"drop":{"S":"y"}}"##),
+        &[
+            "--update-expression",
+            "REMOVE #d",
+            "--expression-attribute-names",
+            r##"{"#d":"drop"}"##,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_remove_absent_attribute_is_noop() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_remove_absent"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_remove_absent"},"keep":{"S":"x"}}"##),
+        &["--update-expression", "REMOVE never_existed"],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_set_and_remove_combined() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_combo"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_combo"},"status":{"S":"old"},"drop":{"S":"x"}}"##),
+        &[
+            "--update-expression",
+            "SET #s = :new REMOVE #d",
+            "--expression-attribute-names",
+            r##"{"#s":"status","#d":"drop"}"##,
+            "--expression-attribute-values",
+            r##"{":new":{"S":"new"}}"##,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_set_all_attribute_value_variants() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_variants"}}"##,
+        None,
+        &[
+            "--update-expression",
+            "SET s = :s, n = :n, b = :b, active = :bool, deleted = :null, l = :l, m = :m, tags = :ss, scores = :ns, chunks = :bs",
+            "--expression-attribute-values",
+            r##"{
+                ":s":{"S":"hello"},
+                ":n":{"N":"42.5"},
+                ":b":{"B":"AAEC"},
+                ":bool":{"BOOL":true},
+                ":null":{"NULL":true},
+                ":l":{"L":[{"S":"a"},{"N":"1"}]},
+                ":m":{"M":{"k":{"S":"v"}}},
+                ":ss":{"SS":["a","b"]},
+                ":ns":{"NS":["1","2"]},
+                ":bs":{"BS":["AAE="]}
+            }"##,
+        ],
+    );
+}
+
+// ---- Phase 4c: attribute_not_exists(pk) -----------------------------------
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_insert_only_succeeds_on_missing_row() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_io_new"}}"##,
+        None,
+        &[
+            "--update-expression",
+            "SET #n = :name",
+            "--expression-attribute-names",
+            r##"{"#n":"name"}"##,
+            "--expression-attribute-values",
+            r##"{":name":{"S":"alice"}}"##,
+            "--condition-expression",
+            "attribute_not_exists(id)",
+        ],
+    );
+}
+
+/// Insert-only condition on an existing row: DDB-local returns CCFE,
+/// rektifier should too. We can't use `assert_update_round_trip_matches`
+/// because both endpoints fail and the AWS CLI exits nonzero — we
+/// invoke them directly and assert the error shape matches.
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_insert_only_fails_on_existing_row() {
+    ensure_users_table();
+    let key = r##"{"id":{"S":"diff_io_clash"}}"##;
+    delete_both("users", key);
+    // Seed
+    let seed = r##"{"id":{"S":"diff_io_clash"},"name":{"S":"alice"}}"##;
+    aws(
+        REF,
+        &["dynamodb", "put-item", "--table-name", "users", "--item", seed],
+    );
+    aws(
+        OURS,
+        &["dynamodb", "put-item", "--table-name", "users", "--item", seed],
+    );
+
+    let upd_args = [
+        "dynamodb",
+        "update-item",
+        "--table-name",
+        "users",
+        "--key",
+        key,
+        "--update-expression",
+        "SET #n = :name",
+        "--expression-attribute-names",
+        r##"{"#n":"new_name"}"##,
+        "--expression-attribute-values",
+        r##"{":name":{"S":"NEW"}}"##,
+        "--condition-expression",
+        "attribute_not_exists(id)",
+    ];
+
+    let ref_err = run_for_error(REF, &upd_args);
+    let ours_err = run_for_error(OURS, &upd_args);
+
+    // Both should reject the request with a ConditionalCheckFailedException.
+    // The exact wording of the message can drift; the error type tag is what
+    // we care about.
+    assert!(
+        ref_err.contains("ConditionalCheckFailedException"),
+        "DDB-local should reject with CCFE, got: {ref_err}"
+    );
+    assert!(
+        ours_err.contains("ConditionalCheckFailedException"),
+        "rektifier should reject with CCFE, got: {ours_err}"
+    );
+
+    // The row should be unchanged on both sides.
+    let get_args = ["dynamodb", "get-item", "--table-name", "users", "--key", key];
+    let mut ref_got = aws(REF, &get_args);
+    let mut ours_got = aws(OURS, &get_args);
+    sort_sets(&mut ref_got);
+    sort_sets(&mut ours_got);
+    assert_eq!(ref_got, ours_got, "post-CCFE GetItem diverged");
+}
+
+// ---- Phase 4d: SimpleSql conditions (UPDATE … WHERE) ---------------------
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_attribute_exists_pk_succeeds_when_row_present() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_ae_present"}}"##,
+        Some(r##"{"id":{"S":"diff_ae_present"},"name":{"S":"alice"}}"##),
+        &[
+            "--update-expression",
+            "SET #n = :v",
+            "--expression-attribute-names",
+            r##"{"#n":"name"}"##,
+            "--expression-attribute-values",
+            r##"{":v":{"S":"alice2"}}"##,
+            "--condition-expression",
+            "attribute_exists(id)",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_attribute_exists_pk_fails_when_row_missing() {
+    ensure_users_table();
+    let key = r##"{"id":{"S":"diff_ae_missing"}}"##;
+    delete_both("users", key);
+
+    let upd_args = [
+        "dynamodb",
+        "update-item",
+        "--table-name",
+        "users",
+        "--key",
+        key,
+        "--update-expression",
+        "SET #n = :v",
+        "--expression-attribute-names",
+        r##"{"#n":"name"}"##,
+        "--expression-attribute-values",
+        r##"{":v":{"S":"x"}}"##,
+        "--condition-expression",
+        "attribute_exists(id)",
+    ];
+    let ref_err = run_for_error(REF, &upd_args);
+    let ours_err = run_for_error(OURS, &upd_args);
+    assert!(
+        ref_err.contains("ConditionalCheckFailedException"),
+        "DDB-local should reject with CCFE, got: {ref_err}"
+    );
+    assert!(
+        ours_err.contains("ConditionalCheckFailedException"),
+        "rektifier should reject with CCFE, got: {ours_err}"
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_optimistic_lock_via_version() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_oplock_ok"}}"##,
+        Some(r##"{"id":{"S":"diff_oplock_ok"},"version":{"N":"3"}}"##),
+        &[
+            "--update-expression",
+            "SET #v = :new",
+            "--expression-attribute-names",
+            r##"{"#v":"version"}"##,
+            "--expression-attribute-values",
+            r##"{":expected":{"N":"3"},":new":{"N":"4"}}"##,
+            "--condition-expression",
+            "#v = :expected",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_optimistic_lock_mismatched_version_is_ccfe() {
+    ensure_users_table();
+    let key = r##"{"id":{"S":"diff_oplock_mismatch"}}"##;
+    delete_both("users", key);
+    let seed = r##"{"id":{"S":"diff_oplock_mismatch"},"version":{"N":"5"}}"##;
+    aws(
+        REF,
+        &["dynamodb", "put-item", "--table-name", "users", "--item", seed],
+    );
+    aws(
+        OURS,
+        &["dynamodb", "put-item", "--table-name", "users", "--item", seed],
+    );
+
+    let upd_args = [
+        "dynamodb",
+        "update-item",
+        "--table-name",
+        "users",
+        "--key",
+        key,
+        "--update-expression",
+        "SET #v = :new",
+        "--expression-attribute-names",
+        r##"{"#v":"version"}"##,
+        "--expression-attribute-values",
+        r##"{":expected":{"N":"1"},":new":{"N":"99"}}"##,
+        "--condition-expression",
+        "#v = :expected",
+    ];
+    let ref_err = run_for_error(REF, &upd_args);
+    let ours_err = run_for_error(OURS, &upd_args);
+    assert!(ref_err.contains("ConditionalCheckFailedException"));
+    assert!(ours_err.contains("ConditionalCheckFailedException"));
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_numeric_ordering() {
+    ensure_users_table();
+    // score < 100 → applies; sets score=50.
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_ord_lt"}}"##,
+        Some(r##"{"id":{"S":"diff_ord_lt"},"score":{"N":"10"}}"##),
+        &[
+            "--update-expression",
+            "SET score = :new",
+            "--expression-attribute-values",
+            r##"{":new":{"N":"50"},":lim":{"N":"100"}}"##,
+            "--condition-expression",
+            "score < :lim",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_string_ordering() {
+    ensure_users_table();
+    // #n >= "a" → applies. (`name` is a DDB reserved keyword, must be
+    // referenced via #alias to survive DDB-local's strict validator.)
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_ord_s"}}"##,
+        Some(r##"{"id":{"S":"diff_ord_s"},"name":{"S":"bob"}}"##),
+        &[
+            "--update-expression",
+            "SET #n = :new",
+            "--expression-attribute-names",
+            r##"{"#n":"name"}"##,
+            "--expression-attribute-values",
+            r##"{":new":{"S":"carol"},":floor":{"S":"a"}}"##,
+            "--condition-expression",
+            "#n >= :floor",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_boolean_and_composition() {
+    ensure_users_table();
+    // `status` and `version` are both DDB reserved keywords; alias both.
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_and"}}"##,
+        Some(r##"{"id":{"S":"diff_and"},"status":{"S":"active"},"version":{"N":"1"}}"##),
+        &[
+            "--update-expression",
+            "SET #v = :new",
+            "--expression-attribute-names",
+            r##"{"#v":"version","#s":"status"}"##,
+            "--expression-attribute-values",
+            r##"{":active":{"S":"active"},":v1":{"N":"1"},":new":{"N":"2"}}"##,
+            "--condition-expression",
+            "#s = :active AND #v = :v1",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_boolean_or_composition() {
+    ensure_users_table();
+    // version = 1 OR status = "active" → true (status matches). Both
+    // attribute names are DDB reserved keywords; alias them.
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_or"}}"##,
+        Some(r##"{"id":{"S":"diff_or"},"status":{"S":"active"},"version":{"N":"99"}}"##),
+        &[
+            "--update-expression",
+            "SET marker = :m",
+            "--expression-attribute-names",
+            r##"{"#v":"version","#s":"status"}"##,
+            "--expression-attribute-values",
+            r##"{":v1":{"N":"1"},":active":{"S":"active"},":m":{"S":"updated"}}"##,
+            "--condition-expression",
+            "#v = :v1 OR #s = :active",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_not_composition() {
+    ensure_users_table();
+    // NOT attribute_exists(deleted) → true when no `deleted` attr.
+    // `name` is reserved, alias it.
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_not"}}"##,
+        Some(r##"{"id":{"S":"diff_not"},"name":{"S":"alice"}}"##),
+        &[
+            "--update-expression",
+            "SET #n = :v",
+            "--expression-attribute-names",
+            r##"{"#n":"name"}"##,
+            "--expression-attribute-values",
+            r##"{":v":{"S":"alice2"}}"##,
+            "--condition-expression",
+            "NOT attribute_exists(deleted)",
+        ],
+    );
+}
+
+// ---- Phase 3b/3c: slow-path UpdateExpression RHS forms -------------------
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_set_path_ref() {
+    ensure_users_table();
+    // `source` is DDB-reserved; alias it.
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_pathref"}}"##,
+        Some(r##"{"id":{"S":"diff_pathref"},"source":{"S":"hello"}}"##),
+        &[
+            "--update-expression",
+            "SET copied = #src",
+            "--expression-attribute-names",
+            r##"{"#src":"source"}"##,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_arithmetic_increment() {
+    ensure_users_table();
+    // `counter` is DDB-reserved; alias it.
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_inc"}}"##,
+        Some(r##"{"id":{"S":"diff_inc"},"counter":{"N":"5"}}"##),
+        &[
+            "--update-expression",
+            "SET #c = #c + :inc",
+            "--expression-attribute-names",
+            r##"{"#c":"counter"}"##,
+            "--expression-attribute-values",
+            r##"{":inc":{"N":"3"}}"##,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_arithmetic_decrement() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_dec"}}"##,
+        Some(r##"{"id":{"S":"diff_dec"},"counter":{"N":"10"}}"##),
+        &[
+            "--update-expression",
+            "SET #c = #c - :dec",
+            "--expression-attribute-names",
+            r##"{"#c":"counter"}"##,
+            "--expression-attribute-values",
+            r##"{":dec":{"N":"4"}}"##,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_if_not_exists_preserves() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_ine_pres"}}"##,
+        Some(r##"{"id":{"S":"diff_ine_pres"},"created":{"N":"1000"}}"##),
+        &[
+            "--update-expression",
+            "SET created = if_not_exists(created, :now)",
+            "--expression-attribute-values",
+            r##"{":now":{"N":"9999"}}"##,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_if_not_exists_uses_fallback() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_ine_fall"}}"##,
+        Some(r##"{"id":{"S":"diff_ine_fall"}}"##),
+        &[
+            "--update-expression",
+            "SET created = if_not_exists(created, :now)",
+            "--expression-attribute-values",
+            r##"{":now":{"N":"1234"}}"##,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_list_append_appends() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_lapp"}}"##,
+        Some(r##"{"id":{"S":"diff_lapp"},"tags":{"L":[{"S":"a"}]}}"##),
+        &[
+            "--update-expression",
+            "SET tags = list_append(tags, :new)",
+            "--expression-attribute-values",
+            r##"{":new":{"L":[{"S":"b"},{"S":"c"}]}}"##,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_list_append_prepends() {
+    ensure_users_table();
+    // list_append(:new, tags) prepends.
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_lprep"}}"##,
+        Some(r##"{"id":{"S":"diff_lprep"},"tags":{"L":[{"S":"c"}]}}"##),
+        &[
+            "--update-expression",
+            "SET tags = list_append(:new, tags)",
+            "--expression-attribute-values",
+            r##"{":new":{"L":[{"S":"a"},{"S":"b"}]}}"##,
+        ],
+    );
+}
+
+/// Best-effort run that captures stderr (where the AWS CLI puts error
+/// type names). Returns the concatenation of stdout and stderr so the
+/// caller can grep for the expected `__type`.
+fn run_for_error(endpoint: &str, args: &[&str]) -> String {
+    let output = std::process::Command::new("aws")
+        .arg("--endpoint-url")
+        .arg(endpoint)
+        .args(args)
+        .arg("--output")
+        .arg("json")
+        .env("AWS_ACCESS_KEY_ID", "local")
+        .env("AWS_SECRET_ACCESS_KEY", "local")
+        .env("AWS_DEFAULT_REGION", "us-east-1")
+        .output()
+        .unwrap_or_else(|e| panic!("aws CLI invocation failed: {e}"));
+    assert!(!output.status.success(), "command unexpectedly succeeded");
+    let mut s = String::from_utf8_lossy(&output.stdout).into_owned();
+    s.push_str(&String::from_utf8_lossy(&output.stderr));
+    s
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_composite_key() {
+    ensure_device_events_table();
+    assert_update_round_trip_matches(
+        "device_events",
+        r##"{"device_id":{"S":"diff_upd_ck"},"ts":{"N":"1000"}}"##,
+        None,
+        &[
+            "--update-expression",
+            "SET v = :v",
+            "--expression-attribute-values",
+            r##"{":v":{"N":"42"}}"##,
+        ],
+    );
+}

@@ -8,6 +8,8 @@ description = "tokio-postgres-backed storage backend for rektifier"
 
 [dependencies]
 rekt-storage = { path = "../rekt-storage" }
+rekt-expressions = { path = "../rekt-expressions" }
+rekt-protocol = { path = "../rekt-protocol" }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 deadpool-postgres = { workspace = true }
