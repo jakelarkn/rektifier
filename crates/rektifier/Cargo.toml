@@ -25,3 +25,7 @@ tokio = { workspace = true }
 tokio-postgres = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-flame = { workspace = true, optional = true }
+
+[features]
+flame = ["dep:tracing-flame"]

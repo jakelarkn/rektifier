@@ -17,6 +17,7 @@ use rekt_storage::{Backend, BackendError, KeyValue, TableShape};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::{IsNull, Json, ToSql, Type};
 use tokio_postgres::NoTls;
+use tracing::Instrument;
 
 pub struct PgBackend {
     pool: Pool,
@@ -47,6 +48,7 @@ impl PgBackend {
     async fn client(&self) -> Result<deadpool_postgres::Object, BackendError> {
         self.pool
             .get()
+            .instrument(tracing::debug_span!("pg.pool_get"))
             .await
             .map_err(|e| BackendError::Other(format!("pool get failed: {e}")))
     }
@@ -163,6 +165,7 @@ fn map_pg_err(table: &str, e: tokio_postgres::Error) -> BackendError {
 
 #[async_trait]
 impl Backend for PgBackend {
+    #[tracing::instrument(level = "debug", skip_all, name = "pg.put_item_raw", fields(table = %shape.table))]
     async fn put_item_raw(
         &self,
         shape: &TableShape<'_>,
@@ -194,15 +197,18 @@ impl Backend for PgBackend {
 
         let stmt = client
             .prepare_typed_cached(&sql, &[Type::JSONB])
+            .instrument(tracing::debug_span!("pg.prepare"))
             .await
             .map_err(|e| map_pg_err(shape.table, e))?;
         client
             .execute(&stmt, &[&Json(item)])
+            .instrument(tracing::debug_span!("pg.execute"))
             .await
             .map_err(|e| map_pg_err(shape.table, e))?;
         Ok(())
     }
 
+    #[tracing::instrument(level = "debug", skip_all, name = "pg.get_item_raw", fields(table = %shape.table))]
     async fn get_item_raw(
         &self,
         shape: &TableShape<'_>,
@@ -225,9 +231,13 @@ impl Backend for PgBackend {
                 let sql = format!("SELECT {jsonb_col} FROM {table} WHERE {pk_col} = $1{pk_cast}");
                 let stmt = client
                     .prepare_typed_cached(&sql, &[pk_pg])
+                    .instrument(tracing::debug_span!("pg.prepare"))
                     .await
                     .map_err(|e| map_pg_err(shape.table, e))?;
-                client.query_opt(&stmt, &[&pk_bound]).await
+                client
+                    .query_opt(&stmt, &[&pk_bound])
+                    .instrument(tracing::debug_span!("pg.query"))
+                    .await
             }
             (Some(sk_col_name), Some(sk_val)) => {
                 let sk_col = quote_ident(sk_col_name);
@@ -240,9 +250,13 @@ impl Backend for PgBackend {
                 );
                 let stmt = client
                     .prepare_typed_cached(&sql, &[pk_pg, sk_pg])
+                    .instrument(tracing::debug_span!("pg.prepare"))
                     .await
                     .map_err(|e| map_pg_err(shape.table, e))?;
-                client.query_opt(&stmt, &[&pk_bound, &sk_bound]).await
+                client
+                    .query_opt(&stmt, &[&pk_bound, &sk_bound])
+                    .instrument(tracing::debug_span!("pg.query"))
+                    .await
             }
             (Some(_), None) => unreachable!("rejected by check_sk_shape above"),
         };

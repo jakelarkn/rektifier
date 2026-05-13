@@ -29,7 +29,7 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
+    let _tracing_guard = init_tracing();
 
     let config_path = std::env::var("REKTIFIER_CONFIG")
         .context("REKTIFIER_CONFIG env var is required (path to TOML config)")?;
@@ -72,10 +72,39 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
+/// Opaque guard returned from `init_tracing` that must be held for the
+/// lifetime of the program. With the `flame` feature, dropping this guard
+/// flushes the span samples to disk; without it, it's a no-op marker.
+#[allow(dead_code)]
+struct TracingGuard {
+    #[cfg(feature = "flame")]
+    flame: tracing_flame::FlushGuard<std::io::BufWriter<std::fs::File>>,
+}
+
+fn init_tracing() -> TracingGuard {
     let filter =
         EnvFilter::try_from_env("REKTIFIER_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    #[cfg(feature = "flame")]
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let (flame_layer, flame_guard) = tracing_flame::FlameLayer::with_file("./tracing.folded")
+            .expect("opening tracing.folded for write");
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(flame_layer)
+            .init();
+        tracing::info!("tracing-flame ENABLED — sampling to ./tracing.folded");
+        return TracingGuard { flame: flame_guard };
+    }
+
+    #[cfg(not(feature = "flame"))]
+    {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+        TracingGuard {}
+    }
 }
 
 fn build_pool(database_url: &str) -> Result<Pool> {

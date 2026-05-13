@@ -37,6 +37,7 @@ pub trait Verifier: Send + Sync + 'static {
 pub struct PermissiveVerifier;
 
 impl Verifier for PermissiveVerifier {
+    #[tracing::instrument(level = "debug", skip_all, name = "verifier.permissive")]
     fn verify(
         &self,
         parts: &http::request::Parts,

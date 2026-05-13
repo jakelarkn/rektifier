@@ -83,6 +83,7 @@ pub enum TranslateError {
     ExtraKeyAttribute { attr: String },
 }
 
+#[tracing::instrument(level = "debug", skip_all, name = "translate.put_item", fields(table = %schema.name))]
 pub fn translate_put_item(
     req: &PutItemRequest,
     schema: &TableSchema,
@@ -99,6 +100,7 @@ pub fn translate_put_item(
     Ok(PutItemPlan { item_json })
 }
 
+#[tracing::instrument(level = "debug", skip_all, name = "translate.get_item", fields(table = %schema.name))]
 pub fn translate_get_item(
     req: &GetItemRequest,
     schema: &TableSchema,

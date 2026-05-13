@@ -80,6 +80,24 @@ smoke-ours:
 bench-build:
     cargo build -p rekt-bench --release
 
+# Profile a workload under tracing-flame and emit flamegraph.svg.
+# Requires `cargo install inferno` once (for the inferno-flamegraph binary).
+# Assumes docker + bootstrap-pg already applied, and ddb-local users table
+# created via `./target/release/rekt-bench setup-ddb-local` (only needed
+# if you switch the workload to --target ddb-local).
+flame:
+    cargo build -p rektifier --features flame --release
+    cargo build -p rekt-bench --release
+    rm -f tracing.folded flamegraph.svg
+    REKTIFIER_CONFIG=rektifier.toml.example REKTIFIER_LOG=rekt=debug,info ./target/release/rektifier &
+    sleep 3
+    ./target/release/rekt-bench run --target rektifier --workload mixed --concurrency 16 --duration 15s --warmup 2s --working-set 1000
+    pkill -f 'target/release/rektifier' || true
+    sleep 1
+    test -s tracing.folded || { echo 'no tracing data captured'; exit 1; }
+    inferno-flamegraph < tracing.folded > flamegraph.svg
+    @echo 'wrote flamegraph.svg — open it in a browser'
+
 # Run a quick (10s/target/workload) bench across all three targets for put + get.
 # Assumes: docker up + bootstrap-pg applied + rektifier running + ddb-local
 # `users` table created (`./target/release/rekt-bench setup-ddb-local`).

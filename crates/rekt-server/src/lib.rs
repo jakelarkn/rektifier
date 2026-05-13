@@ -175,6 +175,7 @@ impl From<SigV4Error> for ApiError {
 
 // ===== Dispatch ================================================================
 
+#[tracing::instrument(level = "debug", skip_all, name = "server.dispatch", fields(op = tracing::field::Empty))]
 async fn dispatch(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -199,6 +200,7 @@ async fn dispatch(
     let op = target
         .strip_prefix(TARGET_PREFIX)
         .ok_or_else(|| ApiError::UnknownOperation(format!("unsupported target: {target}")))?;
+    tracing::Span::current().record("op", op);
 
     // 3. Dispatch on op name.
     match op {
@@ -218,9 +220,11 @@ fn headers_to_parts(headers: &HeaderMap, mut parts: http::request::Parts) -> htt
     parts
 }
 
+#[tracing::instrument(level = "debug", skip_all, name = "server.put_item", fields(table = tracing::field::Empty))]
 async fn handle_put_item(state: &AppState, body: &Bytes) -> Result<Response, ApiError> {
     let req: PutItemRequest = serde_json::from_slice(body)
         .map_err(|e| ApiError::Serialization(format!("invalid PutItem body: {e}")))?;
+    tracing::Span::current().record("table", req.table_name.as_str());
 
     let schema = state.schemas.get(&req.table_name).ok_or_else(|| {
         ApiError::ResourceNotFound(format!("Table not found: {}", req.table_name))
@@ -236,9 +240,11 @@ async fn handle_put_item(state: &AppState, body: &Bytes) -> Result<Response, Api
     Ok(json_ok(&resp))
 }
 
+#[tracing::instrument(level = "debug", skip_all, name = "server.get_item", fields(table = tracing::field::Empty))]
 async fn handle_get_item(state: &AppState, body: &Bytes) -> Result<Response, ApiError> {
     let req: GetItemRequest = serde_json::from_slice(body)
         .map_err(|e| ApiError::Serialization(format!("invalid GetItem body: {e}")))?;
+    tracing::Span::current().record("table", req.table_name.as_str());
 
     let schema = state.schemas.get(&req.table_name).ok_or_else(|| {
         ApiError::ResourceNotFound(format!("Table not found: {}", req.table_name))

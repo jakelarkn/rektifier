@@ -5,3 +5,5 @@
 .DS_Store
 *.swp
 docs/plan/
+tracing.folded
+flamegraph.svg
