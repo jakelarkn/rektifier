@@ -127,6 +127,19 @@ enum Workload {
     /// key `bench-hot` — measures row-lock-induced serialization
     /// under the slow path.
     UpdateSlowRmwHot,
+    /// `ADD counter :inc` — Phase 5 numeric ADD. Same end-state as
+    /// `UpdateSlowRmw` (`SET counter = counter + :inc`); pairing the
+    /// two answers "does the ADD clause cost the same as the
+    /// equivalent SET-arithmetic?"
+    UpdateSlowAddNum,
+    /// `ADD tags :new` — Phase 5 set union. Different Rust path from
+    /// numeric ADD (set dedup) but same Tx envelope.
+    UpdateSlowAddSet,
+    /// `SET marker = :v` gated on `begins_with(name, :p)` — Phase 4e
+    /// representative. Condition always true on seeded rows; isolates
+    /// the cost of the in-Rust condition evaluator on top of the
+    /// slow-path RMW round-trip.
+    UpdateSlowCondBeginsWith,
 }
 
 impl Workload {
@@ -140,7 +153,10 @@ impl Workload {
             | Self::Mixed
             | Self::UpdateFastSet
             | Self::UpdateFastCond
-            | Self::UpdateSlowRmw => true,
+            | Self::UpdateSlowRmw
+            | Self::UpdateSlowAddNum
+            | Self::UpdateSlowAddSet
+            | Self::UpdateSlowCondBeginsWith => true,
             Self::UpdateSlowRmwHot => false, // seeds one hot key separately
         }
     }
@@ -168,6 +184,20 @@ trait Target: Send + Sync {
 
     /// `SET counter = counter + :inc` — Phase 3b slow path.
     async fn update_slow_rmw_inc(&self, pk: &str, by: i64) -> Result<()>;
+
+    /// `ADD counter :inc` — Phase 5 numeric ADD.
+    async fn update_slow_add_num(&self, pk: &str, by: i64) -> Result<()>;
+
+    /// `ADD tags :new` (SS union) — Phase 5 set ADD.
+    async fn update_slow_add_set(&self, pk: &str, items: &[String]) -> Result<()>;
+
+    /// `SET marker = :v` gated on `begins_with(name, :p)` — Phase 4e.
+    async fn update_slow_cond_begins_with(
+        &self,
+        pk: &str,
+        prefix: &str,
+        marker: &str,
+    ) -> Result<()>;
 }
 
 // (We pull `async-trait` only as a transitive macro through reqwest's tower;
@@ -248,6 +278,48 @@ impl Target for HttpTarget {
             "UpdateExpression": "SET #c = #c + :inc",
             "ExpressionAttributeNames": {"#c": "counter"},
             "ExpressionAttributeValues": {":inc": {"N": by.to_string()}},
+        });
+        self.post("DynamoDB_20120810.UpdateItem", &body).await
+    }
+
+    async fn update_slow_add_num(&self, pk: &str, by: i64) -> Result<()> {
+        let body = json!({
+            "TableName": self.table,
+            "Key": {"id": {"S": pk}},
+            "UpdateExpression": "ADD #c :inc",
+            "ExpressionAttributeNames": {"#c": "counter"},
+            "ExpressionAttributeValues": {":inc": {"N": by.to_string()}},
+        });
+        self.post("DynamoDB_20120810.UpdateItem", &body).await
+    }
+
+    async fn update_slow_add_set(&self, pk: &str, items: &[String]) -> Result<()> {
+        let body = json!({
+            "TableName": self.table,
+            "Key": {"id": {"S": pk}},
+            "UpdateExpression": "ADD tags :new",
+            "ExpressionAttributeValues": {":new": {"SS": items}},
+        });
+        self.post("DynamoDB_20120810.UpdateItem", &body).await
+    }
+
+    async fn update_slow_cond_begins_with(
+        &self,
+        pk: &str,
+        prefix: &str,
+        marker: &str,
+    ) -> Result<()> {
+        // `name` is DDB-reserved; alias.
+        let body = json!({
+            "TableName": self.table,
+            "Key": {"id": {"S": pk}},
+            "UpdateExpression": "SET marker = :m",
+            "ExpressionAttributeNames": {"#n": "name"},
+            "ExpressionAttributeValues": {
+                ":m": {"S": marker},
+                ":p": {"S": prefix},
+            },
+            "ConditionExpression": "begins_with(#n, :p)",
         });
         self.post("DynamoDB_20120810.UpdateItem", &body).await
     }
@@ -411,21 +483,21 @@ impl Target for PgTarget {
         // SELECT FOR UPDATE → compute new counter in Rust → UPDATE →
         // COMMIT. Same round-trip cost; same lock semantics. The
         // direct-pg target is the latency floor for this code path.
+        self.tx_rmw_counter(pk, by).await
+    }
+
+    async fn update_slow_add_num(&self, pk: &str, by: i64) -> Result<()> {
+        // End-state of ADD numeric is identical to SET-arithmetic on
+        // the slow path. We use the same direct-pg implementation; the
+        // rektifier-side comparison still measures the ADD-clause
+        // translator / evaluator path.
+        self.tx_rmw_counter(pk, by).await
+    }
+
+    async fn update_slow_add_set(&self, pk: &str, items: &[String]) -> Result<()> {
         let mut client = self.pool.get().await.context("pool get")?;
         let tx = client.transaction().await.context("begin tx")?;
-        let select_sql = format!(
-            "SELECT data FROM \"{0}\" WHERE id = $1 FOR UPDATE",
-            self.table
-        );
-        let update_sql = format!("UPDATE \"{0}\" SET data = $1 WHERE id = $2", self.table);
-        let select_stmt = tx
-            .prepare_typed_cached(&select_sql, &[Type::TEXT])
-            .await
-            .context("prepare select")?;
-        let update_stmt = tx
-            .prepare_typed_cached(&update_sql, &[Type::JSONB, Type::TEXT])
-            .await
-            .context("prepare update")?;
+        let (select_stmt, update_stmt) = self.prepare_rmw_stmts(&tx).await?;
 
         let row = tx
             .query_opt(&select_stmt, &[&pk])
@@ -438,6 +510,98 @@ impl Target for PgTarget {
             })
             .ok_or_else(|| anyhow::anyhow!("row not pre-populated: {pk}"))?;
 
+        let mut combined: Vec<String> = existing
+            .get("tags")
+            .and_then(|t| t.get("SS"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for item in items {
+            if !combined.contains(item) {
+                combined.push(item.clone());
+            }
+        }
+
+        let mut new_item = existing.clone();
+        if let Value::Object(obj) = &mut new_item {
+            obj.insert("tags".into(), json!({"SS": combined}));
+        }
+        tx.execute(&update_stmt, &[&Json(&new_item), &pk])
+            .await
+            .context("execute update")?;
+        tx.commit().await.context("commit")?;
+        Ok(())
+    }
+
+    async fn update_slow_cond_begins_with(
+        &self,
+        pk: &str,
+        prefix: &str,
+        marker: &str,
+    ) -> Result<()> {
+        let mut client = self.pool.get().await.context("pool get")?;
+        let tx = client.transaction().await.context("begin tx")?;
+        let (select_stmt, update_stmt) = self.prepare_rmw_stmts(&tx).await?;
+
+        let row = tx
+            .query_opt(&select_stmt, &[&pk])
+            .await
+            .context("select for update")?;
+        let existing: Value = row
+            .map(|r| {
+                let Json(v): Json<Value> = r.get(0);
+                v
+            })
+            .ok_or_else(|| anyhow::anyhow!("row not pre-populated: {pk}"))?;
+
+        // Evaluate begins_with(name, prefix) in Rust against the
+        // existing row, mirroring rektifier's slow path.
+        let name = existing
+            .get("name")
+            .and_then(|n| n.get("S"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !name.starts_with(prefix) {
+            // Condition failed → CCFE semantics. For bench, treat as
+            // an error so the rate gets recorded.
+            tx.rollback().await.context("rollback")?;
+            anyhow::bail!("ConditionalCheckFailed (begins_with)");
+        }
+        let mut new_item = existing.clone();
+        if let Value::Object(obj) = &mut new_item {
+            obj.insert("marker".into(), json!({"S": marker}));
+        }
+        tx.execute(&update_stmt, &[&Json(&new_item), &pk])
+            .await
+            .context("execute update")?;
+        tx.commit().await.context("commit")?;
+        Ok(())
+    }
+}
+
+impl PgTarget {
+    /// Shared SELECT FOR UPDATE → counter increment → UPDATE → COMMIT
+    /// used by both `update_slow_rmw_inc` and `update_slow_add_num`
+    /// (their end-state is identical).
+    async fn tx_rmw_counter(&self, pk: &str, by: i64) -> Result<()> {
+        let mut client = self.pool.get().await.context("pool get")?;
+        let tx = client.transaction().await.context("begin tx")?;
+        let (select_stmt, update_stmt) = self.prepare_rmw_stmts(&tx).await?;
+
+        let row = tx
+            .query_opt(&select_stmt, &[&pk])
+            .await
+            .context("select for update")?;
+        let existing: Value = row
+            .map(|r| {
+                let Json(v): Json<Value> = r.get(0);
+                v
+            })
+            .ok_or_else(|| anyhow::anyhow!("row not pre-populated: {pk}"))?;
         let cur: i64 = existing["counter"]["N"]
             .as_str()
             .unwrap_or("0")
@@ -452,6 +616,26 @@ impl Target for PgTarget {
             .context("execute update")?;
         tx.commit().await.context("commit")?;
         Ok(())
+    }
+
+    async fn prepare_rmw_stmts(
+        &self,
+        tx: &deadpool_postgres::Transaction<'_>,
+    ) -> Result<(tokio_postgres::Statement, tokio_postgres::Statement)> {
+        let select_sql = format!(
+            "SELECT data FROM \"{0}\" WHERE id = $1 FOR UPDATE",
+            self.table
+        );
+        let update_sql = format!("UPDATE \"{0}\" SET data = $1 WHERE id = $2", self.table);
+        let select_stmt = tx
+            .prepare_typed_cached(&select_sql, &[Type::TEXT])
+            .await
+            .context("prepare select")?;
+        let update_stmt = tx
+            .prepare_typed_cached(&update_sql, &[Type::JSONB, Type::TEXT])
+            .await
+            .context("prepare update")?;
+        Ok((select_stmt, update_stmt))
     }
 }
 
@@ -479,14 +663,23 @@ fn make_payload(target_bytes: usize) -> Value {
     json!({"filler": {"S": filler}})
 }
 
-/// Seeded payload for working-set rows used by update workloads. Same
-/// shape as `make_payload` but includes a `counter:{N:"0"}` attr so
-/// arithmetic-increment paths have something to read.
+/// Seeded payload for working-set rows used by update workloads.
+/// Carries every attribute the update workloads need to read:
+/// - `counter:{N:"0"}` for arithmetic increments and ADD-numeric
+/// - `name:{S:"alice"}` for the begins_with condition (always
+///   matches prefix "ali")
+///
+/// Set-shaped attrs like `tags` are created by the ADD-set workload
+/// itself, so we leave them out of the seed.
 fn seeded_payload(target_bytes: usize) -> Value {
-    let overhead = 90usize; // adds room for counter + id
+    let overhead = 120usize; // room for id + counter + name + json punctuation
     let fill_len = target_bytes.saturating_sub(overhead).max(1);
     let filler: String = "x".repeat(fill_len);
-    json!({"filler": {"S": filler}, "counter": {"N": "0"}})
+    json!({
+        "filler": {"S": filler},
+        "counter": {"N": "0"},
+        "name": {"S": "alice"},
+    })
 }
 
 // ============================== Bench runner ===================================
@@ -699,6 +892,23 @@ async fn dispatch_op(
         Workload::UpdateSlowRmwHot => {
             target.update_slow_rmw_inc("bench-hot", 1).await
         }
+        Workload::UpdateSlowAddNum => {
+            let pk = working_set_key(counter, working_set);
+            target.update_slow_add_num(&pk, 1).await
+        }
+        Workload::UpdateSlowAddSet => {
+            let pk = working_set_key(counter, working_set);
+            // Use the counter to generate a unique item; sometimes hits
+            // an existing element (forcing dedup), sometimes adds new.
+            let item = format!("tag-{}", counter % 16);
+            target.update_slow_add_set(&pk, &[item]).await
+        }
+        Workload::UpdateSlowCondBeginsWith => {
+            let pk = working_set_key(counter, working_set);
+            // Seeded name is "alice"; prefix "ali" always matches.
+            let marker = format!("m{counter}");
+            target.update_slow_cond_begins_with(&pk, "ali", &marker).await
+        }
     }
 }
 
@@ -767,6 +977,9 @@ fn workload_label(w: Workload) -> &'static str {
         Workload::UpdateFastCond => "UpdateItem-fast-cond (4d)",
         Workload::UpdateSlowRmw => "UpdateItem-slow-rmw (3b spread)",
         Workload::UpdateSlowRmwHot => "UpdateItem-slow-rmw-hot (3b hot-key)",
+        Workload::UpdateSlowAddNum => "UpdateItem-slow-add-num (5)",
+        Workload::UpdateSlowAddSet => "UpdateItem-slow-add-set (5)",
+        Workload::UpdateSlowCondBeginsWith => "UpdateItem-slow-cond-begins-with (4e)",
     }
 }
 

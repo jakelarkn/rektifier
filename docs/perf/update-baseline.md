@@ -26,6 +26,9 @@ the full UpdateItem dispatch tree.
 | `update-fast-cond` | 4d | `UPDATE … WHERE pk = $ AND (data ? 'id')` — one round-trip, condition compiles to SQL |
 | `update-slow-rmw` | 3b | `BEGIN → SELECT FOR UPDATE → UPDATE → COMMIT`; keys spread, no lock contention |
 | `update-slow-rmw-hot` | 3b | Same as above but every op hits one row — measures row-lock serialization |
+| `update-slow-add-num` | 5 | `ADD counter :inc` — same Tx envelope as `update-slow-rmw`; numeric add through the ADD-clause evaluator |
+| `update-slow-add-set` | 5 | `ADD tags :new` — set union with insertion-order dedup in Rust |
+| `update-slow-cond-begins-with` | 4e | `SET marker = :v` gated on `begins_with(name, :p)` — slow-path condition evaluator, no extra round trip vs `update-slow-rmw` |
 
 ## Numbers
 
@@ -37,8 +40,11 @@ the full UpdateItem dispatch tree.
 | update-fast-set (3a) | 9,176 | 1.70 | 2.18 | 2.78 | 3.67 |
 | update-fast-insert-only (4c) | 8,686 | 1.78 | 2.35 | 3.19 | 4.84 |
 | update-fast-cond (4d) | 9,027 | 1.70 | 2.26 | 3.26 | 4.24 |
-| update-slow-rmw (3b spread) | 3,926 | 3.94 | 4.88 | 7.09 | 9.89 |
+| update-slow-rmw (3b spread) | 3,630 | 4.18 | 5.59 | 8.43 | 11.30 |
 | update-slow-rmw-hot (3b hot) | 1,570 | 6.47 | 24.32 | 53.09 | 82.62 |
+| update-slow-add-num (5) | 3,773 | 4.11 | 5.14 | 7.35 | 9.31 |
+| update-slow-add-set (5) | 3,616 | 4.19 | 5.65 | 8.38 | 12.38 |
+| update-slow-cond-begins-with (4e) | 3,578 | 4.20 | 5.69 | 8.79 | 15.48 |
 
 ### Direct PG (latency floor for the rektifier+PG path)
 
@@ -48,8 +54,11 @@ the full UpdateItem dispatch tree.
 | update-fast-set | 15,270 | 1.02 | 1.31 | 1.78 | 2.84 |
 | update-fast-insert-only | 15,205 | 1.03 | 1.30 | 1.73 | 2.85 |
 | update-fast-cond | 15,551 | 1.00 | 1.28 | 1.88 | 2.98 |
-| update-slow-rmw | 4,984 | 3.05 | 4.05 | 6.12 | 8.69 |
+| update-slow-rmw | 4,839 | 3.15 | 4.17 | 6.09 | 9.63 |
 | update-slow-rmw-hot | 1,801 | 6.31 | 19.30 | 38.14 | 55.71 |
+| update-slow-add-num | 4,880 | 3.13 | 4.13 | 5.99 | 8.83 |
+| update-slow-add-set | 4,223 | 3.45 | 5.16 | 9.66 | 15.58 |
+| update-slow-cond-begins-with | 4,470 | 3.29 | 4.77 | 8.06 | 15.30 |
 
 ## Observations
 
@@ -87,6 +96,24 @@ the full UpdateItem dispatch tree.
 5. **No errors on any workload** (CCFE-free by design: every
    workload either uses fresh PKs or always-true conditions).
 
+6. **ADD-numeric ≈ SET-arithmetic on the slow path** (4.11 vs 4.18 ms
+   p50). Sanity check: the ADD clause goes through the same evaluator
+   framework + Tx envelope as `SET counter = counter + :inc`, and
+   the numbers confirm the work is interchangeable. Phase 3d would
+   recover ~2× for *both* by promoting them to a single-statement
+   `jsonb_set` emitter.
+
+7. **ADD-set adds no measurable overhead vs scalar ADD** (4.19 ms vs
+   4.11 ms p50). The set-dedup work is dwarfed by Tx round-trip cost.
+
+8. **begins_with condition costs essentially nothing on top of the
+   slow path** (4.20 vs 4.18 ms p50). The condition evaluator runs
+   against the row we already SELECTed for the update — no extra
+   round-trip, just a string starts_with check. This generalizes:
+   all Phase 4e shapes (contains, BETWEEN, IN, attribute_type) should
+   show similar near-zero overhead because they all run as Rust
+   functions over the in-memory SELECTed row.
+
 ## Reproducing
 
 ```sh
@@ -95,7 +122,9 @@ just bootstrap-pg                                                  # PG schema
 REKTIFIER_CONFIG=rektifier.toml.example cargo run --release --bin rektifier &
 cargo build --release -p rekt-bench
 for wl in update-fast-set update-fast-insert-only update-fast-cond \
-          update-slow-rmw update-slow-rmw-hot; do
+          update-slow-rmw update-slow-rmw-hot \
+          update-slow-add-num update-slow-add-set \
+          update-slow-cond-begins-with; do
   for tgt in rektifier direct-pg; do
     ./target/release/rekt-bench run \
       --target $tgt --workload $wl \
