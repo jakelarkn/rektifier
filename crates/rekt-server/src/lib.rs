@@ -20,12 +20,12 @@
 //! HTTP status is **400 for almost everything** (per DDB convention) and
 //! **500** only for genuine internal errors.
 
-use axum::body::Bytes;
-use axum::extract::State;
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::extract::{Request, State};
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
+use bytes::Bytes;
 use rekt_protocol::{GetItemRequest, GetItemResponse, Item, PutItemRequest, PutItemResponse};
 use rekt_sigv4::{SigV4Error, Verifier};
 use rekt_storage::{Backend, BackendError};
@@ -176,24 +176,24 @@ impl From<SigV4Error> for ApiError {
 // ===== Dispatch ================================================================
 
 #[tracing::instrument(level = "debug", skip_all, name = "server.dispatch", fields(op = tracing::field::Empty))]
-async fn dispatch(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ApiError> {
+async fn dispatch(State(state): State<AppState>, req: Request) -> Result<Response, ApiError> {
+    // Split the request into its real Parts + Body. Passing the real Parts
+    // straight to the verifier saves a HeaderMap::clone vs the earlier
+    // `HeaderMap + Bytes` extractor pair, which built a synthetic Parts and
+    // cloned headers into it.
+    let (parts, body) = req.into_parts();
+    let body = axum::body::to_bytes(body, MAX_BODY_BYTES)
+        .await
+        .map_err(|e| ApiError::Serialization(format!("body read failed: {e}")))?;
+
     // 1. Verify the request. PermissiveVerifier is the MVP impl — see
     //    rekt-sigv4. We do this before peeking at any body content so the
     //    auth boundary stays at the top.
-    let parts = http::Request::builder().body(()).unwrap().into_parts().0;
-    let _verified = {
-        // PermissiveVerifier doesn't use parts/body, but the trait signature
-        // gives StrictVerifier (future) what it'll need.
-        let parts = headers_to_parts(&headers, parts);
-        state.verifier.verify(&parts, &body)?
-    };
+    state.verifier.verify(&parts, &body)?;
 
     // 2. Identify the operation from the X-Amz-Target header.
-    let target = headers
+    let target = parts
+        .headers
         .get("x-amz-target")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| ApiError::Serialization("missing X-Amz-Target header".into()))?;
@@ -210,14 +210,6 @@ async fn dispatch(
             "operation `{op}` not implemented"
         ))),
     }
-}
-
-/// Build a `http::request::Parts` from the headers we received. PermissiveVerifier
-/// only reads from headers, but giving it real Parts keeps the interface honest
-/// for StrictVerifier later.
-fn headers_to_parts(headers: &HeaderMap, mut parts: http::request::Parts) -> http::request::Parts {
-    parts.headers = headers.clone();
-    parts
 }
 
 #[tracing::instrument(level = "debug", skip_all, name = "server.put_item", fields(table = tracing::field::Empty))]
