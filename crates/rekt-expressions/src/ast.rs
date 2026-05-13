@@ -22,6 +22,24 @@ pub struct UpdateExpression {
     pub delete: Vec<DeleteAction>,
 }
 
+impl UpdateExpression {
+    /// True iff every clause fits the storage layer's pure-SQL fast path:
+    /// a top-level `SET attr = literal` (RHS is a resolved `:v` value of
+    /// any AttributeValue variant) or `REMOVE attr`. ADD / DELETE / nested
+    /// paths / path-reference / arithmetic / function-call RHS all return
+    /// false — those route to the read-modify-write fallback in a later
+    /// phase.
+    pub fn is_simple(&self) -> bool {
+        self.add.is_empty()
+            && self.delete.is_empty()
+            && self
+                .set
+                .iter()
+                .all(|c| c.path.is_top_level() && matches!(c.value, SetRhs::Operand(Operand::Value(_))))
+            && self.remove.iter().all(|p| p.is_top_level())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetClause {
     pub path: Path,
@@ -91,6 +109,59 @@ impl Path {
     }
 }
 
+// ===== ConditionExpression (resolved) ========================================
+//
+// Used by UpdateItem / DeleteItem / PutItem / TransactWriteItems. Reuses
+// the shared `Path` and `Operand` types from above.
+//
+// v1 grammar covers: attribute_exists / attribute_not_exists, comparison
+// operators, AND / OR / NOT, parens. Deferred: BETWEEN, IN, begins_with,
+// contains, size, attribute_type, nested paths — Phase 4e and later.
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Condition {
+    /// `op1 op op2`
+    Compare {
+        op: ComparisonOp,
+        left: Operand,
+        right: Operand,
+    },
+    /// `attribute_exists(path)`
+    AttributeExists(Path),
+    /// `attribute_not_exists(path)`
+    AttributeNotExists(Path),
+    /// `cond AND cond`
+    And(Box<Condition>, Box<Condition>),
+    /// `cond OR cond`
+    Or(Box<Condition>, Box<Condition>),
+    /// `NOT cond`
+    Not(Box<Condition>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComparisonOp {
+    Eq, // =
+    Ne, // <>
+    Lt, // <
+    Le, // <=
+    Gt, // >
+    Ge, // >=
+}
+
+impl ComparisonOp {
+    /// The on-wire token form, useful for error messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Eq => "=",
+            Self::Ne => "<>",
+            Self::Lt => "<",
+            Self::Le => "<=",
+            Self::Gt => ">",
+            Self::Ge => ">=",
+        }
+    }
+}
+
 // ===== Raw AST (pre-substitution; what the parser emits) =====================
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -148,4 +219,20 @@ pub enum RawPathSegment {
     NameRef(String),
     /// `[N]` list index.
     Index(usize),
+}
+
+// ===== ConditionExpression (raw, pre-substitution) ===========================
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RawCondition {
+    Compare {
+        op: ComparisonOp,
+        left: RawOperand,
+        right: RawOperand,
+    },
+    AttributeExists(RawPath),
+    AttributeNotExists(RawPath),
+    And(Box<RawCondition>, Box<RawCondition>),
+    Or(Box<RawCondition>, Box<RawCondition>),
+    Not(Box<RawCondition>),
 }

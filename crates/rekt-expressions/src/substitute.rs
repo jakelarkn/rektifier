@@ -160,6 +160,37 @@ fn resolve_path(p: RawPath, names: &BTreeMap<String, String>) -> Result<Path, Su
     })
 }
 
+// ===== ConditionExpression substitution =======================================
+
+pub fn substitute_condition(
+    raw: RawCondition,
+    names: &BTreeMap<String, String>,
+    values: &BTreeMap<String, AttributeValue>,
+) -> Result<Condition, SubstituteError> {
+    Ok(match raw {
+        RawCondition::Compare { op, left, right } => Condition::Compare {
+            op,
+            left: resolve_operand(left, names, values)?,
+            right: resolve_operand(right, names, values)?,
+        },
+        RawCondition::AttributeExists(p) => Condition::AttributeExists(resolve_path(p, names)?),
+        RawCondition::AttributeNotExists(p) => {
+            Condition::AttributeNotExists(resolve_path(p, names)?)
+        }
+        RawCondition::And(a, b) => Condition::And(
+            Box::new(substitute_condition(*a, names, values)?),
+            Box::new(substitute_condition(*b, names, values)?),
+        ),
+        RawCondition::Or(a, b) => Condition::Or(
+            Box::new(substitute_condition(*a, names, values)?),
+            Box::new(substitute_condition(*b, names, values)?),
+        ),
+        RawCondition::Not(inner) => {
+            Condition::Not(Box::new(substitute_condition(*inner, names, values)?))
+        }
+    })
+}
+
 fn debug_path(p: &RawPath) -> String {
     let mut out = String::new();
     for (i, seg) in p.segments.iter().enumerate() {

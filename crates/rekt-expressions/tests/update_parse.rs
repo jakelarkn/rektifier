@@ -528,11 +528,11 @@ fn roundtrip_compound_expression() {
 fn err_empty_expression() {
     assert!(matches!(
         parse_update_expression(""),
-        Err(ParseError::Empty)
+        Err(ParseError::Empty { kind }) if kind == "UpdateExpression"
     ));
     assert!(matches!(
         parse_update_expression("   "),
-        Err(ParseError::Empty)
+        Err(ParseError::Empty { kind }) if kind == "UpdateExpression"
     ));
 }
 

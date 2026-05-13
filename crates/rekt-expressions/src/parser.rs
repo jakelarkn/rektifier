@@ -1,6 +1,8 @@
-//! winnow-based parser for `UpdateExpression`. Produces a `RawUpdateExpression`
-//! with `:v` and `#n` placeholders verbatim; downstream `substitute_update`
-//! resolves them.
+//! winnow-based parsers for DDB expression languages: `UpdateExpression`
+//! (`parse_update_expression`) and `ConditionExpression`
+//! (`parse_condition_expression`). Both produce raw ASTs with `:v` and
+//! `#n` placeholders verbatim; downstream `substitute_*` functions
+//! resolve them.
 
 use winnow::ascii::{digit1, multispace0, multispace1, Caseless};
 use winnow::combinator::{alt, delimited, fail, opt, preceded, repeat, separated, terminated};
@@ -13,11 +15,15 @@ use crate::ast::*;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
-    #[error("UpdateExpression parse error at position {position}: {message}")]
-    Invalid { position: usize, message: String },
+    #[error("{kind} parse error at position {position}: {message}")]
+    Invalid {
+        kind: &'static str,
+        position: usize,
+        message: String,
+    },
 
-    #[error("UpdateExpression is empty")]
-    Empty,
+    #[error("{kind} is empty")]
+    Empty { kind: &'static str },
 
     #[error(
         "UpdateExpression contains duplicate `{clause}` keyword — DDB requires actions of one kind to be grouped under a single `SET`/`REMOVE`/`ADD`/`DELETE` keyword"
@@ -26,9 +32,14 @@ pub enum ParseError {
 }
 
 impl ParseError {
-    fn from_winnow(input_orig: &str, e: WinnowParseError<&str, ContextError>) -> Self {
+    fn from_winnow(
+        kind: &'static str,
+        input_orig: &str,
+        e: WinnowParseError<&str, ContextError>,
+    ) -> Self {
         let position = input_orig.len() - e.input().len();
         Self::Invalid {
+            kind,
             position,
             message: e.inner().to_string(),
         }
@@ -37,11 +48,13 @@ impl ParseError {
 
 pub fn parse_update_expression(input: &str) -> Result<RawUpdateExpression, ParseError> {
     if input.trim().is_empty() {
-        return Err(ParseError::Empty);
+        return Err(ParseError::Empty {
+            kind: "UpdateExpression",
+        });
     }
     let raw_blocks = full_expression
         .parse(input)
-        .map_err(|e| ParseError::from_winnow(input, e))?;
+        .map_err(|e| ParseError::from_winnow("UpdateExpression", input, e))?;
 
     let mut expr = RawUpdateExpression::default();
     let mut seen = [false; 4];
@@ -269,4 +282,142 @@ fn ident(input: &mut &str) -> ModalResult<String> {
     s.push_str(first);
     s.push_str(rest);
     Ok(s)
+}
+
+// =============================================================================
+// ConditionExpression parser
+// =============================================================================
+//
+// v1 grammar:
+//
+//   condition  := or_expr
+//   or_expr    := and_expr ('OR' and_expr)*
+//   and_expr   := not_expr ('AND' not_expr)*
+//   not_expr   := 'NOT' not_expr | atom
+//   atom       := '(' condition ')'
+//                | 'attribute_exists' '(' path ')'
+//                | 'attribute_not_exists' '(' path ')'
+//                | operand comparator operand
+//   comparator := '=' | '<>' | '<=' | '>=' | '<' | '>'
+//
+// Precedence: OR (lowest) < AND < NOT < parens/atom. Keywords are
+// case-insensitive (matches DDB behavior). Deferred to later phases:
+// BETWEEN, IN, begins_with, contains, size, attribute_type.
+
+pub fn parse_condition_expression(input: &str) -> Result<RawCondition, ParseError> {
+    if input.trim().is_empty() {
+        return Err(ParseError::Empty {
+            kind: "ConditionExpression",
+        });
+    }
+    cond_top
+        .parse(input)
+        .map_err(|e| ParseError::from_winnow("ConditionExpression", input, e))
+}
+
+fn cond_top(input: &mut &str) -> ModalResult<RawCondition> {
+    let _ = multispace0.parse_next(input)?;
+    let c = or_expr.parse_next(input)?;
+    let _ = multispace0.parse_next(input)?;
+    Ok(c)
+}
+
+fn or_expr(input: &mut &str) -> ModalResult<RawCondition> {
+    let mut left = and_expr.parse_next(input)?;
+    while opt(or_keyword).parse_next(input)?.is_some() {
+        let right = and_expr.parse_next(input)?;
+        left = RawCondition::Or(Box::new(left), Box::new(right));
+    }
+    Ok(left)
+}
+
+fn and_expr(input: &mut &str) -> ModalResult<RawCondition> {
+    let mut left = not_expr.parse_next(input)?;
+    while opt(and_keyword).parse_next(input)?.is_some() {
+        let right = not_expr.parse_next(input)?;
+        left = RawCondition::And(Box::new(left), Box::new(right));
+    }
+    Ok(left)
+}
+
+fn not_expr(input: &mut &str) -> ModalResult<RawCondition> {
+    let _ = multispace0.parse_next(input)?;
+    if opt(not_keyword).parse_next(input)?.is_some() {
+        let inner = not_expr.parse_next(input)?;
+        return Ok(RawCondition::Not(Box::new(inner)));
+    }
+    cond_atom.parse_next(input)
+}
+
+fn cond_atom(input: &mut &str) -> ModalResult<RawCondition> {
+    let _ = multispace0.parse_next(input)?;
+    alt((paren_group, attribute_exists_fn, attribute_not_exists_fn, comparison)).parse_next(input)
+}
+
+fn paren_group(input: &mut &str) -> ModalResult<RawCondition> {
+    let _ = '('.parse_next(input)?;
+    let inner = or_expr.parse_next(input)?;
+    let _ = (multispace0, ')').parse_next(input)?;
+    Ok(inner)
+}
+
+fn attribute_exists_fn(input: &mut &str) -> ModalResult<RawCondition> {
+    let _ = Caseless("attribute_exists").parse_next(input)?;
+    let _ = (multispace0, '(', multispace0).parse_next(input)?;
+    let p = path.parse_next(input)?;
+    let _ = (multispace0, ')').parse_next(input)?;
+    Ok(RawCondition::AttributeExists(p))
+}
+
+fn attribute_not_exists_fn(input: &mut &str) -> ModalResult<RawCondition> {
+    let _ = Caseless("attribute_not_exists").parse_next(input)?;
+    let _ = (multispace0, '(', multispace0).parse_next(input)?;
+    let p = path.parse_next(input)?;
+    let _ = (multispace0, ')').parse_next(input)?;
+    Ok(RawCondition::AttributeNotExists(p))
+}
+
+fn comparison(input: &mut &str) -> ModalResult<RawCondition> {
+    let left = operand.parse_next(input)?;
+    let _ = multispace0.parse_next(input)?;
+    let op = comparator.parse_next(input)?;
+    let _ = multispace0.parse_next(input)?;
+    let right = operand.parse_next(input)?;
+    Ok(RawCondition::Compare { op, left, right })
+}
+
+fn comparator(input: &mut &str) -> ModalResult<ComparisonOp> {
+    // Order matters: `<=` and `<>` must be tried before `<`; `>=` before `>`.
+    alt((
+        "<=".map(|_| ComparisonOp::Le),
+        ">=".map(|_| ComparisonOp::Ge),
+        "<>".map(|_| ComparisonOp::Ne),
+        "=".map(|_| ComparisonOp::Eq),
+        "<".map(|_| ComparisonOp::Lt),
+        ">".map(|_| ComparisonOp::Gt),
+    ))
+    .parse_next(input)
+}
+
+/// Match the `AND` keyword as a whole word — i.e., followed by whitespace
+/// or end-of-input — so paths whose names happen to start with `and` (e.g.
+/// `andrew`) don't get mis-eaten by the OR loop's lookahead.
+fn and_keyword(input: &mut &str) -> ModalResult<()> {
+    let _ = multispace1.parse_next(input)?;
+    let _ = Caseless("AND").parse_next(input)?;
+    let _ = multispace1.parse_next(input)?;
+    Ok(())
+}
+
+fn or_keyword(input: &mut &str) -> ModalResult<()> {
+    let _ = multispace1.parse_next(input)?;
+    let _ = Caseless("OR").parse_next(input)?;
+    let _ = multispace1.parse_next(input)?;
+    Ok(())
+}
+
+fn not_keyword(input: &mut &str) -> ModalResult<()> {
+    let _ = Caseless("NOT").parse_next(input)?;
+    let _ = multispace1.parse_next(input)?;
+    Ok(())
 }

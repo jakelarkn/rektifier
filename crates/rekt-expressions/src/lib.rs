@@ -47,8 +47,9 @@ mod parser;
 mod substitute;
 
 pub use ast::{
-    AddAction, DeleteAction, Operand, Path, PathSegment, RawOperand, RawPath, RawPathSegment,
-    RawSetClause, RawSetRhs, RawUpdateExpression, SetClause, SetRhs, UpdateExpression,
+    AddAction, ComparisonOp, Condition, DeleteAction, Operand, Path, PathSegment, RawCondition,
+    RawOperand, RawPath, RawPathSegment, RawSetClause, RawSetRhs, RawUpdateExpression, SetClause,
+    SetRhs, UpdateExpression,
 };
-pub use parser::{parse_update_expression, ParseError};
-pub use substitute::{substitute_update, SubstituteError};
+pub use parser::{parse_condition_expression, parse_update_expression, ParseError};
+pub use substitute::{substitute_condition, substitute_update, SubstituteError};
