@@ -99,8 +99,8 @@ fn parse_eq_path_value() {
 
 #[test]
 fn parse_ne_path_value() {
-    let got = parse_condition_expression("status <> :s").unwrap();
-    assert_eq!(got, cmp(ComparisonOp::Ne, rop_path("status"), vref("s")));
+    let got = parse_condition_expression("flag <> :s").unwrap();
+    assert_eq!(got, cmp(ComparisonOp::Ne, rop_path("flag"), vref("s")));
 }
 
 #[test]
@@ -132,12 +132,12 @@ fn parse_path_vs_path() {
 
 #[test]
 fn parse_comparison_with_name_refs() {
-    let got = parse_condition_expression("#status = :v").unwrap();
+    let got = parse_condition_expression("#flag = :v").unwrap();
     assert_eq!(
         got,
         cmp(
             ComparisonOp::Eq,
-            RawOperand::Path(rpath(&[pnref("status")])),
+            RawOperand::Path(rpath(&[pnref("flag")])),
             vref("v")
         )
     );
@@ -291,11 +291,11 @@ fn parse_name_starting_with_keyword_letters_is_identifier() {
 #[test]
 fn subst_attribute_exists_resolves_name_ref() {
     let raw = parse_condition_expression("attribute_exists(#a)").unwrap();
-    let resolved = substitute_condition(raw, &names(&[("#a", "status")]), &values(&[])).unwrap();
+    let resolved = substitute_condition(raw, &names(&[("#a", "flag")]), &values(&[])).unwrap();
     assert_eq!(
         resolved,
         Condition::AttributeExists(Path {
-            segments: vec![PathSegment::Name("status".into())],
+            segments: vec![PathSegment::Name("flag".into())],
         })
     );
 }
@@ -327,12 +327,12 @@ fn subst_boolean_composition() {
         parse_condition_expression("attribute_exists(#k) AND #k = :v").unwrap();
     let resolved = substitute_condition(
         raw,
-        &names(&[("#k", "status")]),
+        &names(&[("#k", "flag")]),
         &values(&[(":v", AttributeValue::S("active".into()))]),
     )
     .unwrap();
     let status_path = Path {
-        segments: vec![PathSegment::Name("status".into())],
+        segments: vec![PathSegment::Name("flag".into())],
     };
     assert_eq!(
         resolved,
@@ -416,10 +416,10 @@ fn err_substitute_missing_value() {
 
 #[test]
 fn parse_begins_with() {
-    let got = parse_condition_expression("begins_with(name, :p)").unwrap();
+    let got = parse_condition_expression("begins_with(label, :p)").unwrap();
     assert_eq!(
         got,
-        RawCondition::BeginsWith(rpath(&[pn("name")]), vref("p"))
+        RawCondition::BeginsWith(rpath(&[pn("label")]), vref("p"))
     );
 }
 
@@ -449,17 +449,17 @@ fn parse_between() {
 
 #[test]
 fn parse_in_list() {
-    let got = parse_condition_expression("status IN (:a, :b, :c)").unwrap();
+    let got = parse_condition_expression("flag IN (:a, :b, :c)").unwrap();
     assert_eq!(
         got,
-        RawCondition::In(rop_path("status"), vec![vref("a"), vref("b"), vref("c")])
+        RawCondition::In(rop_path("flag"), vec![vref("a"), vref("b"), vref("c")])
     );
 }
 
 #[test]
 fn parse_in_single_item() {
-    let got = parse_condition_expression("status IN (:a)").unwrap();
-    assert_eq!(got, RawCondition::In(rop_path("status"), vec![vref("a")]));
+    let got = parse_condition_expression("flag IN (:a)").unwrap();
+    assert_eq!(got, RawCondition::In(rop_path("flag"), vec![vref("a")]));
 }
 
 #[test]
@@ -498,14 +498,14 @@ fn parse_in_with_paths() {
 fn parse_case_insensitive_extended_keywords() {
     // BETWEEN / IN / begins_with all case-insensitive.
     assert!(parse_condition_expression("score between :lo and :hi").is_ok());
-    assert!(parse_condition_expression("status in (:a)").is_ok());
-    assert!(parse_condition_expression("Begins_With(name, :p)").is_ok());
+    assert!(parse_condition_expression("flag in (:a)").is_ok());
+    assert!(parse_condition_expression("Begins_With(label, :p)").is_ok());
 }
 
 #[test]
 fn err_in_with_empty_list() {
     // `path IN ()` — empty list is not valid grammar.
-    assert!(parse_condition_expression("status IN ()").is_err());
+    assert!(parse_condition_expression("flag IN ()").is_err());
 }
 
 #[test]

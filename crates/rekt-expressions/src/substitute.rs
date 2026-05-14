@@ -20,6 +20,14 @@ pub enum SubstituteError {
 
     #[error("ExpressionAttributeValues is missing entry `:{name}` referenced by the expression")]
     UnknownValue { name: String },
+
+    /// A bare identifier in the expression matched a DDB reserved word.
+    /// The caller can substitute an ExpressionAttributeName alias
+    /// (`#x` → "actualName") to bypass — that's the whole point of the
+    /// alias mechanism. We mirror DDB's message format so consumers
+    /// that pattern-match on the wire error see the same shape.
+    #[error("Attribute name is a reserved keyword; reserved keyword: {word}")]
+    ReservedWord { word: String },
 }
 
 pub fn substitute_update(
@@ -144,7 +152,19 @@ fn resolve_path(p: RawPath, names: &BTreeMap<String, String>) -> Result<Path, Su
             .into_iter()
             .map(|s| {
                 Ok(match s {
-                    RawPathSegment::Name(n) => PathSegment::Name(n),
+                    RawPathSegment::Name(n) => {
+                        // Bare identifier: rejected if it collides with a
+                        // DDB reserved word. The user is supposed to use
+                        // an `#x` alias instead. Note: this check does
+                        // NOT apply to NameRef below — substituted names
+                        // can legitimately resolve to reserved-word
+                        // strings because the resolved name never lands
+                        // back in the expression grammar's token stream.
+                        if crate::reserved_words::is_reserved(&n) {
+                            return Err(SubstituteError::ReservedWord { word: n });
+                        }
+                        PathSegment::Name(n)
+                    }
                     RawPathSegment::Index(i) => PathSegment::Index(i),
                     RawPathSegment::NameRef(n) => {
                         let actual = names

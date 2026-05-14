@@ -13,6 +13,20 @@
 //! variant (S, N, B, BOOL, NULL, L, M, SS, NS, BS) plus a composite-key
 //! case. Each test uses a unique PK so they're idempotent regardless of
 //! whatever else is in the tables.
+//!
+//! ## Attribute-name convention
+//!
+//! DDB has a ~573-word reserved-keyword list. Bare reserved names in
+//! expressions are rejected with a `ValidationException` (rektifier
+//! enforces this too, via `rekt_expressions::is_reserved`). To keep
+//! main-path tests focused on the feature under test rather than the
+//! reservation rules, use **non-reserved** attribute names in test
+//! data: `label`, `flag`, `tally`, `origin`, `entries`, `replica`,
+//! `score`, `version`, `tags`, `role`. If a test absolutely needs a
+//! reserved name (e.g. for parity-with-DDB error testing), alias it
+//! via `ExpressionAttributeNames` (`{"#n":"name"}`). Reserved-word
+//! rejection itself has dedicated edge-case tests below — don't
+//! duplicate that concern in main-path tests.
 
 use serde_json::{json, Value};
 use std::process::Command;
@@ -21,6 +35,33 @@ const REF: &str = "http://localhost:8000"; // dynamodb-local
 const OURS: &str = "http://localhost:9000"; // rektifier
 
 // ===== Shell-out helpers ======================================================
+
+/// Like `aws`, but expects the CLI to exit non-zero. Returns the
+/// stderr text so the test can match on the DDB error message. Panics
+/// if the command unexpectedly succeeded.
+fn aws_expecting_failure(endpoint: &str, args: &[&str]) -> String {
+    let output = Command::new("aws")
+        .arg("--endpoint-url")
+        .arg(endpoint)
+        .args(args)
+        .env("AWS_ACCESS_KEY_ID", "local")
+        .env("AWS_SECRET_ACCESS_KEY", "local")
+        .env("AWS_DEFAULT_REGION", "us-east-1")
+        .arg("--output")
+        .arg("json")
+        .output()
+        .unwrap_or_else(|e| panic!("aws CLI invocation failed: {e}"));
+
+    if output.status.success() {
+        panic!(
+            "aws {endpoint} args={args:?} unexpectedly succeeded:\nstdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    let mut s = String::from_utf8_lossy(&output.stderr).into_owned();
+    s.push_str(&String::from_utf8_lossy(&output.stdout));
+    s
+}
 
 fn aws(endpoint: &str, args: &[&str]) -> Value {
     let output = Command::new("aws")
@@ -1612,6 +1653,83 @@ fn diff_update_return_values_all_new_add_numeric() {
             r##"{":n":{"N":"5"}}"##,
             "--return-values",
             "ALL_NEW",
+        ],
+    );
+}
+
+// ---- Reserved-word rejection parity (edge cases) -------------------------
+//
+// These verify both endpoints reject bare reserved-word attribute names
+// in expressions with a similar error shape. They are deliberately
+// scoped to the reservation behavior — main-path tests above use
+// non-reserved attribute names (see the module header) so they stay
+// focused on translator/storage logic.
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_reject_reserved_bare_name_in_update_expression() {
+    ensure_users_table();
+    let args = &[
+        "dynamodb", "update-item",
+        "--table-name", "users",
+        "--key", r##"{"id":{"S":"diff_reserved_upd"}}"##,
+        "--update-expression", "SET name = :v",
+        "--expression-attribute-values", r##"{":v":{"S":"alice"}}"##,
+    ];
+    let ref_err = aws_expecting_failure(REF, args);
+    let ours_err = aws_expecting_failure(OURS, args);
+    for (label, msg) in [("ref", &ref_err), ("ours", &ours_err)] {
+        assert!(
+            msg.contains("ValidationException"),
+            "{label}: expected ValidationException, got: {msg}"
+        );
+        assert!(
+            msg.contains("reserved keyword: name"),
+            "{label}: expected `reserved keyword: name`, got: {msg}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_reject_reserved_bare_name_in_condition_expression() {
+    ensure_users_table();
+    let args = &[
+        "dynamodb", "update-item",
+        "--table-name", "users",
+        "--key", r##"{"id":{"S":"diff_reserved_cond"}}"##,
+        "--update-expression", "SET label = :v",
+        "--condition-expression", "attribute_exists(status)",
+        "--expression-attribute-values", r##"{":v":{"S":"alice"}}"##,
+    ];
+    let ref_err = aws_expecting_failure(REF, args);
+    let ours_err = aws_expecting_failure(OURS, args);
+    for (label, msg) in [("ref", &ref_err), ("ours", &ours_err)] {
+        assert!(
+            msg.contains("ValidationException"),
+            "{label}: expected ValidationException, got: {msg}"
+        );
+        assert!(
+            msg.contains("reserved keyword: status"),
+            "{label}: expected `reserved keyword: status`, got: {msg}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_aliased_reserved_name_is_accepted() {
+    // Verifies the bypass: `#n → "name"` succeeds on both endpoints
+    // because the parser only sees the placeholder.
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_reserved_aliased"}}"##,
+        None,
+        &[
+            "--update-expression", "SET #n = :v",
+            "--expression-attribute-names", r##"{"#n":"name"}"##,
+            "--expression-attribute-values", r##"{":v":{"S":"alice"}}"##,
         ],
     );
 }

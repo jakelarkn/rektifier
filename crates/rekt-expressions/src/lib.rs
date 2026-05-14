@@ -44,6 +44,7 @@
 
 pub mod ast;
 mod parser;
+mod reserved_words;
 mod substitute;
 
 pub use ast::{
@@ -52,4 +53,5 @@ pub use ast::{
     SetRhs, UpdateExpression,
 };
 pub use parser::{parse_condition_expression, parse_update_expression, ParseError};
+pub use reserved_words::is_reserved;
 pub use substitute::{substitute_condition, substitute_update, SubstituteError};

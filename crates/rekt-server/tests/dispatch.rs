@@ -144,7 +144,7 @@ impl Backend for MockBackend {
         };
         let obj = new_item
             .as_object_mut()
-            .ok_or_else(|| BackendError::Other("stored value is not an object".into()))?;
+            .ok_or_else(|| BackendError::Other("stored val is not an object".into()))?;
         for (name, value) in sets {
             obj.insert((*name).to_string(), (*value).clone());
         }
@@ -187,7 +187,7 @@ impl Backend for MockBackend {
         let mut new_item = item;
         let obj = new_item
             .as_object_mut()
-            .ok_or_else(|| BackendError::Other("stored value is not an object".into()))?;
+            .ok_or_else(|| BackendError::Other("stored val is not an object".into()))?;
         for (name, value) in sets {
             obj.insert((*name).to_string(), (*value).clone());
         }
@@ -336,7 +336,7 @@ async fn put_then_get_round_trip() {
     // PutItem
     let put_body = json!({
         "TableName": "users",
-        "Item": {"id": {"S": "u1"}, "name": {"S": "alice"}}
+        "Item": {"id": {"S": "u1"}, "label": {"S": "alice"}}
     });
     let resp = app
         .clone()
@@ -357,7 +357,7 @@ async fn put_then_get_round_trip() {
     let got = body_json(resp).await;
     assert_eq!(
         got,
-        json!({"Item": {"id": {"S": "u1"}, "name": {"S": "alice"}}})
+        json!({"Item": {"id": {"S": "u1"}, "label": {"S": "alice"}}})
     );
 }
 
@@ -433,7 +433,7 @@ async fn put_with_missing_pk_attr_is_validation_error() {
     let resp = app
         .oneshot(ddb_request(
             "PutItem",
-            json!({"TableName":"users","Item":{"name":{"S":"alice"}}}),
+            json!({"TableName":"users","Item":{"label":{"S":"alice"}}}),
         ))
         .await
         .unwrap();
@@ -482,7 +482,7 @@ async fn composite_table_put_then_get() {
     let item = json!({
         "device_id": {"S": "d1"},
         "ts": {"N": "1000"},
-        "value": {"N": "42"}
+        "val": {"N": "42"}
     });
     let resp = app
         .clone()
@@ -534,7 +534,7 @@ async fn put_item_returns_empty_object_and_correct_content_type() {
 async fn delete_then_get_returns_empty() {
     let app = app();
     // Put first
-    let item = json!({"id":{"S":"to_delete"},"name":{"S":"alice"}});
+    let item = json!({"id":{"S":"to_delete"},"label":{"S":"alice"}});
     let resp = app
         .clone()
         .oneshot(ddb_request(
@@ -627,9 +627,9 @@ async fn update_set_on_missing_row_upserts() {
             json!({
                 "TableName":"users",
                 "Key":{"id":{"S":"u1"}},
-                "UpdateExpression":"SET #n = :name, score = :s",
-                "ExpressionAttributeNames":{"#n":"name"},
-                "ExpressionAttributeValues":{":name":{"S":"alice"},":s":{"N":"7"}},
+                "UpdateExpression":"SET #n = :label, score = :s",
+                "ExpressionAttributeNames":{"#n":"label"},
+                "ExpressionAttributeValues":{":label":{"S":"alice"},":s":{"N":"7"}},
             }),
         ))
         .await
@@ -647,7 +647,7 @@ async fn update_set_on_missing_row_upserts() {
     let got = body_json(resp).await;
     assert_eq!(
         got,
-        json!({"Item":{"id":{"S":"u1"},"name":{"S":"alice"},"score":{"N":"7"}}})
+        json!({"Item":{"id":{"S":"u1"},"label":{"S":"alice"},"score":{"N":"7"}}})
     );
 }
 
@@ -658,7 +658,7 @@ async fn update_set_on_existing_row_merges_siblings() {
     app.clone()
         .oneshot(ddb_request(
             "PutItem",
-            json!({"TableName":"users","Item":{"id":{"S":"u1"},"name":{"S":"alice"},"keep":{"S":"x"}}}),
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"label":{"S":"alice"},"keep":{"S":"x"}}}),
         ))
         .await
         .unwrap();
@@ -671,9 +671,9 @@ async fn update_set_on_existing_row_merges_siblings() {
             json!({
                 "TableName":"users",
                 "Key":{"id":{"S":"u1"}},
-                "UpdateExpression":"SET #n = :name, active = :a",
-                "ExpressionAttributeNames":{"#n":"name"},
-                "ExpressionAttributeValues":{":name":{"S":"alice2"},":a":{"BOOL":true}},
+                "UpdateExpression":"SET #n = :label, active = :a",
+                "ExpressionAttributeNames":{"#n":"label"},
+                "ExpressionAttributeValues":{":label":{"S":"alice2"},":a":{"BOOL":true}},
             }),
         ))
         .await
@@ -692,7 +692,7 @@ async fn update_set_on_existing_row_merges_siblings() {
         got,
         json!({"Item":{
             "id":{"S":"u1"},
-            "name":{"S":"alice2"},
+            "label":{"S":"alice2"},
             "keep":{"S":"x"},
             "active":{"BOOL":true},
         }})
@@ -705,7 +705,7 @@ async fn update_remove_drops_attribute() {
     app.clone()
         .oneshot(ddb_request(
             "PutItem",
-            json!({"TableName":"users","Item":{"id":{"S":"u1"},"keep":{"S":"x"},"drop":{"S":"y"}}}),
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"keep":{"S":"x"},"goner":{"S":"y"}}}),
         ))
         .await
         .unwrap();
@@ -718,7 +718,7 @@ async fn update_remove_drops_attribute() {
                 "TableName":"users",
                 "Key":{"id":{"S":"u1"}},
                 "UpdateExpression":"REMOVE #d",
-                "ExpressionAttributeNames":{"#d":"drop"},
+                "ExpressionAttributeNames":{"#d":"goner"},
             }),
         ))
         .await
@@ -744,7 +744,7 @@ async fn update_attribute_exists_pk_succeeds_when_row_exists() {
     app.clone()
         .oneshot(ddb_request(
             "PutItem",
-            json!({"TableName":"users","Item":{"id":{"S":"u1"},"name":{"S":"alice"}}}),
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"label":{"S":"alice"}}}),
         ))
         .await
         .unwrap();
@@ -756,7 +756,7 @@ async fn update_attribute_exists_pk_succeeds_when_row_exists() {
             json!({
                 "TableName":"users",
                 "Key":{"id":{"S":"u1"}},
-                "UpdateExpression":"SET name = :n",
+                "UpdateExpression":"SET label = :n",
                 "ExpressionAttributeValues":{":n":{"S":"alice2"}},
                 "ConditionExpression":"attribute_exists(id)",
             }),
@@ -775,7 +775,7 @@ async fn update_attribute_exists_pk_succeeds_when_row_exists() {
     let got = body_json(resp).await;
     assert_eq!(
         got,
-        json!({"Item":{"id":{"S":"u1"},"name":{"S":"alice2"}}})
+        json!({"Item":{"id":{"S":"u1"},"label":{"S":"alice2"}}})
     );
 }
 
@@ -789,7 +789,7 @@ async fn update_attribute_exists_pk_fails_when_row_missing() {
             json!({
                 "TableName":"users",
                 "Key":{"id":{"S":"never_existed"}},
-                "UpdateExpression":"SET name = :n",
+                "UpdateExpression":"SET label = :n",
                 "ExpressionAttributeValues":{":n":{"S":"alice"}},
                 "ConditionExpression":"attribute_exists(id)",
             }),
@@ -918,7 +918,7 @@ async fn update_boolean_composition() {
     app.clone()
         .oneshot(ddb_request(
             "PutItem",
-            json!({"TableName":"users","Item":{"id":{"S":"u1"},"status":{"S":"active"},"version":{"N":"1"}}}),
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"flag":{"S":"active"},"version":{"N":"1"}}}),
         ))
         .await
         .unwrap();
@@ -933,7 +933,7 @@ async fn update_boolean_composition() {
                 "Key":{"id":{"S":"u1"}},
                 "UpdateExpression":"SET version = :new",
                 "ExpressionAttributeValues":{":active":{"S":"active"},":v1":{"N":"1"},":new":{"N":"2"}},
-                "ConditionExpression":"status = :active AND version = :v1",
+                "ConditionExpression":"flag = :active AND version = :v1",
             }),
         ))
         .await
@@ -949,7 +949,7 @@ async fn update_boolean_composition() {
                 "Key":{"id":{"S":"u1"}},
                 "UpdateExpression":"SET version = :new",
                 "ExpressionAttributeValues":{":inactive":{"S":"inactive"},":new":{"N":"3"}},
-                "ConditionExpression":"status = :inactive",
+                "ConditionExpression":"flag = :inactive",
             }),
         ))
         .await
@@ -969,9 +969,9 @@ async fn update_insert_only_creates_when_row_absent() {
             json!({
                 "TableName":"users",
                 "Key":{"id":{"S":"u_insert_only"}},
-                "UpdateExpression":"SET #n = :name",
-                "ExpressionAttributeNames":{"#n":"name"},
-                "ExpressionAttributeValues":{":name":{"S":"alice"}},
+                "UpdateExpression":"SET #n = :label",
+                "ExpressionAttributeNames":{"#n":"label"},
+                "ExpressionAttributeValues":{":label":{"S":"alice"}},
                 "ConditionExpression":"attribute_not_exists(id)",
             }),
         ))
@@ -990,7 +990,7 @@ async fn update_insert_only_creates_when_row_absent() {
     let got = body_json(resp).await;
     assert_eq!(
         got,
-        json!({"Item":{"id":{"S":"u_insert_only"},"name":{"S":"alice"}}})
+        json!({"Item":{"id":{"S":"u_insert_only"},"label":{"S":"alice"}}})
     );
 }
 
@@ -1001,7 +1001,7 @@ async fn update_insert_only_fails_when_row_exists() {
     app.clone()
         .oneshot(ddb_request(
             "PutItem",
-            json!({"TableName":"users","Item":{"id":{"S":"u_exists"},"name":{"S":"alice"}}}),
+            json!({"TableName":"users","Item":{"id":{"S":"u_exists"},"label":{"S":"alice"}}}),
         ))
         .await
         .unwrap();
@@ -1013,7 +1013,7 @@ async fn update_insert_only_fails_when_row_exists() {
             json!({
                 "TableName":"users",
                 "Key":{"id":{"S":"u_exists"}},
-                "UpdateExpression":"SET name = :n",
+                "UpdateExpression":"SET label = :n",
                 "ExpressionAttributeValues":{":n":{"S":"alice2"}},
                 "ConditionExpression":"attribute_not_exists(id)",
             }),
@@ -1039,7 +1039,7 @@ async fn update_insert_only_fails_when_row_exists() {
     let got = body_json(resp).await;
     assert_eq!(
         got,
-        json!({"Item":{"id":{"S":"u_exists"},"name":{"S":"alice"}}})
+        json!({"Item":{"id":{"S":"u_exists"},"label":{"S":"alice"}}})
     );
 }
 
@@ -1093,7 +1093,7 @@ async fn update_reject_unsupported_return_values() {
             json!({
                 "TableName":"users",
                 "Key":{"id":{"S":"u1"}},
-                "UpdateExpression":"SET name = :n",
+                "UpdateExpression":"SET label = :n",
                 "ExpressionAttributeValues":{":n":{"S":"alice"}},
                 "ReturnValues":"ALL_OLD",
             }),
@@ -1120,7 +1120,7 @@ async fn update_return_values_all_new_direct_set_insert() {
                 "TableName":"users",
                 "Key":{"id":{"S":"u1"}},
                 "UpdateExpression":"SET #n = :n",
-                "ExpressionAttributeNames":{"#n":"name"},
+                "ExpressionAttributeNames":{"#n":"label"},
                 "ExpressionAttributeValues":{":n":{"S":"alice"}},
                 "ReturnValues":"ALL_NEW",
             }),
@@ -1133,7 +1133,7 @@ async fn update_return_values_all_new_direct_set_insert() {
         .get("Attributes")
         .expect("ALL_NEW must populate Attributes");
     assert_eq!(attrs.get("id").unwrap(), &json!({"S":"u1"}));
-    assert_eq!(attrs.get("name").unwrap(), &json!({"S":"alice"}));
+    assert_eq!(attrs.get("label").unwrap(), &json!({"S":"alice"}));
 }
 
 #[tokio::test]
@@ -1144,7 +1144,7 @@ async fn update_return_values_all_new_direct_set_update() {
     app.clone()
         .oneshot(ddb_request(
             "PutItem",
-            json!({"TableName":"users","Item":{"id":{"S":"u1"},"name":{"S":"old"},"role":{"S":"admin"}}}),
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"label":{"S":"old"},"role":{"S":"admin"}}}),
         ))
         .await
         .unwrap();
@@ -1157,7 +1157,7 @@ async fn update_return_values_all_new_direct_set_update() {
                 "TableName":"users",
                 "Key":{"id":{"S":"u1"}},
                 "UpdateExpression":"SET #n = :n",
-                "ExpressionAttributeNames":{"#n":"name"},
+                "ExpressionAttributeNames":{"#n":"label"},
                 "ExpressionAttributeValues":{":n":{"S":"new"}},
                 "ReturnValues":"ALL_NEW",
             }),
@@ -1167,7 +1167,7 @@ async fn update_return_values_all_new_direct_set_update() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
     let attrs = body.get("Attributes").unwrap();
-    assert_eq!(attrs.get("name").unwrap(), &json!({"S":"new"}));
+    assert_eq!(attrs.get("label").unwrap(), &json!({"S":"new"}));
     assert_eq!(attrs.get("role").unwrap(), &json!({"S":"admin"}));
 }
 
@@ -1184,7 +1184,7 @@ async fn update_return_values_all_new_insert_only_path() {
                 "Key":{"id":{"S":"u-new"}},
                 "UpdateExpression":"SET #n = :n",
                 "ConditionExpression":"attribute_not_exists(id)",
-                "ExpressionAttributeNames":{"#n":"name"},
+                "ExpressionAttributeNames":{"#n":"label"},
                 "ExpressionAttributeValues":{":n":{"S":"bob"}},
                 "ReturnValues":"ALL_NEW",
             }),
@@ -1195,7 +1195,7 @@ async fn update_return_values_all_new_insert_only_path() {
     let attrs = body_json(resp).await;
     let attrs = attrs.get("Attributes").unwrap();
     assert_eq!(attrs.get("id").unwrap(), &json!({"S":"u-new"}));
-    assert_eq!(attrs.get("name").unwrap(), &json!({"S":"bob"}));
+    assert_eq!(attrs.get("label").unwrap(), &json!({"S":"bob"}));
 }
 
 #[tokio::test]
@@ -1240,7 +1240,7 @@ async fn update_return_values_all_new_tx_path() {
     app.clone()
         .oneshot(ddb_request(
             "PutItem",
-            json!({"TableName":"users","Item":{"id":{"S":"u1"},"source":{"S":"hello"}}}),
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"origin":{"S":"hello"}}}),
         ))
         .await
         .unwrap();
@@ -1251,8 +1251,8 @@ async fn update_return_values_all_new_tx_path() {
             json!({
                 "TableName":"users",
                 "Key":{"id":{"S":"u1"}},
-                "UpdateExpression":"SET copy = #s",
-                "ExpressionAttributeNames":{"#s":"source"},
+                "UpdateExpression":"SET replica = #s",
+                "ExpressionAttributeNames":{"#s":"origin"},
                 "ReturnValues":"ALL_NEW",
             }),
         ))
@@ -1261,8 +1261,87 @@ async fn update_return_values_all_new_tx_path() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
     let attrs = body.get("Attributes").unwrap();
-    assert_eq!(attrs.get("copy").unwrap(), &json!({"S":"hello"}));
-    assert_eq!(attrs.get("source").unwrap(), &json!({"S":"hello"}));
+    assert_eq!(attrs.get("replica").unwrap(), &json!({"S":"hello"}));
+    assert_eq!(attrs.get("origin").unwrap(), &json!({"S":"hello"}));
+}
+
+// ===== Reserved-word rejection (edge cases) ==============================
+//
+// Main-path tests above avoid reserved attribute names. These tests are
+// dedicated to verifying the rejection AND that aliasing bypasses it.
+// Use `label`/`flag`/`tally`/`origin`/etc. as non-reserved attribute
+// names in any new main-path test.
+
+#[tokio::test]
+async fn update_rejects_reserved_bare_name_as_validation_exception() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET name = :v",
+                "ExpressionAttributeValues":{":v":{"S":"alice"}},
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let ty = body.get("__type").and_then(Value::as_str).unwrap();
+    assert!(ty.ends_with("#ValidationException"));
+    let msg = body.get("message").and_then(Value::as_str).unwrap();
+    assert!(
+        msg.contains("reserved keyword: name"),
+        "expected DDB-shaped reserved-keyword message, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn update_rejects_reserved_bare_name_in_condition() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET label = :v",
+                "ConditionExpression":"attribute_exists(status)",
+                "ExpressionAttributeValues":{":v":{"S":"alice"}},
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let msg = body.get("message").and_then(Value::as_str).unwrap();
+    assert!(
+        msg.contains("ConditionExpression") && msg.contains("reserved keyword: status"),
+        "got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn update_accepts_reserved_name_when_aliased() {
+    // The whole point of #x → "name": a reserved word is fine as the
+    // *target* of an alias because the parser only sees the placeholder.
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET #n = :v",
+                "ExpressionAttributeNames":{"#n":"name"},
+                "ExpressionAttributeValues":{":v":{"S":"alice"}},
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -1278,7 +1357,7 @@ async fn update_return_values_none_omits_attributes() {
                 "TableName":"users",
                 "Key":{"id":{"S":"u1"}},
                 "UpdateExpression":"SET #n = :n",
-                "ExpressionAttributeNames":{"#n":"name"},
+                "ExpressionAttributeNames":{"#n":"label"},
                 "ExpressionAttributeValues":{":n":{"S":"alice"}},
                 "ReturnValues":"NONE",
             }),
@@ -1298,7 +1377,7 @@ async fn update_set_path_ref_copies_attribute() {
     app.clone()
         .oneshot(ddb_request(
             "PutItem",
-            json!({"TableName":"users","Item":{"id":{"S":"u1"},"source":{"S":"hello"}}}),
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"origin":{"S":"hello"}}}),
         ))
         .await
         .unwrap();
@@ -1310,7 +1389,7 @@ async fn update_set_path_ref_copies_attribute() {
             json!({
                 "TableName":"users",
                 "Key":{"id":{"S":"u1"}},
-                "UpdateExpression":"SET copied = source",
+                "UpdateExpression":"SET copied = origin",
             }),
         ))
         .await
@@ -1327,7 +1406,7 @@ async fn update_set_path_ref_copies_attribute() {
     let got = body_json(resp).await;
     assert_eq!(
         got,
-        json!({"Item":{"id":{"S":"u1"},"source":{"S":"hello"},"copied":{"S":"hello"}}})
+        json!({"Item":{"id":{"S":"u1"},"origin":{"S":"hello"},"copied":{"S":"hello"}}})
     );
 }
 
@@ -1337,7 +1416,7 @@ async fn update_set_arithmetic_increment_counter() {
     app.clone()
         .oneshot(ddb_request(
             "PutItem",
-            json!({"TableName":"users","Item":{"id":{"S":"u1"},"counter":{"N":"10"}}}),
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"tally":{"N":"10"}}}),
         ))
         .await
         .unwrap();
@@ -1349,7 +1428,7 @@ async fn update_set_arithmetic_increment_counter() {
             json!({
                 "TableName":"users",
                 "Key":{"id":{"S":"u1"}},
-                "UpdateExpression":"SET counter = counter + :inc",
+                "UpdateExpression":"SET tally = tally + :inc",
                 "ExpressionAttributeValues":{":inc":{"N":"5"}},
             }),
         ))
@@ -1365,7 +1444,7 @@ async fn update_set_arithmetic_increment_counter() {
         .await
         .unwrap();
     let got = body_json(resp).await;
-    assert_eq!(got, json!({"Item":{"id":{"S":"u1"},"counter":{"N":"15"}}}));
+    assert_eq!(got, json!({"Item":{"id":{"S":"u1"},"tally":{"N":"15"}}}));
 }
 
 #[tokio::test]
@@ -1524,7 +1603,7 @@ async fn update_slow_path_handles_condition_too() {
             "PutItem",
             json!({
                 "TableName":"users",
-                "Item":{"id":{"S":"u1"},"counter":{"N":"5"},"version":{"N":"1"}}
+                "Item":{"id":{"S":"u1"},"tally":{"N":"5"},"version":{"N":"1"}}
             }),
         ))
         .await
@@ -1538,7 +1617,7 @@ async fn update_slow_path_handles_condition_too() {
             json!({
                 "TableName":"users",
                 "Key":{"id":{"S":"u1"}},
-                "UpdateExpression":"SET counter = counter + :inc",
+                "UpdateExpression":"SET tally = tally + :inc",
                 "ExpressionAttributeValues":{":inc":{"N":"3"},":v":{"N":"1"}},
                 "ConditionExpression":"version = :v",
             }),
@@ -1556,7 +1635,7 @@ async fn update_slow_path_handles_condition_too() {
         .await
         .unwrap();
     assert_eq!(
-        body_json(resp).await.get("Item").unwrap().get("counter"),
+        body_json(resp).await.get("Item").unwrap().get("tally"),
         Some(&json!({"N":"8"}))
     );
 
@@ -1568,7 +1647,7 @@ async fn update_slow_path_handles_condition_too() {
             json!({
                 "TableName":"users",
                 "Key":{"id":{"S":"u1"}},
-                "UpdateExpression":"SET counter = counter + :inc",
+                "UpdateExpression":"SET tally = tally + :inc",
                 "ExpressionAttributeValues":{":inc":{"N":"99"},":v":{"N":"42"}},
                 "ConditionExpression":"version = :v",
             }),
@@ -1589,7 +1668,7 @@ async fn update_slow_path_handles_condition_too() {
         .await
         .unwrap();
     assert_eq!(
-        body_json(resp).await.get("Item").unwrap().get("counter"),
+        body_json(resp).await.get("Item").unwrap().get("tally"),
         Some(&json!({"N":"8"}))
     );
 }
@@ -1644,7 +1723,7 @@ async fn update_begins_with_routes_through_slow_path() {
     app.clone()
         .oneshot(ddb_request(
             "PutItem",
-            json!({"TableName":"users","Item":{"id":{"S":"u1"},"name":{"S":"alice"}}}),
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"label":{"S":"alice"}}}),
         ))
         .await
         .unwrap();
@@ -1659,7 +1738,7 @@ async fn update_begins_with_routes_through_slow_path() {
                 "UpdateExpression":"SET marker = :m",
                 "ExpressionAttributeValues":{":m":{"S":"ok"},":p":{"S":"ali"}},
                 "ConditionExpression":"begins_with(#n, :p)",
-                "ExpressionAttributeNames":{"#n":"name"},
+                "ExpressionAttributeNames":{"#n":"label"},
             }),
         ))
         .await
@@ -1747,7 +1826,7 @@ async fn update_in_list_via_slow_path() {
     app.clone()
         .oneshot(ddb_request(
             "PutItem",
-            json!({"TableName":"users","Item":{"id":{"S":"u1"},"status":{"S":"pending"}}}),
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"flag":{"S":"pending"}}}),
         ))
         .await
         .unwrap();
@@ -1766,7 +1845,7 @@ async fn update_in_list_via_slow_path() {
                     ":c":{"S":"closed"},
                 },
                 "ConditionExpression":"#s IN (:a, :p, :c)",
-                "ExpressionAttributeNames":{"#s":"status"},
+                "ExpressionAttributeNames":{"#s":"flag"},
             }),
         ))
         .await
@@ -1814,7 +1893,7 @@ async fn update_add_numeric_on_missing_row_creates_counter() {
                 "TableName":"users",
                 "Key":{"id":{"S":"new_counter"}},
                 "UpdateExpression":"ADD #c :one",
-                "ExpressionAttributeNames":{"#c":"counter"},
+                "ExpressionAttributeNames":{"#c":"tally"},
                 "ExpressionAttributeValues":{":one":{"N":"1"}},
             }),
         ))
@@ -1830,7 +1909,7 @@ async fn update_add_numeric_on_missing_row_creates_counter() {
         .await
         .unwrap();
     let got = body_json(resp).await;
-    assert_eq!(got["Item"]["counter"], json!({"N":"1"}));
+    assert_eq!(got["Item"]["tally"], json!({"N":"1"}));
 }
 
 #[tokio::test]
@@ -1839,7 +1918,7 @@ async fn update_add_numeric_increments_existing() {
     app.clone()
         .oneshot(ddb_request(
             "PutItem",
-            json!({"TableName":"users","Item":{"id":{"S":"u1"},"counter":{"N":"10"}}}),
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"tally":{"N":"10"}}}),
         ))
         .await
         .unwrap();
@@ -1852,7 +1931,7 @@ async fn update_add_numeric_increments_existing() {
                 "TableName":"users",
                 "Key":{"id":{"S":"u1"}},
                 "UpdateExpression":"ADD #c :inc",
-                "ExpressionAttributeNames":{"#c":"counter"},
+                "ExpressionAttributeNames":{"#c":"tally"},
                 "ExpressionAttributeValues":{":inc":{"N":"5"}},
             }),
         ))
@@ -1867,7 +1946,7 @@ async fn update_add_numeric_increments_existing() {
         ))
         .await
         .unwrap();
-    assert_eq!(body_json(resp).await["Item"]["counter"], json!({"N":"15"}));
+    assert_eq!(body_json(resp).await["Item"]["tally"], json!({"N":"15"}));
 }
 
 #[tokio::test]

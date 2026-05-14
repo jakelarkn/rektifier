@@ -228,6 +228,21 @@ pub enum TranslateError {
     #[error("invalid ConditionExpression: {0}")]
     InvalidConditionExpression(String),
 
+    /// Bare attribute name in an UpdateExpression matched a DDB reserved
+    /// word. Caller should rewrite the expression to use an
+    /// ExpressionAttributeName alias (`#x` → "actualName"). Message
+    /// format mirrors DDB-local's wire output.
+    #[error(
+        "Invalid UpdateExpression: Attribute name is a reserved keyword; reserved keyword: {word}"
+    )]
+    ReservedWordInUpdateExpression { word: String },
+
+    /// Same as above but for ConditionExpression.
+    #[error(
+        "Invalid ConditionExpression: Attribute name is a reserved keyword; reserved keyword: {word}"
+    )]
+    ReservedWordInConditionExpression { word: String },
+
     /// ConditionExpression handling lives in Phases 4c/4d/4e; the
     /// no-condition fast path can't be safely reused for conditional
     /// requests. Surfaced through the storage materializer until those
@@ -385,7 +400,8 @@ pub fn translate_update_item(
         Some(c) if c.trim().is_empty() => None,
         Some(c) => {
             let raw = parse_condition_expression(c)?;
-            let cond = substitute_condition(raw, names, values)?;
+            let cond = substitute_condition(raw, names, values)
+                .map_err(map_substitute_for_condition)?;
             check_condition_paths_top_level(&cond)?;
             let routing = classify_condition(&cond, schema);
             Some(ConditionPlan {
@@ -826,7 +842,26 @@ impl From<SubstituteError> for TranslateError {
             SubstituteError::UnknownValue { name } => {
                 TranslateError::UnknownPlaceholder(format!(":{name}"))
             }
+            // The blanket `From` defaults to the UpdateExpression
+            // phrasing; call sites that resolve a ConditionExpression
+            // remap it via `map_substitute_for_condition` so the wire
+            // message names the right expression.
+            SubstituteError::ReservedWord { word } => {
+                TranslateError::ReservedWordInUpdateExpression { word }
+            }
         }
+    }
+}
+
+/// Remap a `SubstituteError::ReservedWord` raised during
+/// ConditionExpression resolution to the condition-specific variant,
+/// leaving placeholder errors unchanged.
+fn map_substitute_for_condition(e: SubstituteError) -> TranslateError {
+    match e {
+        SubstituteError::ReservedWord { word } => {
+            TranslateError::ReservedWordInConditionExpression { word }
+        }
+        other => other.into(),
     }
 }
 
@@ -936,13 +971,13 @@ mod tests {
             table_name: "users".into(),
             item: item_of(&[
                 ("id", AttributeValue::S("u1".into())),
-                ("name", AttributeValue::S("alice".into())),
+                ("label", AttributeValue::S("alice".into())),
             ]),
         };
         let plan = translate_put_item(&req, &schema_hash_s()).unwrap();
         assert_eq!(
             plan.item_json,
-            serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice"}})
+            serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}})
         );
     }
 
@@ -953,7 +988,7 @@ mod tests {
             item: item_of(&[
                 ("device_id", AttributeValue::S("dev-1".into())),
                 ("ts", AttributeValue::N("1234567890".into())),
-                ("value", AttributeValue::N("99".into())),
+                ("val", AttributeValue::N("99".into())),
             ]),
         };
         let plan = translate_put_item(&req, &schema_composite_s_n()).unwrap();
@@ -971,7 +1006,7 @@ mod tests {
             table_name: "blobs".into(),
             item: item_of(&[
                 ("hash", AttributeValue::B(Bytes::from_static(b"\x00\x01"))),
-                ("size", AttributeValue::N("2".into())),
+                ("extent", AttributeValue::N("2".into())),
             ]),
         };
         let plan = translate_put_item(&req, &schema_hash_b()).unwrap();
@@ -1017,7 +1052,7 @@ mod tests {
     fn put_missing_pk() {
         let req = PutItemRequest {
             table_name: "users".into(),
-            item: item_of(&[("name", AttributeValue::S("alice".into()))]),
+            item: item_of(&[("label", AttributeValue::S("alice".into()))]),
         };
         let err = translate_put_item(&req, &schema_hash_s()).unwrap_err();
         assert!(matches!(err, TranslateError::MissingPartitionKey { .. }));
@@ -1064,7 +1099,7 @@ mod tests {
             table_name: "users".into(),
             key: item_of(&[
                 ("id", AttributeValue::S("u1".into())),
-                ("name", AttributeValue::S("alice".into())),
+                ("label", AttributeValue::S("alice".into())),
             ]),
         };
         let err = translate_get_item(&req, &schema_hash_s()).unwrap_err();
@@ -1141,14 +1176,14 @@ mod tests {
         let req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
-            "SET name = :v",
+            "SET label = :v",
             &[(":v", AttributeValue::S("alice".into()))],
             &[],
         );
         let plan = translate_update_item(&req, &schema_hash_s()).unwrap();
         assert_eq!(plan.pk, KeyValue::S("u1".into()));
         assert_eq!(
-            set_literal_value(&plan, "name"),
+            set_literal_value(&plan, "label"),
             AttributeValue::S("alice".into())
         );
     }
@@ -1174,13 +1209,13 @@ mod tests {
         let req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
-            "SET blob = :v",
+            "SET binmark = :v",
             &[(":v", AttributeValue::B(Bytes::from_static(b"\x00\x01\x02")))],
             &[],
         );
         let plan = translate_update_item(&req, &schema_hash_s()).unwrap();
         assert!(matches!(
-            set_literal_value(&plan, "blob"),
+            set_literal_value(&plan, "binmark"),
             AttributeValue::B(_)
         ));
     }
@@ -1223,12 +1258,12 @@ mod tests {
         let req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
-            "SET items = :v",
+            "SET entries = :v",
             &[(":v", list.clone())],
             &[],
         );
         let plan = translate_update_item(&req, &schema_hash_s()).unwrap();
-        assert_eq!(set_literal_value(&plan, "items"), list);
+        assert_eq!(set_literal_value(&plan, "entries"), list);
     }
 
     #[test]
@@ -1297,7 +1332,7 @@ mod tests {
         let req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
-            "SET status = :s, score = :n, active = :b",
+            "SET flag = :s, score = :n, active = :b",
             &[
                 (":s", AttributeValue::S("active".into())),
                 (":n", AttributeValue::N("42".into())),
@@ -1308,7 +1343,7 @@ mod tests {
         let plan = translate_update_item(&req, &schema_hash_s()).unwrap();
         assert_eq!(plan.expression.set.len(), 3);
         assert_eq!(
-            set_literal_value(&plan, "status"),
+            set_literal_value(&plan, "flag"),
             AttributeValue::S("active".into())
         );
         assert_eq!(
@@ -1356,7 +1391,7 @@ mod tests {
         let req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
-            "SET status = :s REMOVE deprecated_field",
+            "SET flag = :s REMOVE deprecated_field",
             &[(":s", AttributeValue::S("active".into()))],
             &[],
         );
@@ -1373,7 +1408,7 @@ mod tests {
                 ("device_id", AttributeValue::S("d1".into())),
                 ("ts", AttributeValue::N("1000".into())),
             ],
-            "SET value = :v",
+            "SET val = :v",
             &[(":v", AttributeValue::N("42".into()))],
             &[],
         );
@@ -1389,10 +1424,10 @@ mod tests {
             &[("id", AttributeValue::S("u1".into()))],
             "SET #s = :v",
             &[(":v", AttributeValue::S("ok".into()))],
-            &[("#s", "status")],
+            &[("#s", "flag")],
         );
         let plan = translate_update_item(&req, &schema_hash_s()).unwrap();
-        assert_eq!(plan.expression.set[0].path.top_name(), Some("status"));
+        assert_eq!(plan.expression.set[0].path.top_name(), Some("flag"));
     }
 
     // ----- Reject paths that touch key attributes --------------------------
@@ -1461,13 +1496,13 @@ mod tests {
         let req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
-            "SET items[3] = :v",
+            "SET entries[3] = :v",
             &[(":v", AttributeValue::S("x".into()))],
             &[],
         );
         let err = translate_update_item(&req, &schema_hash_s()).unwrap_err();
         assert!(
-            matches!(err, TranslateError::UnsupportedNestedPath { ref path } if path == "items[3]")
+            matches!(err, TranslateError::UnsupportedNestedPath { ref path } if path == "entries[3]")
         );
     }
 
@@ -1496,7 +1531,7 @@ mod tests {
         let req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
-            "SET total = subtotal + :tax",
+            "SET summed = subtotal + :tax",
             &[(":tax", AttributeValue::N("1".into()))],
             &[],
         );
@@ -1522,7 +1557,7 @@ mod tests {
         let req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
-            "SET items = list_append(items, :new)",
+            "SET entries = list_append(entries, :new)",
             &[(":new", AttributeValue::L(vec![]))],
             &[],
         );
@@ -1551,7 +1586,7 @@ mod tests {
         let req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
-            "ADD count :one",
+            "ADD tally2 :one",
             &[(":one", AttributeValue::N("1".into()))],
             &[],
         );
@@ -1578,7 +1613,7 @@ mod tests {
         let req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
-            "ADD count :one",
+            "ADD tally2 :one",
             &[(":one", AttributeValue::S("not_a_number".into()))],
             &[],
         );
@@ -1647,7 +1682,7 @@ mod tests {
         let mut req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
-            "SET status = :s",
+            "SET flag = :s",
             // Merge `:s` placeholder with any caller-supplied ones.
             &{
                 let mut v: Vec<(&str, AttributeValue)> =
@@ -1672,7 +1707,7 @@ mod tests {
 
     #[test]
     fn upd_condition_attribute_not_exists_on_non_pk_is_simple_sql() {
-        let req = upd_with_condition("attribute_not_exists(status)", &[], &[]);
+        let req = upd_with_condition("attribute_not_exists(flag)", &[], &[]);
         let plan = translate_update_item(&req, &schema_hash_s()).unwrap();
         assert_eq!(
             plan.condition.unwrap().routing,
@@ -1726,7 +1761,7 @@ mod tests {
         let req = upd_with_condition(
             "#k = :want",
             &[(":want", AttributeValue::S("active".into()))],
-            &[("#k", "status")],
+            &[("#k", "flag")],
         );
         let plan = translate_update_item(&req, &schema_hash_s()).unwrap();
         let cp = plan.condition.unwrap();
@@ -1734,7 +1769,7 @@ mod tests {
             Condition::Compare { left, right, .. } => {
                 assert!(matches!(
                     left,
-                    Operand::Path(p) if p.top_name() == Some("status")
+                    Operand::Path(p) if p.top_name() == Some("flag")
                 ));
                 assert!(matches!(right, Operand::Value(AttributeValue::S(ref s)) if s == "active"));
             }
@@ -1747,7 +1782,7 @@ mod tests {
         let mut req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
-            "SET status = :v",
+            "SET flag = :v",
             &[(":v", AttributeValue::S("active".into()))],
             &[],
         );
@@ -1767,7 +1802,7 @@ mod tests {
 
     #[test]
     fn upd_condition_reject_indexed_path() {
-        let req = upd_with_condition("items[0] = :v", &[(":v", AttributeValue::N("1".into()))], &[]);
+        let req = upd_with_condition("entries[0] = :v", &[(":v", AttributeValue::N("1".into()))], &[]);
         let err = translate_update_item(&req, &schema_hash_s()).unwrap_err();
         assert!(matches!(
             err,
@@ -1869,7 +1904,7 @@ mod tests {
     #[test]
     fn upd_condition_ordering_against_s_value_is_simple_sql() {
         let req = upd_with_condition(
-            "name <= :s",
+            "label <= :s",
             &[(":s", AttributeValue::S("z".into()))],
             &[],
         );
@@ -1915,7 +1950,7 @@ mod tests {
         let mut req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
-            "SET status = :v",
+            "SET flag = :v",
             &[(":v", AttributeValue::S("active".into()))],
             &[],
         );
@@ -1929,7 +1964,7 @@ mod tests {
         let mut req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
-            "SET status = :v",
+            "SET flag = :v",
             &[(":v", AttributeValue::S("active".into()))],
             &[],
         );
@@ -1943,7 +1978,7 @@ mod tests {
         let mut req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
-            "SET status = :v",
+            "SET flag = :v",
             &[(":v", AttributeValue::S("active".into()))],
             &[],
         );
@@ -1959,7 +1994,7 @@ mod tests {
         let mut req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
-            "SET status = :v",
+            "SET flag = :v",
             &[(":v", AttributeValue::S("active".into()))],
             &[],
         );
@@ -1977,7 +2012,7 @@ mod tests {
         let req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
-            "SET status = ",
+            "SET flag = ",
             &[],
             &[],
         );
@@ -1990,7 +2025,7 @@ mod tests {
         let req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
-            "SET status = :v",
+            "SET flag = :v",
             &[],
             &[],
         );
@@ -2019,7 +2054,7 @@ mod tests {
         let req = upd(
             "users",
             &[],
-            "SET status = :v",
+            "SET flag = :v",
             &[(":v", AttributeValue::S("x".into()))],
             &[],
         );
@@ -2035,7 +2070,7 @@ mod tests {
                 ("id", AttributeValue::S("u1".into())),
                 ("rogue", AttributeValue::S("x".into())),
             ],
-            "SET status = :v",
+            "SET flag = :v",
             &[(":v", AttributeValue::S("x".into()))],
             &[],
         );
@@ -2060,5 +2095,116 @@ mod tests {
         // Parser rejects empty string with ParseError::Empty, which we
         // wrap as InvalidUpdateExpression.
         assert!(matches!(err, TranslateError::InvalidUpdateExpression(_)));
+    }
+
+    // ----- Reserved-word rejection (edge cases) ---------------------------
+    //
+    // These tests verify rektifier rejects bare DDB-reserved attribute
+    // names exactly like DDB does, AND that the alias mechanism
+    // (`ExpressionAttributeNames`) bypasses the check. Main-path tests
+    // above use non-reserved names (`label`, `flag`, `tally`, ...) so
+    // they exercise translator logic rather than reservation rules. If
+    // you add a new test that wants to use `name`/`status`/etc. as an
+    // attribute, alias it via `#x` or pick a non-reserved name.
+
+    #[test]
+    fn upd_reject_reserved_bare_name_in_set() {
+        let req = upd(
+            "users",
+            &[("id", AttributeValue::S("u1".into()))],
+            "SET name = :v",
+            &[(":v", AttributeValue::S("alice".into()))],
+            &[],
+        );
+        let err = translate_update_item(&req, &schema_hash_s()).unwrap_err();
+        assert!(
+            matches!(err, TranslateError::ReservedWordInUpdateExpression { ref word } if word == "name"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn upd_reject_reserved_bare_name_in_remove() {
+        let req = upd(
+            "users",
+            &[("id", AttributeValue::S("u1".into()))],
+            "REMOVE status",
+            &[],
+            &[],
+        );
+        let err = translate_update_item(&req, &schema_hash_s()).unwrap_err();
+        assert!(
+            matches!(err, TranslateError::ReservedWordInUpdateExpression { ref word } if word == "status"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn upd_reject_reserved_bare_name_in_add() {
+        let req = upd(
+            "users",
+            &[("id", AttributeValue::S("u1".into()))],
+            "ADD counter :n",
+            &[(":n", AttributeValue::N("1".into()))],
+            &[],
+        );
+        let err = translate_update_item(&req, &schema_hash_s()).unwrap_err();
+        assert!(
+            matches!(err, TranslateError::ReservedWordInUpdateExpression { ref word } if word == "counter"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn upd_reject_reserved_bare_name_in_condition() {
+        let req = upd_with_condition(
+            "attribute_exists(status)",
+            &[],
+            &[],
+        );
+        let err = translate_update_item(&req, &schema_hash_s()).unwrap_err();
+        assert!(
+            matches!(err, TranslateError::ReservedWordInConditionExpression { ref word } if word == "status"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn upd_aliased_reserved_name_is_accepted() {
+        // The whole point of ExpressionAttributeNames — `#n → "name"`
+        // bypasses the reservation check because the resolved name
+        // never lands back in the expression's token stream.
+        let mut req = upd(
+            "users",
+            &[("id", AttributeValue::S("u1".into()))],
+            "SET #n = :v",
+            &[(":v", AttributeValue::S("alice".into()))],
+            &[],
+        );
+        req.expression_attribute_names =
+            Some(BTreeMap::from([("#n".to_string(), "name".to_string())]));
+        let plan = translate_update_item(&req, &schema_hash_s()).unwrap();
+        assert_eq!(plan.expression.set[0].path.top_name(), Some("name"));
+    }
+
+    #[test]
+    fn upd_reserved_word_match_is_case_insensitive() {
+        // DDB's reserved-word check is case-insensitive — `STATUS`,
+        // `status`, and `Status` are all rejected.
+        for upper in ["NAME", "Name", "nAmE"] {
+            let expr = format!("SET {upper} = :v");
+            let req = upd(
+                "users",
+                &[("id", AttributeValue::S("u1".into()))],
+                &expr,
+                &[(":v", AttributeValue::S("alice".into()))],
+                &[],
+            );
+            let err = translate_update_item(&req, &schema_hash_s()).unwrap_err();
+            assert!(
+                matches!(err, TranslateError::ReservedWordInUpdateExpression { .. }),
+                "expected reservation rejection for `{upper}`, got: {err:?}"
+            );
+        }
     }
 }

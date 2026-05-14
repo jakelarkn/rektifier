@@ -678,33 +678,33 @@ mod tests {
     #[test]
     fn set_literal_on_missing_row_synthesizes_from_key() {
         let key = key_of(&[("id", AttributeValue::S("u1".into()))]);
-        let expr = parse_upd("SET name = :n", &[(":n", AttributeValue::S("alice".into()))]);
+        let expr = parse_upd("SET label = :n", &[(":n", AttributeValue::S("alice".into()))]);
         let got = apply_update_expression(None, &expr, &key).unwrap();
         assert_eq!(
             got,
-            serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice"}})
+            serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}})
         );
     }
 
     #[test]
     fn set_literal_on_existing_row_merges() {
         let existing = serde_json::json!({"id":{"S":"u1"},"keep":{"S":"x"}});
-        let expr = parse_upd("SET name = :n", &[(":n", AttributeValue::S("alice".into()))]);
+        let expr = parse_upd("SET label = :n", &[(":n", AttributeValue::S("alice".into()))]);
         let got =
             apply_update_expression(Some(&existing), &expr, &BTreeMap::new()).unwrap();
         assert_eq!(
             got,
-            serde_json::json!({"id":{"S":"u1"},"keep":{"S":"x"},"name":{"S":"alice"}})
+            serde_json::json!({"id":{"S":"u1"},"keep":{"S":"x"},"label":{"S":"alice"}})
         );
     }
 
     #[test]
     fn remove_on_existing_row() {
-        let existing = serde_json::json!({"id":{"S":"u1"},"drop":{"S":"x"},"keep":{"S":"y"}});
+        let existing = serde_json::json!({"id":{"S":"u1"},"goner":{"S":"x"},"keep":{"S":"y"}});
         let expr = parse_upd("REMOVE drop_me", &[]);
-        // (renaming for clarity — "drop" is a Rust keyword in some contexts)
+        // (renaming for clarity — "goner" is a Rust keyword in some contexts)
         let _ = expr;
-        let expr = parse_upd("REMOVE drop", &[]);
+        let expr = parse_upd("REMOVE goner", &[]);
         let got = apply_update_expression(Some(&existing), &expr, &BTreeMap::new()).unwrap();
         assert_eq!(
             got,
@@ -724,8 +724,8 @@ mod tests {
 
     #[test]
     fn set_path_ref_copies_value() {
-        let existing = serde_json::json!({"id":{"S":"u1"},"source":{"S":"hello"}});
-        let expr = parse_upd("SET copied = source", &[]);
+        let existing = serde_json::json!({"id":{"S":"u1"},"origin":{"S":"hello"}});
+        let expr = parse_upd("SET copied = origin", &[]);
         let got = apply_update_expression(Some(&existing), &expr, &BTreeMap::new()).unwrap();
         assert_eq!(got.get("copied"), Some(&serde_json::json!({"S":"hello"})));
     }
@@ -733,10 +733,10 @@ mod tests {
     #[test]
     fn set_path_ref_missing_path_errors() {
         let existing = serde_json::json!({"id":{"S":"u1"}});
-        let expr = parse_upd("SET copied = source", &[]);
+        let expr = parse_upd("SET copied = origin", &[]);
         let err =
             apply_update_expression(Some(&existing), &expr, &BTreeMap::new()).unwrap_err();
-        assert!(matches!(err, EvalError::PathDoesNotExist { ref path } if path == "source"));
+        assert!(matches!(err, EvalError::PathDoesNotExist { ref path } if path == "origin"));
     }
 
     #[test]
@@ -754,31 +754,31 @@ mod tests {
 
     #[test]
     fn set_arith_plus_path_and_value() {
-        let existing = serde_json::json!({"id":{"S":"u1"},"counter":{"N":"10"}});
+        let existing = serde_json::json!({"id":{"S":"u1"},"tally":{"N":"10"}});
         let expr = parse_upd(
-            "SET counter = counter + :inc",
+            "SET tally = tally + :inc",
             &[(":inc", AttributeValue::N("5".into()))],
         );
         let got = apply_update_expression(Some(&existing), &expr, &BTreeMap::new()).unwrap();
-        assert_eq!(got.get("counter"), Some(&serde_json::json!({"N":"15"})));
+        assert_eq!(got.get("tally"), Some(&serde_json::json!({"N":"15"})));
     }
 
     #[test]
     fn set_arith_minus() {
-        let existing = serde_json::json!({"id":{"S":"u1"},"counter":{"N":"10"}});
+        let existing = serde_json::json!({"id":{"S":"u1"},"tally":{"N":"10"}});
         let expr = parse_upd(
-            "SET counter = counter - :dec",
+            "SET tally = tally - :dec",
             &[(":dec", AttributeValue::N("3".into()))],
         );
         let got = apply_update_expression(Some(&existing), &expr, &BTreeMap::new()).unwrap();
-        assert_eq!(got.get("counter"), Some(&serde_json::json!({"N":"7"})));
+        assert_eq!(got.get("tally"), Some(&serde_json::json!({"N":"7"})));
     }
 
     #[test]
     fn set_arith_rejects_non_numeric_operand() {
-        let existing = serde_json::json!({"id":{"S":"u1"},"name":{"S":"hi"}});
+        let existing = serde_json::json!({"id":{"S":"u1"},"label":{"S":"hi"}});
         let expr = parse_upd(
-            "SET counter = name + :v",
+            "SET tally = label + :v",
             &[(":v", AttributeValue::N("1".into()))],
         );
         let err =
@@ -820,9 +820,9 @@ mod tests {
 
     #[test]
     fn list_append_path_then_value() {
-        let existing = serde_json::json!({"id":{"S":"u1"},"items":{"L":[{"S":"a"}]}});
+        let existing = serde_json::json!({"id":{"S":"u1"},"entries":{"L":[{"S":"a"}]}});
         let expr = parse_upd(
-            "SET items = list_append(items, :new)",
+            "SET entries = list_append(entries, :new)",
             &[(
                 ":new",
                 AttributeValue::L(vec![
@@ -833,16 +833,16 @@ mod tests {
         );
         let got = apply_update_expression(Some(&existing), &expr, &BTreeMap::new()).unwrap();
         assert_eq!(
-            got.get("items"),
+            got.get("entries"),
             Some(&serde_json::json!({"L":[{"S":"a"},{"S":"b"},{"S":"c"}]}))
         );
     }
 
     #[test]
     fn list_append_rejects_non_list_operand() {
-        let existing = serde_json::json!({"id":{"S":"u1"},"items":{"S":"oops"}});
+        let existing = serde_json::json!({"id":{"S":"u1"},"entries":{"S":"oops"}});
         let expr = parse_upd(
-            "SET items = list_append(items, :new)",
+            "SET entries = list_append(entries, :new)",
             &[(":new", AttributeValue::L(vec![]))],
         );
         let err =
@@ -862,7 +862,7 @@ mod tests {
     #[test]
     fn cond_attribute_exists_false_when_absent() {
         let item = serde_json::json!({"id":{"S":"u1"}});
-        let cond = parse_cond("attribute_exists(name)", &[]);
+        let cond = parse_cond("attribute_exists(label)", &[]);
         assert!(!evaluate_condition(Some(&item), &cond));
     }
 
@@ -898,20 +898,20 @@ mod tests {
 
     #[test]
     fn cond_string_ordering() {
-        let item = serde_json::json!({"id":{"S":"u1"},"name":{"S":"bob"}});
+        let item = serde_json::json!({"id":{"S":"u1"},"label":{"S":"bob"}});
         assert!(evaluate_condition(
             Some(&item),
-            &parse_cond("name >= :v", &[(":v", AttributeValue::S("a".into()))])
+            &parse_cond("label >= :v", &[(":v", AttributeValue::S("a".into()))])
         ));
     }
 
     #[test]
     fn cond_and_or_not() {
-        let item = serde_json::json!({"id":{"S":"u1"},"status":{"S":"active"},"v":{"N":"1"}});
+        let item = serde_json::json!({"id":{"S":"u1"},"flag":{"S":"active"},"v":{"N":"1"}});
         assert!(evaluate_condition(
             Some(&item),
             &parse_cond(
-                "status = :s AND v = :v",
+                "flag = :s AND v = :v",
                 &[
                     (":s", AttributeValue::S("active".into())),
                     (":v", AttributeValue::N("1".into())),
@@ -921,7 +921,7 @@ mod tests {
         assert!(!evaluate_condition(
             Some(&item),
             &parse_cond(
-                "status = :s AND v = :v",
+                "flag = :s AND v = :v",
                 &[
                     (":s", AttributeValue::S("active".into())),
                     (":v", AttributeValue::N("99".into())),
@@ -946,14 +946,14 @@ mod tests {
 
     #[test]
     fn cond_begins_with() {
-        let item = serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice"}});
+        let item = serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}});
         assert!(evaluate_condition(
             Some(&item),
-            &parse_cond("begins_with(name, :p)", &[(":p", AttributeValue::S("ali".into()))])
+            &parse_cond("begins_with(label, :p)", &[(":p", AttributeValue::S("ali".into()))])
         ));
         assert!(!evaluate_condition(
             Some(&item),
-            &parse_cond("begins_with(name, :p)", &[(":p", AttributeValue::S("bob".into()))])
+            &parse_cond("begins_with(label, :p)", &[(":p", AttributeValue::S("bob".into()))])
         ));
         // Type mismatch (begins_with against N attribute) → false.
         let item_n = serde_json::json!({"id":{"S":"u1"},"x":{"N":"42"}});
@@ -965,14 +965,14 @@ mod tests {
 
     #[test]
     fn cond_contains_string_substring() {
-        let item = serde_json::json!({"id":{"S":"u1"},"name":{"S":"hello world"}});
+        let item = serde_json::json!({"id":{"S":"u1"},"label":{"S":"hello world"}});
         assert!(evaluate_condition(
             Some(&item),
-            &parse_cond("contains(name, :p)", &[(":p", AttributeValue::S("lo wo".into()))])
+            &parse_cond("contains(label, :p)", &[(":p", AttributeValue::S("lo wo".into()))])
         ));
         assert!(!evaluate_condition(
             Some(&item),
-            &parse_cond("contains(name, :p)", &[(":p", AttributeValue::S("zzz".into()))])
+            &parse_cond("contains(label, :p)", &[(":p", AttributeValue::S("zzz".into()))])
         ));
     }
 
@@ -991,14 +991,14 @@ mod tests {
 
     #[test]
     fn cond_contains_list_element() {
-        let item = serde_json::json!({"id":{"S":"u1"},"items":{"L":[{"S":"a"},{"N":"7"}]}});
+        let item = serde_json::json!({"id":{"S":"u1"},"entries":{"L":[{"S":"a"},{"N":"7"}]}});
         assert!(evaluate_condition(
             Some(&item),
-            &parse_cond("contains(items, :v)", &[(":v", AttributeValue::N("7".into()))])
+            &parse_cond("contains(entries, :v)", &[(":v", AttributeValue::N("7".into()))])
         ));
         assert!(!evaluate_condition(
             Some(&item),
-            &parse_cond("contains(items, :v)", &[(":v", AttributeValue::N("99".into()))])
+            &parse_cond("contains(entries, :v)", &[(":v", AttributeValue::N("99".into()))])
         ));
     }
 
@@ -1021,11 +1021,11 @@ mod tests {
 
     #[test]
     fn cond_between_string() {
-        let item = serde_json::json!({"id":{"S":"u1"},"name":{"S":"charlie"}});
+        let item = serde_json::json!({"id":{"S":"u1"},"label":{"S":"charlie"}});
         assert!(evaluate_condition(
             Some(&item),
             &parse_cond(
-                "name BETWEEN :a AND :z",
+                "label BETWEEN :a AND :z",
                 &[
                     (":a", AttributeValue::S("a".into())),
                     (":z", AttributeValue::S("d".into())),
@@ -1036,11 +1036,11 @@ mod tests {
 
     #[test]
     fn cond_in_list() {
-        let item = serde_json::json!({"id":{"S":"u1"},"status":{"S":"pending"}});
+        let item = serde_json::json!({"id":{"S":"u1"},"flag":{"S":"pending"}});
         assert!(evaluate_condition(
             Some(&item),
             &parse_cond(
-                "status IN (:a, :b, :c)",
+                "flag IN (:a, :b, :c)",
                 &[
                     (":a", AttributeValue::S("active".into())),
                     (":b", AttributeValue::S("pending".into())),
@@ -1051,7 +1051,7 @@ mod tests {
         assert!(!evaluate_condition(
             Some(&item),
             &parse_cond(
-                "status IN (:a, :b)",
+                "flag IN (:a, :b)",
                 &[
                     (":a", AttributeValue::S("active".into())),
                     (":b", AttributeValue::S("closed".into())),
@@ -1074,7 +1074,7 @@ mod tests {
         // Missing path → false.
         assert!(!evaluate_condition(
             Some(&item),
-            &parse_cond("attribute_type(missing, :t)", &[(":t", AttributeValue::S("S".into()))])
+            &parse_cond("attribute_type(absent, :t)", &[(":t", AttributeValue::S("S".into()))])
         ));
     }
 
@@ -1084,31 +1084,31 @@ mod tests {
     fn add_numeric_on_missing_creates_with_value() {
         let key = key_of(&[("id", AttributeValue::S("u1".into()))]);
         let expr = parse_upd(
-            "ADD counter :inc",
+            "ADD tally :inc",
             &[(":inc", AttributeValue::N("5".into()))],
         );
         let got = apply_update_expression(None, &expr, &key).unwrap();
-        assert_eq!(got.get("counter"), Some(&serde_json::json!({"N":"5"})));
+        assert_eq!(got.get("tally"), Some(&serde_json::json!({"N":"5"})));
     }
 
     #[test]
     fn add_numeric_on_existing_increments() {
-        let existing = serde_json::json!({"id":{"S":"u1"},"counter":{"N":"10"}});
+        let existing = serde_json::json!({"id":{"S":"u1"},"tally":{"N":"10"}});
         let expr = parse_upd(
-            "ADD counter :inc",
+            "ADD tally :inc",
             &[(":inc", AttributeValue::N("3".into()))],
         );
         let got =
             apply_update_expression(Some(&existing), &expr, &std::collections::BTreeMap::new())
                 .unwrap();
-        assert_eq!(got.get("counter"), Some(&serde_json::json!({"N":"13"})));
+        assert_eq!(got.get("tally"), Some(&serde_json::json!({"N":"13"})));
     }
 
     #[test]
     fn add_numeric_existing_wrong_type_errors() {
-        let existing = serde_json::json!({"id":{"S":"u1"},"counter":{"S":"oops"}});
+        let existing = serde_json::json!({"id":{"S":"u1"},"tally":{"S":"oops"}});
         let expr = parse_upd(
-            "ADD counter :inc",
+            "ADD tally :inc",
             &[(":inc", AttributeValue::N("1".into()))],
         );
         let err =

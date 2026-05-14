@@ -43,11 +43,11 @@ fn opath(segs: &[RawPathSegment]) -> RawOperand {
 
 #[test]
 fn parse_set_top_level_literal() {
-    let r = parse_update_expression("SET status = :v").unwrap();
+    let r = parse_update_expression("SET flag = :v").unwrap();
     assert_eq!(
         r.set,
         vec![RawSetClause {
-            path: rpath(&[pn("status")]),
+            path: rpath(&[pn("flag")]),
             value: RawSetRhs::Operand(vref("v")),
         }]
     );
@@ -75,7 +75,7 @@ fn parse_set_path_reference() {
 
 #[test]
 fn parse_set_arithmetic_plus() {
-    let r = parse_update_expression("SET total = subtotal + :tax").unwrap();
+    let r = parse_update_expression("SET summed = subtotal + :tax").unwrap();
     assert_eq!(
         r.set[0].value,
         RawSetRhs::Plus(opath(&[pn("subtotal")]), vref("tax"))
@@ -105,7 +105,7 @@ fn parse_set_if_not_exists() {
 
 #[test]
 fn parse_set_list_append() {
-    let r = parse_update_expression("SET items = list_append(items, :new_items)").unwrap();
+    let r = parse_update_expression("SET entries = list_append(entries, :new_items)").unwrap();
     match &r.set[0].value {
         RawSetRhs::ListAppend(a, b) => {
             assert!(matches!(**a, RawSetRhs::Operand(RawOperand::Path(_))));
@@ -119,7 +119,7 @@ fn parse_set_list_append() {
 fn parse_set_list_append_with_empty_initial() {
     // list_append wrapped in if_not_exists is the classic
     // "append-to-list-or-create-it" idiom.
-    let r = parse_update_expression("SET items = list_append(if_not_exists(items, :empty), :v)")
+    let r = parse_update_expression("SET entries = list_append(if_not_exists(entries, :empty), :v)")
         .unwrap();
     match &r.set[0].value {
         RawSetRhs::ListAppend(a, _) => {
@@ -150,8 +150,8 @@ fn parse_path_dotted() {
 
 #[test]
 fn parse_path_indexed() {
-    let r = parse_update_expression("SET items[3] = :v").unwrap();
-    assert_eq!(r.set[0].path, rpath(&[pn("items"), pidx(3)]));
+    let r = parse_update_expression("SET entries[3] = :v").unwrap();
+    assert_eq!(r.set[0].path, rpath(&[pn("entries"), pidx(3)]));
 }
 
 #[test]
@@ -165,8 +165,8 @@ fn parse_path_mixed_dotted_and_indexed() {
 
 #[test]
 fn parse_path_with_name_placeholders() {
-    let r = parse_update_expression("SET #u.#name = :v").unwrap();
-    assert_eq!(r.set[0].path, rpath(&[pnref("u"), pnref("name")]));
+    let r = parse_update_expression("SET #u.#label = :v").unwrap();
+    assert_eq!(r.set[0].path, rpath(&[pnref("u"), pnref("label")]));
 }
 
 #[test]
@@ -212,9 +212,9 @@ fn parse_remove_multiple() {
 
 #[test]
 fn parse_add_numeric() {
-    let r = parse_update_expression("ADD count :one").unwrap();
+    let r = parse_update_expression("ADD tally2 :one").unwrap();
     assert_eq!(r.add.len(), 1);
-    assert_eq!(r.add[0].path, rpath(&[pn("count")]));
+    assert_eq!(r.add[0].path, rpath(&[pn("tally2")]));
     assert_eq!(r.add[0].value, vref("one"));
 }
 
@@ -244,7 +244,7 @@ fn parse_delete_from_set() {
 
 #[test]
 fn parse_set_and_remove() {
-    let r = parse_update_expression("SET status = :s REMOVE old_field").unwrap();
+    let r = parse_update_expression("SET flag = :s REMOVE old_field").unwrap();
     assert_eq!(r.set.len(), 1);
     assert_eq!(r.remove.len(), 1);
 }
@@ -252,7 +252,7 @@ fn parse_set_and_remove() {
 #[test]
 fn parse_all_four_clauses() {
     let r = parse_update_expression(
-        "SET status = :s, version = version + :one REMOVE old_field ADD count :one DELETE tags :remove_set",
+        "SET flag = :s, version = version + :one REMOVE old_field ADD tally2 :one DELETE tags :remove_set",
     )
     .unwrap();
     assert_eq!(r.set.len(), 2);
@@ -306,7 +306,7 @@ fn values_map(pairs: &[(&str, AttributeValue)]) -> BTreeMap<String, AttributeVal
 
 #[test]
 fn subst_set_with_s_value() {
-    let raw = parse_update_expression("SET status = :v").unwrap();
+    let raw = parse_update_expression("SET flag = :v").unwrap();
     let v = values_map(&[(":v", AttributeValue::S("active".into()))]);
     let r = substitute_update(raw, &BTreeMap::new(), &v).unwrap();
     let SetRhs::Operand(Operand::Value(av)) = &r.set[0].value else {
@@ -328,7 +328,7 @@ fn subst_set_with_n_value() {
 
 #[test]
 fn subst_set_with_b_value() {
-    let raw = parse_update_expression("SET blob = :v").unwrap();
+    let raw = parse_update_expression("SET binmark = :v").unwrap();
     let v = values_map(&[(":v", AttributeValue::B(Bytes::from_static(b"\x00\x01\x02")))]);
     let r = substitute_update(raw, &BTreeMap::new(), &v).unwrap();
     let SetRhs::Operand(Operand::Value(av)) = &r.set[0].value else {
@@ -363,7 +363,7 @@ fn subst_set_with_null_value() {
 
 #[test]
 fn subst_set_with_list_value() {
-    let raw = parse_update_expression("SET items = :v").unwrap();
+    let raw = parse_update_expression("SET entries = :v").unwrap();
     let list = AttributeValue::L(vec![
         AttributeValue::S("a".into()),
         AttributeValue::N("1".into()),
@@ -432,13 +432,13 @@ fn subst_set_with_bs_value() {
 #[test]
 fn subst_name_ref_in_path() {
     let raw = parse_update_expression("SET #u = :v").unwrap();
-    let n = names_map(&[("#u", "name")]);
+    let n = names_map(&[("#u", "label")]);
     let v = values_map(&[(":v", AttributeValue::S("alice".into()))]);
     let r = substitute_update(raw, &n, &v).unwrap();
     assert_eq!(
         r.set[0].path,
         Path {
-            segments: vec![PathSegment::Name("name".into())]
+            segments: vec![PathSegment::Name("label".into())]
         }
     );
 }
@@ -462,7 +462,7 @@ fn subst_name_ref_in_dotted_path() {
 
 #[test]
 fn subst_add_resolves_value() {
-    let raw = parse_update_expression("ADD count :one").unwrap();
+    let raw = parse_update_expression("ADD tally2 :one").unwrap();
     let v = values_map(&[(":one", AttributeValue::N("1".into()))]);
     let r = substitute_update(raw, &BTreeMap::new(), &v).unwrap();
     assert_eq!(r.add[0].value, AttributeValue::N("1".into()));
@@ -480,16 +480,16 @@ fn subst_delete_resolves_value() {
 
 #[test]
 fn roundtrip_compound_expression() {
-    let src = "SET #s = :status, version = version + :one, \
+    let src = "SET #s = :flag, version = version + :one, \
                updated_at = if_not_exists(updated_at, :now), \
-               items = list_append(items, :new_items) \
+               entries = list_append(entries, :new_items) \
                REMOVE deprecated_field \
-               ADD count :one \
+               ADD tally2 :one \
                DELETE tags :to_remove";
     let raw = parse_update_expression(src).unwrap();
-    let n = names_map(&[("#s", "status")]);
+    let n = names_map(&[("#s", "flag")]);
     let v = values_map(&[
-        (":status", AttributeValue::S("active".into())),
+        (":flag", AttributeValue::S("active".into())),
         (":one", AttributeValue::N("1".into())),
         (":now", AttributeValue::N("1700000000".into())),
         (
@@ -507,7 +507,7 @@ fn roundtrip_compound_expression() {
     // Spot-check resolutions.
     assert_eq!(
         r.set[0].path.segments,
-        vec![PathSegment::Name("status".into())]
+        vec![PathSegment::Name("flag".into())]
     );
     assert_eq!(
         r.set[2].value,
@@ -539,7 +539,7 @@ fn err_empty_expression() {
 #[test]
 fn err_invalid_syntax() {
     // Bare value with no `=` after path.
-    let e = parse_update_expression("SET status :v");
+    let e = parse_update_expression("SET flag :v");
     assert!(matches!(e, Err(ParseError::Invalid { .. })));
 }
 
@@ -585,7 +585,7 @@ fn err_unknown_name_placeholder() {
 #[test]
 fn err_add_with_path_not_value() {
     // ADD only accepts a value ref, not a path reference.
-    let raw = parse_update_expression("ADD count count2").unwrap();
+    let raw = parse_update_expression("ADD tally2 count2").unwrap();
     let e = substitute_update(raw, &BTreeMap::new(), &BTreeMap::new());
     assert!(matches!(
         e,
