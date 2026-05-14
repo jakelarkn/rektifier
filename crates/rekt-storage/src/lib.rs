@@ -150,13 +150,19 @@ pub trait Backend: Send + Sync + 'static {
     /// `if_not_exists` / `list_append`, nested paths, ADD / DELETE) is
     /// out of scope for this method — those will route to a future
     /// read-modify-write method.
+    ///
+    /// Returns the post-update item as DDB-JSON (the value of the `data`
+    /// column after the write). Callers that need it for
+    /// `ReturnValues=ALL_NEW` use it directly; callers that don't can
+    /// discard it. The cost on the wire is one extra row in the
+    /// `RETURNING` clause — negligible relative to the round-trip.
     async fn update_simple_raw(
         &self,
         shape: &TableShape<'_>,
         insert_item: &serde_json::Value,
         sets: &[(&str, &serde_json::Value)],
         removes: &[&str],
-    ) -> Result<(), BackendError>;
+    ) -> Result<serde_json::Value, BackendError>;
 
     /// Insert-only-if-the-row-doesn't-exist. Backs the
     /// `ConditionExpression: attribute_not_exists(pk)` case of UpdateItem
@@ -169,11 +175,14 @@ pub trait Backend: Send + Sync + 'static {
     /// merged the request's key attrs with whatever SET clauses the
     /// UpdateExpression specified; REMOVE clauses are no-ops here because
     /// the row didn't exist).
+    ///
+    /// Returns the inserted item on success (same shape as
+    /// `update_simple_raw`'s return).
     async fn update_insert_only_raw(
         &self,
         shape: &TableShape<'_>,
         insert_item: &serde_json::Value,
-    ) -> Result<(), BackendError>;
+    ) -> Result<serde_json::Value, BackendError>;
 
     /// Apply the simple update subset to a single row gated by a
     /// `SimpleSql`-classified ConditionExpression. Emits:
@@ -194,6 +203,8 @@ pub trait Backend: Send + Sync + 'static {
     /// ordering with a Path operand and a Value operand of type N or
     /// S). Anything outside that subset is the `NeedsTx` slow path,
     /// which is a future phase.
+    ///
+    /// Returns the post-update item on success.
     async fn update_with_simple_condition_raw(
         &self,
         shape: &TableShape<'_>,
@@ -202,7 +213,7 @@ pub trait Backend: Send + Sync + 'static {
         sets: &[(&str, &serde_json::Value)],
         removes: &[&str],
         condition: &Condition,
-    ) -> Result<(), BackendError>;
+    ) -> Result<serde_json::Value, BackendError>;
 
     /// Slow-path read-modify-write for any UpdateItem shape that can't
     /// run on the fast paths: non-simple UpdateExpression RHS forms
@@ -227,13 +238,16 @@ pub trait Backend: Send + Sync + 'static {
     /// The closure is `Fn` (not `FnOnce`) so the retry loop can call it
     /// again on a race. It's pure — no I/O — and runs entirely against
     /// the JSON view of the row.
+    ///
+    /// Returns the post-update item — the value the closure returned
+    /// from its successful `UpdateDecision::Apply(new)`.
     async fn update_general_rmw_raw(
         &self,
         shape: &TableShape<'_>,
         pk: &KeyValue,
         sk: Option<&KeyValue>,
         apply: GeneralUpdateFn<'_>,
-    ) -> Result<(), BackendError>;
+    ) -> Result<serde_json::Value, BackendError>;
 }
 
 /// Caller-supplied decision function for the slow path. Synchronous —

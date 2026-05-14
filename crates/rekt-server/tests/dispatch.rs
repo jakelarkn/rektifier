@@ -109,7 +109,7 @@ impl Backend for MockBackend {
         insert_item: &serde_json::Value,
         sets: &[(&str, &serde_json::Value)],
         removes: &[&str],
-    ) -> Result<(), BackendError> {
+    ) -> Result<serde_json::Value, BackendError> {
         // Derive pk/sk from insert_item (the key attrs are guaranteed
         // present there by the translator).
         let pk_value = insert_item
@@ -152,8 +152,8 @@ impl Backend for MockBackend {
             obj.remove(*name);
         }
 
-        store.insert(key, new_item);
-        Ok(())
+        store.insert(key, new_item.clone());
+        Ok(new_item)
     }
 
     async fn update_with_simple_condition_raw(
@@ -164,7 +164,7 @@ impl Backend for MockBackend {
         sets: &[(&str, &serde_json::Value)],
         removes: &[&str],
         condition: &Condition,
-    ) -> Result<(), BackendError> {
+    ) -> Result<serde_json::Value, BackendError> {
         let pk_value = kv_to_string(pk);
         let sk_value = sk.map(kv_to_string).unwrap_or_default();
         let key = (shape.table.to_string(), pk_value, sk_value);
@@ -194,8 +194,8 @@ impl Backend for MockBackend {
         for name in removes {
             obj.remove(*name);
         }
-        store.insert(key, new_item);
-        Ok(())
+        store.insert(key, new_item.clone());
+        Ok(new_item)
     }
 
     async fn update_general_rmw_raw(
@@ -204,7 +204,7 @@ impl Backend for MockBackend {
         pk: &KeyValue,
         sk: Option<&KeyValue>,
         apply: GeneralUpdateFn<'_>,
-    ) -> Result<(), BackendError> {
+    ) -> Result<serde_json::Value, BackendError> {
         // Mock equivalent of the PgBackend RMW loop. No actual locking;
         // the Mutex serializes access so the retry-on-race case doesn't
         // arise here.
@@ -219,8 +219,8 @@ impl Backend for MockBackend {
         match decision {
             UpdateDecision::Fail => Err(BackendError::ConditionalCheckFailed),
             UpdateDecision::Apply(new_item) => {
-                store.insert(key, new_item);
-                Ok(())
+                store.insert(key, new_item.clone());
+                Ok(new_item)
             }
         }
     }
@@ -229,7 +229,7 @@ impl Backend for MockBackend {
         &self,
         shape: &TableShape<'_>,
         insert_item: &serde_json::Value,
-    ) -> Result<(), BackendError> {
+    ) -> Result<serde_json::Value, BackendError> {
         // Same key derivation as put_item_raw / update_simple_raw.
         let pk_value = insert_item
             .get(shape.pk_col)
@@ -258,7 +258,7 @@ impl Backend for MockBackend {
             return Err(BackendError::ConditionalCheckFailed);
         }
         store.insert(key, insert_item.clone());
-        Ok(())
+        Ok(insert_item.clone())
     }
 }
 
@@ -1084,6 +1084,8 @@ async fn update_insert_only_composite_key() {
 
 #[tokio::test]
 async fn update_reject_unsupported_return_values() {
+    // ALL_OLD / UPDATED_OLD / UPDATED_NEW remain Phase 7b/7c. Pick one
+    // here to keep the divergence honest at the dispatch boundary.
     let app = app();
     let resp = app
         .oneshot(ddb_request(
@@ -1093,7 +1095,7 @@ async fn update_reject_unsupported_return_values() {
                 "Key":{"id":{"S":"u1"}},
                 "UpdateExpression":"SET name = :n",
                 "ExpressionAttributeValues":{":n":{"S":"alice"}},
-                "ReturnValues":"ALL_NEW",
+                "ReturnValues":"ALL_OLD",
             }),
         ))
         .await
@@ -1102,6 +1104,190 @@ async fn update_reject_unsupported_return_values() {
     let body = body_json(resp).await;
     let ty = body.get("__type").and_then(Value::as_str).unwrap();
     assert!(ty.ends_with("#ValidationException"));
+}
+
+// ===== Phase 7a: ReturnValues=ALL_NEW =====================================
+
+#[tokio::test]
+async fn update_return_values_all_new_direct_set_insert() {
+    // No prior row → INSERT branch of the fast path. ALL_NEW must
+    // return the full synthesized item (key + SET attrs).
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET #n = :n",
+                "ExpressionAttributeNames":{"#n":"name"},
+                "ExpressionAttributeValues":{":n":{"S":"alice"}},
+                "ReturnValues":"ALL_NEW",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let attrs = body
+        .get("Attributes")
+        .expect("ALL_NEW must populate Attributes");
+    assert_eq!(attrs.get("id").unwrap(), &json!({"S":"u1"}));
+    assert_eq!(attrs.get("name").unwrap(), &json!({"S":"alice"}));
+}
+
+#[tokio::test]
+async fn update_return_values_all_new_direct_set_update() {
+    // Prior row exists → DO-UPDATE branch. ALL_NEW must merge the
+    // existing attrs with the SET delta.
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"name":{"S":"old"},"role":{"S":"admin"}}}),
+        ))
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET #n = :n",
+                "ExpressionAttributeNames":{"#n":"name"},
+                "ExpressionAttributeValues":{":n":{"S":"new"}},
+                "ReturnValues":"ALL_NEW",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let attrs = body.get("Attributes").unwrap();
+    assert_eq!(attrs.get("name").unwrap(), &json!({"S":"new"}));
+    assert_eq!(attrs.get("role").unwrap(), &json!({"S":"admin"}));
+}
+
+#[tokio::test]
+async fn update_return_values_all_new_insert_only_path() {
+    // attribute_not_exists(pk) → InsertOnlyOnPk fast path. ALL_NEW must
+    // return the inserted item.
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u-new"}},
+                "UpdateExpression":"SET #n = :n",
+                "ConditionExpression":"attribute_not_exists(id)",
+                "ExpressionAttributeNames":{"#n":"name"},
+                "ExpressionAttributeValues":{":n":{"S":"bob"}},
+                "ReturnValues":"ALL_NEW",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let attrs = body_json(resp).await;
+    let attrs = attrs.get("Attributes").unwrap();
+    assert_eq!(attrs.get("id").unwrap(), &json!({"S":"u-new"}));
+    assert_eq!(attrs.get("name").unwrap(), &json!({"S":"bob"}));
+}
+
+#[tokio::test]
+async fn update_return_values_all_new_simple_sql_cond_path() {
+    // Prior row + SimpleSql condition → SQL-WHERE fast path. ALL_NEW
+    // must return the merged item.
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"version":{"N":"1"}}}),
+        ))
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET #v = :new",
+                "ConditionExpression":"#v = :old",
+                "ExpressionAttributeNames":{"#v":"version"},
+                "ExpressionAttributeValues":{":new":{"N":"2"},":old":{"N":"1"}},
+                "ReturnValues":"ALL_NEW",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let attrs = body.get("Attributes").unwrap();
+    assert_eq!(attrs.get("version").unwrap(), &json!({"N":"2"}));
+}
+
+#[tokio::test]
+async fn update_return_values_all_new_tx_path() {
+    // Path-ref RHS forces the slow (tx) path. ALL_NEW must come from
+    // the closure's `new_item`, not from a re-fetched SELECT.
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"source":{"S":"hello"}}}),
+        ))
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET copy = #s",
+                "ExpressionAttributeNames":{"#s":"source"},
+                "ReturnValues":"ALL_NEW",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let attrs = body.get("Attributes").unwrap();
+    assert_eq!(attrs.get("copy").unwrap(), &json!({"S":"hello"}));
+    assert_eq!(attrs.get("source").unwrap(), &json!({"S":"hello"}));
+}
+
+#[tokio::test]
+async fn update_return_values_none_omits_attributes() {
+    // Explicit NONE (and implicit / absent) → response body has no
+    // `Attributes` key. Sanity check that the default path didn't
+    // regress to always-returning.
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET #n = :n",
+                "ExpressionAttributeNames":{"#n":"name"},
+                "ExpressionAttributeValues":{":n":{"S":"alice"}},
+                "ReturnValues":"NONE",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(body.get("Attributes").is_none());
 }
 
 // ===== Phase 3b/3c: slow-path UpdateExpression RHS forms ===================

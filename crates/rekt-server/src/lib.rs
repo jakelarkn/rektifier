@@ -35,8 +35,8 @@ use rekt_storage::{Backend, BackendError, UpdateDecision};
 use rekt_translator::{
     apply_update_expression, evaluate_condition, materialize_insert_only_update,
     materialize_simple_sql_update, materialize_simple_update, translate_delete_item,
-    translate_get_item, translate_put_item, translate_update_item, ConditionRouting, TableSchema,
-    TranslateError,
+    translate_get_item, translate_put_item, translate_update_item, ConditionRouting,
+    ReturnValuesMode, TableSchema, TranslateError,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -327,7 +327,7 @@ async fn handle_update_item(state: &AppState, body: &Bytes) -> Result<Response, 
     // Dispatch on ConditionExpression routing. Phase 3a handles the no-
     // condition case; Phase 4c handles `attribute_not_exists(pk)`; Phase
     // 4d handles SimpleSql; the slow-path branch above caught NeedsTx.
-    match plan.condition.as_ref().map(|c| c.routing) {
+    let new_item = match plan.condition.as_ref().map(|c| c.routing) {
         None => {
             let prims = materialize_simple_update(&plan, &req.key)?;
             let sets_borrowed: Vec<(&str, &serde_json::Value)> = prims
@@ -344,14 +344,14 @@ async fn handle_update_item(state: &AppState, body: &Bytes) -> Result<Response, 
                     &sets_borrowed,
                     &removes_borrowed,
                 )
-                .await?;
+                .await?
         }
         Some(ConditionRouting::InsertOnlyOnPk) => {
             let insert_item = materialize_insert_only_update(&plan, &req.key)?;
             state
                 .backend
                 .update_insert_only_raw(&schema.shape(), &insert_item)
-                .await?;
+                .await?
         }
         Some(ConditionRouting::SimpleSql) => {
             let prims = materialize_simple_sql_update(&plan)?;
@@ -378,16 +378,37 @@ async fn handle_update_item(state: &AppState, body: &Bytes) -> Result<Response, 
                     &removes_borrowed,
                     cond,
                 )
-                .await?;
+                .await?
         }
         Some(ConditionRouting::NeedsTx) => unreachable!(
             "NeedsTx is handled by the slow-path branch above"
         ),
-    }
+    };
 
-    // ReturnValues=NONE (Phase 2's only supported variant) → empty body.
-    let resp = UpdateItemResponse::default();
-    Ok(json_ok(&resp))
+    Ok(json_ok(&build_update_response(plan.return_values, new_item)?))
+}
+
+/// Shape the UpdateItem response according to `ReturnValues`. Phase 7a
+/// supports `NONE` (empty body) and `ALL_NEW` (deserialize the post-
+/// update JSON back into an Item and set `Attributes`). 7b/7c will
+/// extend this with the `OLD` and `UPDATED_*` projections.
+fn build_update_response(
+    mode: ReturnValuesMode,
+    new_item: serde_json::Value,
+) -> Result<UpdateItemResponse, ApiError> {
+    match mode {
+        ReturnValuesMode::None => Ok(UpdateItemResponse::default()),
+        ReturnValuesMode::AllNew => {
+            let item: Item = serde_json::from_value(new_item).map_err(|e| {
+                ApiError::Internal(format!(
+                    "ReturnValues=ALL_NEW: stored item is not valid DynamoDB-JSON: {e}"
+                ))
+            })?;
+            Ok(UpdateItemResponse {
+                attributes: Some(item),
+            })
+        }
+    }
 }
 
 /// Slow-path orchestration (Phase 3b): builds a closure that, given the
@@ -419,13 +440,12 @@ async fn dispatch_slow_path(
         }
     };
 
-    state
+    let new_item = state
         .backend
         .update_general_rmw_raw(&schema.shape(), &plan.pk, plan.sk.as_ref(), Box::new(apply))
         .await?;
 
-    let resp = UpdateItemResponse::default();
-    Ok(json_ok(&resp))
+    Ok(json_ok(&build_update_response(plan.return_values, new_item)?))
 }
 
 fn json_ok<T: serde::Serialize>(value: &T) -> Response {

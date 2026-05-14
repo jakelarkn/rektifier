@@ -364,7 +364,7 @@ impl Backend for PgBackend {
         insert_item: &serde_json::Value,
         sets: &[(&str, &serde_json::Value)],
         removes: &[&str],
-    ) -> Result<(), BackendError> {
+    ) -> Result<serde_json::Value, BackendError> {
         let sql = build_update_sql(shape, sets.len(), removes.len());
 
         // Parameter type vector mirrors the SQL: $1 = JSONB (insert_item),
@@ -403,12 +403,13 @@ impl Backend for PgBackend {
             params.push(name);
         }
 
-        client
-            .execute(&stmt, &params)
+        let row = client
+            .query_one(&stmt, &params)
             .instrument(tracing::debug_span!("pg.execute"))
             .await
             .map_err(|e| map_pg_err(shape.table, e))?;
-        Ok(())
+        let Json(new_item): Json<serde_json::Value> = row.get(0);
+        Ok(new_item)
     }
 
     #[tracing::instrument(level = "debug", skip_all, name = "pg.update_with_simple_condition_raw", fields(table = %shape.table))]
@@ -420,7 +421,7 @@ impl Backend for PgBackend {
         sets: &[(&str, &serde_json::Value)],
         removes: &[&str],
         condition: &Condition,
-    ) -> Result<(), BackendError> {
+    ) -> Result<serde_json::Value, BackendError> {
         // Pre-flight: sk shape must match the table shape.
         check_sk_shape(shape, sk)?;
 
@@ -469,7 +470,8 @@ impl Backend for PgBackend {
         let _ = write!(where_clause, " AND ({cond_sql})");
 
         let sql = format!(
-            "UPDATE {table_ident} SET {jsonb_ident} = {expr} WHERE {where_clause}"
+            "UPDATE {table_ident} SET {jsonb_ident} = {expr} \
+             WHERE {where_clause} RETURNING {jsonb_ident}"
         );
 
         let client = self.client().await?;
@@ -481,15 +483,18 @@ impl Backend for PgBackend {
 
         let params_refs: Vec<&(dyn ToSql + Sync)> =
             builder.params.iter().map(|b| b.as_ref() as &(dyn ToSql + Sync)).collect();
-        let rows = client
-            .execute(&stmt, &params_refs)
+        let row = client
+            .query_opt(&stmt, &params_refs)
             .instrument(tracing::debug_span!("pg.execute"))
             .await
             .map_err(|e| map_pg_err(shape.table, e))?;
-        if rows == 0 {
-            return Err(BackendError::ConditionalCheckFailed);
+        match row {
+            None => Err(BackendError::ConditionalCheckFailed),
+            Some(r) => {
+                let Json(new_item): Json<serde_json::Value> = r.get(0);
+                Ok(new_item)
+            }
         }
-        Ok(())
     }
 
     #[tracing::instrument(level = "debug", skip_all, name = "pg.update_general_rmw_raw", fields(table = %shape.table))]
@@ -499,7 +504,7 @@ impl Backend for PgBackend {
         pk: &KeyValue,
         sk: Option<&KeyValue>,
         apply: GeneralUpdateFn<'_>,
-    ) -> Result<(), BackendError> {
+    ) -> Result<serde_json::Value, BackendError> {
         check_sk_shape(shape, sk)?;
 
         // Pre-compute the three SQL shapes (SELECT, UPDATE, INSERT) once.
@@ -638,7 +643,7 @@ impl Backend for PgBackend {
                         tx.commit()
                             .await
                             .map_err(|e| map_pg_err(shape.table, e))?;
-                        return Ok(());
+                        return Ok(new_item);
                     }
                     // 0 rows from the INSERT-DO-NOTHING branch only — loop.
                 }
@@ -659,7 +664,7 @@ impl Backend for PgBackend {
         &self,
         shape: &TableShape<'_>,
         insert_item: &serde_json::Value,
-    ) -> Result<(), BackendError> {
+    ) -> Result<serde_json::Value, BackendError> {
         let sql = build_insert_only_sql(shape);
         let client = self.client().await?;
         let stmt = client
@@ -667,18 +672,21 @@ impl Backend for PgBackend {
             .instrument(tracing::debug_span!("pg.prepare"))
             .await
             .map_err(|e| map_pg_err(shape.table, e))?;
-        let rows = client
-            .execute(&stmt, &[&Json(insert_item)])
+        // INSERT … ON CONFLICT DO NOTHING RETURNING data: returns 1 row
+        // on successful insert, 0 rows when the conflict suppressed the
+        // INSERT — which means `attribute_not_exists(pk)` was false.
+        let row = client
+            .query_opt(&stmt, &[&Json(insert_item)])
             .instrument(tracing::debug_span!("pg.execute"))
             .await
             .map_err(|e| map_pg_err(shape.table, e))?;
-        // INSERT … ON CONFLICT DO NOTHING: 1 row → successful insert,
-        // 0 rows → the row already existed, which means
-        // `attribute_not_exists(pk)` was false.
-        if rows == 0 {
-            return Err(BackendError::ConditionalCheckFailed);
+        match row {
+            None => Err(BackendError::ConditionalCheckFailed),
+            Some(r) => {
+                let Json(new_item): Json<serde_json::Value> = r.get(0);
+                Ok(new_item)
+            }
         }
-        Ok(())
     }
 }
 
@@ -719,7 +727,8 @@ fn build_update_sql(shape: &TableShape<'_>, n_sets: usize, n_removes: usize) -> 
     format!(
         "INSERT INTO {table} ({jsonb_col}) VALUES ($1::jsonb) \
          ON CONFLICT ({conflict_cols}) \
-         DO UPDATE SET {jsonb_col} = {expr}"
+         DO UPDATE SET {jsonb_col} = {expr} \
+         RETURNING {jsonb_col}"
     )
 }
 
@@ -738,7 +747,8 @@ fn build_insert_only_sql(shape: &TableShape<'_>) -> String {
 
     format!(
         "INSERT INTO {table} ({jsonb_col}) VALUES ($1::jsonb) \
-         ON CONFLICT ({conflict_cols}) DO NOTHING"
+         ON CONFLICT ({conflict_cols}) DO NOTHING \
+         RETURNING {jsonb_col}"
     )
 }
 

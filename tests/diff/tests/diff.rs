@@ -1463,3 +1463,155 @@ fn diff_update_composite_key() {
         ],
     );
 }
+
+// ---- Phase 7a: ReturnValues=ALL_NEW --------------------------------------
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_all_new_insert() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_rvan_ins"}}"##,
+        None,
+        &[
+            "--update-expression",
+            "SET #n = :name",
+            "--expression-attribute-names",
+            r##"{"#n":"name"}"##,
+            "--expression-attribute-values",
+            r##"{":name":{"S":"alice"}}"##,
+            "--return-values",
+            "ALL_NEW",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_all_new_update_merge() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_rvan_upd"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_rvan_upd"},"name":{"S":"old"},"role":{"S":"admin"}}"##),
+        &[
+            "--update-expression",
+            "SET #n = :name",
+            "--expression-attribute-names",
+            r##"{"#n":"name"}"##,
+            "--expression-attribute-values",
+            r##"{":name":{"S":"new"}}"##,
+            "--return-values",
+            "ALL_NEW",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_all_new_with_remove() {
+    // Verifies the response reflects post-update state including REMOVE.
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_rvan_rm"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_rvan_rm"},"a":{"S":"keep"},"b":{"S":"drop"}}"##),
+        &[
+            "--update-expression",
+            "REMOVE b",
+            "--return-values",
+            "ALL_NEW",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_all_new_insert_only_path() {
+    // InsertOnlyOnPk routing — attribute_not_exists(pk) on a missing row.
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_rvan_ionly"}}"##,
+        None,
+        &[
+            "--update-expression",
+            "SET #n = :name",
+            "--condition-expression",
+            "attribute_not_exists(id)",
+            "--expression-attribute-names",
+            r##"{"#n":"name"}"##,
+            "--expression-attribute-values",
+            r##"{":name":{"S":"bob"}}"##,
+            "--return-values",
+            "ALL_NEW",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_all_new_sql_cond_path() {
+    // SimpleSql routing — optimistic-lock pattern.
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_rvan_sql"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_rvan_sql"},"version":{"N":"1"}}"##),
+        &[
+            "--update-expression",
+            "SET #v = :new",
+            "--condition-expression",
+            "#v = :old",
+            "--expression-attribute-names",
+            r##"{"#v":"version"}"##,
+            "--expression-attribute-values",
+            r##"{":new":{"N":"2"},":old":{"N":"1"}}"##,
+            "--return-values",
+            "ALL_NEW",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_all_new_tx_path() {
+    // Path-ref RHS forces the slow (tx) path.
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_rvan_tx"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_rvan_tx"},"source":{"S":"hello"}}"##),
+        &[
+            "--update-expression",
+            "SET copy = #src",
+            "--expression-attribute-names",
+            r##"{"#src":"source"}"##,
+            "--return-values",
+            "ALL_NEW",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_all_new_add_numeric() {
+    // ADD :n on the tx path; ALL_NEW must reflect the incremented value.
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_rvan_add"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_rvan_add"},"counter":{"N":"10"}}"##),
+        &[
+            "--update-expression",
+            "ADD #c :n",
+            "--expression-attribute-names",
+            r##"{"#c":"counter"}"##,
+            "--expression-attribute-values",
+            r##"{":n":{"N":"5"}}"##,
+            "--return-values",
+            "ALL_NEW",
+        ],
+    );
+}

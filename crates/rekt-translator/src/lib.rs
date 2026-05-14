@@ -92,6 +92,20 @@ pub struct UpdateItemPlan {
     /// `NeedsTx` falls to the slow path with in-Rust evaluation
     /// (Phase 4e). Always `None` in Phases 1–3.
     pub condition: Option<ConditionPlan>,
+    /// What the response body should carry. `None` means an empty
+    /// response (DDB default). `AllNew` means the full post-update item.
+    /// Other DDB variants (`ALL_OLD` / `UPDATED_OLD` / `UPDATED_NEW`)
+    /// are Phase 7b/7c and are rejected at translate time.
+    pub return_values: ReturnValuesMode,
+}
+
+/// Subset of DDB's `ReturnValues` enum that the dispatcher currently
+/// understands. Phase 7a lands `AllNew`; 7b/7c will extend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReturnValuesMode {
+    #[default]
+    None,
+    AllNew,
 }
 
 #[derive(Debug, Clone)]
@@ -230,7 +244,12 @@ pub enum TranslateError {
     )]
     UnsupportedConditionNestedPath { path: String },
 
-    #[error("only `ReturnValues=NONE` is supported in this phase (got `{got}`)")]
+    /// Phase 7a accepts `NONE` (default, empty response) and `ALL_NEW`
+    /// (full post-update item). `ALL_OLD` / `UPDATED_OLD` / `UPDATED_NEW`
+    /// are deferred to Phase 7b/7c.
+    #[error(
+        "only `ReturnValues=NONE` and `ALL_NEW` are supported in this phase (got `{got}`) — Phase 7b will add `ALL_OLD`; 7c adds `UPDATED_*`"
+    )]
     UnsupportedReturnValues { got: String },
 }
 
@@ -284,16 +303,17 @@ pub fn translate_update_item(
     req: &UpdateItemRequest,
     schema: &TableSchema,
 ) -> Result<UpdateItemPlan, TranslateError> {
-    // 1. Disallow features not yet supported in this phase. Reject early so
-    //    the rest of the translator only deals with the supported subset.
-    match req.return_values.as_deref() {
-        None | Some("NONE") => {}
+    // 1. Resolve ReturnValues. NONE (default / absent) and ALL_NEW are
+    //    supported; the remaining DDB variants are Phase 7b/7c.
+    let return_values = match req.return_values.as_deref() {
+        None | Some("NONE") => ReturnValuesMode::None,
+        Some("ALL_NEW") => ReturnValuesMode::AllNew,
         Some(other) => {
             return Err(TranslateError::UnsupportedReturnValues {
                 got: other.to_string(),
             });
         }
-    }
+    };
 
     // 2. Validate the Key against the schema (same machinery as GetItem /
     //    DeleteItem). Caller must supply pk (and sk if composite); no
@@ -380,6 +400,7 @@ pub fn translate_update_item(
         sk,
         expression,
         condition,
+        return_values,
     })
 }
 
@@ -1899,7 +1920,22 @@ mod tests {
             &[],
         );
         req.return_values = Some("NONE".into());
-        assert!(translate_update_item(&req, &schema_hash_s()).is_ok());
+        let plan = translate_update_item(&req, &schema_hash_s()).unwrap();
+        assert_eq!(plan.return_values, ReturnValuesMode::None);
+    }
+
+    #[test]
+    fn upd_accept_return_values_all_new() {
+        let mut req = upd(
+            "users",
+            &[("id", AttributeValue::S("u1".into()))],
+            "SET status = :v",
+            &[(":v", AttributeValue::S("active".into()))],
+            &[],
+        );
+        req.return_values = Some("ALL_NEW".into());
+        let plan = translate_update_item(&req, &schema_hash_s()).unwrap();
+        assert_eq!(plan.return_values, ReturnValuesMode::AllNew);
     }
 
     #[test]
@@ -1915,6 +1951,22 @@ mod tests {
         let err = translate_update_item(&req, &schema_hash_s()).unwrap_err();
         assert!(
             matches!(err, TranslateError::UnsupportedReturnValues { ref got } if got == "ALL_OLD")
+        );
+    }
+
+    #[test]
+    fn upd_reject_return_values_updated_new() {
+        let mut req = upd(
+            "users",
+            &[("id", AttributeValue::S("u1".into()))],
+            "SET status = :v",
+            &[(":v", AttributeValue::S("active".into()))],
+            &[],
+        );
+        req.return_values = Some("UPDATED_NEW".into());
+        let err = translate_update_item(&req, &schema_hash_s()).unwrap_err();
+        assert!(
+            matches!(err, TranslateError::UnsupportedReturnValues { ref got } if got == "UPDATED_NEW")
         );
     }
 
