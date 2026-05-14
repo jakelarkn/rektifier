@@ -1003,7 +1003,7 @@ mod tests {
             sk_type: None,
             jsonb_col: "data",
         };
-        let item = serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice"}});
+        let item = serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}});
         backend.put_item_raw(&shape, &item).await.unwrap();
 
         let got = backend
@@ -1013,7 +1013,7 @@ mod tests {
         assert_eq!(got, Some(item.clone()));
 
         // Upsert: same key, different value, should replace.
-        let item2 = serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice2"}});
+        let item2 = serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice2"}});
         backend.put_item_raw(&shape, &item2).await.unwrap();
         let got2 = backend
             .get_item_raw(&shape, &KeyValue::S("u1".into()), None)
@@ -1076,9 +1076,9 @@ mod tests {
         // 38-digit precision number.
         let big_ts = "12345678901234567890.12345678901234567";
         let item1 =
-            serde_json::json!({"device_id":{"S":"dev-1"},"ts":{"N":"1000"},"value":{"N":"1"}});
+            serde_json::json!({"device_id":{"S":"dev-1"},"ts":{"N":"1000"},"val":{"N":"1"}});
         let item2 =
-            serde_json::json!({"device_id":{"S":"dev-1"},"ts":{"N":big_ts},"value":{"N":"2"}});
+            serde_json::json!({"device_id":{"S":"dev-1"},"ts":{"N":big_ts},"val":{"N":"2"}});
         backend.put_item_raw(&shape, &item1).await.unwrap();
         backend.put_item_raw(&shape, &item2).await.unwrap();
 
@@ -1144,7 +1144,7 @@ mod tests {
             jsonb_col: "meta",
         };
         // base64 of "\x00\x01\x02\xff" is "AAEC/w==".
-        let item = serde_json::json!({"hash":{"B":"AAEC/w=="},"size":{"N":"4"}});
+        let item = serde_json::json!({"hash":{"B":"AAEC/w=="},"extent":{"N":"4"}});
         backend.put_item_raw(&shape, &item).await.unwrap();
 
         let got = backend
@@ -1193,7 +1193,7 @@ mod tests {
             jsonb_col: "data",
         };
         // JSONB has no `id` attr — generated column yields NULL — PRIMARY KEY rejects.
-        let bad_item = serde_json::json!({"name":{"S":"alice"}});
+        let bad_item = serde_json::json!({"label":{"S":"alice"}});
         let err = backend.put_item_raw(&shape, &bad_item).await.unwrap_err();
         // PG raises a not-null-violation; we map to Other for now (translator
         // should catch this case earlier in the real call path).
@@ -1230,7 +1230,7 @@ mod tests {
             sk_type: None,
             jsonb_col: "data",
         };
-        let item = serde_json::json!({"id":{"S":"alice"},"name":{"S":"A"}});
+        let item = serde_json::json!({"id":{"S":"alice"},"label":{"S":"A"}});
         backend.put_item_raw(&shape, &item).await.unwrap();
         // Sanity: item is present.
         assert_eq!(
@@ -1378,14 +1378,14 @@ mod tests {
         };
 
         let insert_item =
-            serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice"},"score":{"N":"10"}});
+            serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"},"score":{"N":"10"}});
         let name_v = serde_json::json!({"S":"alice"});
         let score_v = serde_json::json!({"N":"10"});
         backend
             .update_simple_raw(
                 &shape,
                 &insert_item,
-                &[("name", &name_v), ("score", &score_v)],
+                &[("label", &name_v), ("score", &score_v)],
                 &[],
             )
             .await
@@ -1421,7 +1421,7 @@ mod tests {
         // Seed an item that has `name` and `untouched`.
         let original = serde_json::json!({
             "id":{"S":"u1"},
-            "name":{"S":"alice"},
+            "label":{"S":"alice"},
             "untouched":{"S":"keep_me"},
         });
         backend.put_item_raw(&shape, &original).await.unwrap();
@@ -1429,14 +1429,14 @@ mod tests {
         // Update: replace `name`, add a new `score`. Sibling `untouched`
         // must survive — that's the merge contract.
         let insert_item =
-            serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice2"},"score":{"N":"42"}});
+            serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice2"},"score":{"N":"42"}});
         let name_v = serde_json::json!({"S":"alice2"});
         let score_v = serde_json::json!({"N":"42"});
         backend
             .update_simple_raw(
                 &shape,
                 &insert_item,
-                &[("name", &name_v), ("score", &score_v)],
+                &[("label", &name_v), ("score", &score_v)],
                 &[],
             )
             .await
@@ -1450,7 +1450,7 @@ mod tests {
             got,
             Some(serde_json::json!({
                 "id":{"S":"u1"},
-                "name":{"S":"alice2"},
+                "label":{"S":"alice2"},
                 "score":{"N":"42"},
                 "untouched":{"S":"keep_me"},
             }))
@@ -1479,7 +1479,7 @@ mod tests {
 
         let original = serde_json::json!({
             "id":{"S":"u1"},
-            "name":{"S":"alice"},
+            "label":{"S":"alice"},
             "deprecated":{"S":"gone"},
         });
         backend.put_item_raw(&shape, &original).await.unwrap();
@@ -1504,7 +1504,7 @@ mod tests {
             got,
             Some(serde_json::json!({
                 "id":{"S":"u1"},
-                "name":{"S":"alice"},
+                "label":{"S":"alice"},
             }))
         );
 
@@ -1531,7 +1531,7 @@ mod tests {
 
         let original = serde_json::json!({
             "id":{"S":"u1"},
-            "status":{"S":"old"},
+            "flag":{"S":"old"},
             "deprecated":{"S":"x"},
         });
         backend.put_item_raw(&shape, &original).await.unwrap();
@@ -1540,8 +1540,8 @@ mod tests {
         backend
             .update_simple_raw(
                 &shape,
-                &serde_json::json!({"id":{"S":"u1"},"status":{"S":"new"}}),
-                &[("status", &status_v)],
+                &serde_json::json!({"id":{"S":"u1"},"flag":{"S":"new"}}),
+                &[("flag", &status_v)],
                 &["deprecated"],
             )
             .await
@@ -1553,7 +1553,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             got,
-            Some(serde_json::json!({"id":{"S":"u1"},"status":{"S":"new"}}))
+            Some(serde_json::json!({"id":{"S":"u1"},"flag":{"S":"new"}}))
         );
 
         client
@@ -1598,9 +1598,9 @@ mod tests {
                 &serde_json::json!({
                     "device_id":{"S":"dev-1"},
                     "ts":{"N":"1000"},
-                    "value":{"N":"7"},
+                    "val":{"N":"7"},
                 }),
-                &[("value", &value_v)],
+                &[("val", &value_v)],
                 &[],
             )
             .await
@@ -1610,7 +1610,7 @@ mod tests {
         let extra = serde_json::json!({
             "device_id":{"S":"dev-1"},
             "ts":{"N":"2000"},
-            "value":{"N":"1"},
+            "val":{"N":"1"},
             "label":{"S":"keep_me"},
         });
         backend.put_item_raw(&shape, &extra).await.unwrap();
@@ -1622,9 +1622,9 @@ mod tests {
                 &serde_json::json!({
                     "device_id":{"S":"dev-1"},
                     "ts":{"N":"2000"},
-                    "value":{"N":"99"},
+                    "val":{"N":"99"},
                 }),
-                &[("value", &value_v2)],
+                &[("val", &value_v2)],
                 &[],
             )
             .await
@@ -1643,7 +1643,7 @@ mod tests {
             Some(serde_json::json!({
                 "device_id":{"S":"dev-1"},
                 "ts":{"N":"2000"},
-                "value":{"N":"99"},
+                "val":{"N":"99"},
                 "label":{"S":"keep_me"},
             }))
         );
@@ -1740,7 +1740,7 @@ mod tests {
             jsonb_col: "data",
         };
 
-        let item = serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice"}});
+        let item = serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}});
         backend.update_insert_only_raw(&shape, &item).await.unwrap();
 
         let got = backend
@@ -1770,12 +1770,12 @@ mod tests {
             jsonb_col: "data",
         };
 
-        let original = serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice"}});
+        let original = serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}});
         backend.put_item_raw(&shape, &original).await.unwrap();
 
         // Second insert-only call on the same key must fail and leave
         // the original row untouched.
-        let proposed = serde_json::json!({"id":{"S":"u1"},"name":{"S":"NEW"}});
+        let proposed = serde_json::json!({"id":{"S":"u1"},"label":{"S":"NEW"}});
         let err = backend
             .update_insert_only_raw(&shape, &proposed)
             .await
@@ -1909,7 +1909,7 @@ mod tests {
         backend
             .put_item_raw(
                 &shape,
-                &serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice"}}),
+                &serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}}),
             )
             .await
             .unwrap();
@@ -1920,7 +1920,7 @@ mod tests {
                 &shape,
                 &KeyValue::S("u1".into()),
                 None,
-                &[("name", &new_name)],
+                &[("label", &new_name)],
                 &[],
                 &cond_attr_exists("id"),
             )
@@ -1933,7 +1933,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             got,
-            Some(serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice2"}}))
+            Some(serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice2"}}))
         );
 
         client
@@ -1962,7 +1962,7 @@ mod tests {
                 &shape,
                 &KeyValue::S("missing".into()),
                 None,
-                &[("name", &new_name)],
+                &[("label", &new_name)],
                 &[],
                 &cond_attr_exists("id"),
             )
@@ -2127,7 +2127,7 @@ mod tests {
                 &shape,
                 &serde_json::json!({
                     "id":{"S":"u1"},
-                    "status":{"S":"active"},
+                    "flag":{"S":"active"},
                     "version":{"N":"1"},
                 }),
             )
@@ -2138,7 +2138,7 @@ mod tests {
         let new_v = serde_json::json!({"N":"2"});
         let cond_both = Condition::And(
             Box::new(cond_eq(
-                "status",
+                "flag",
                 rekt_protocol::AttributeValue::S("active".into()),
             )),
             Box::new(cond_eq("version", rek_n("1"))),
@@ -2159,7 +2159,7 @@ mod tests {
         let new_v2 = serde_json::json!({"N":"3"});
         let cond_bad = Condition::And(
             Box::new(cond_eq(
-                "status",
+                "flag",
                 rekt_protocol::AttributeValue::S("active".into()),
             )),
             Box::new(cond_eq("version", rek_n("999"))),
@@ -2202,7 +2202,7 @@ mod tests {
         backend
             .put_item_raw(
                 &shape,
-                &serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice"}}),
+                &serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}}),
             )
             .await
             .unwrap();
@@ -2263,7 +2263,7 @@ mod tests {
             jsonb_col: "data",
         };
 
-        let new_item = serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice"}});
+        let new_item = serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}});
         let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
         let captured_clone = captured.clone();
         let new_clone = new_item.clone();
@@ -2304,20 +2304,20 @@ mod tests {
             jsonb_col: "data",
         };
 
-        let original = serde_json::json!({"id":{"S":"u1"},"counter":{"N":"5"}});
+        let original = serde_json::json!({"id":{"S":"u1"},"tally":{"N":"5"}});
         backend.put_item_raw(&shape, &original).await.unwrap();
 
         // Closure: read counter, increment, write back.
         let apply: GeneralUpdateFn<'_> = Box::new(move |existing| {
             let existing = existing.expect("row should be present");
-            let cur: i64 = existing["counter"]["N"]
+            let cur: i64 = existing["tally"]["N"]
                 .as_str()
                 .unwrap()
                 .parse()
                 .unwrap();
             let new_item = serde_json::json!({
                 "id":{"S":"u1"},
-                "counter":{"N":format!("{}", cur + 1)},
+                "tally":{"N":format!("{}", cur + 1)},
             });
             Ok(UpdateDecision::Apply(new_item))
         });
@@ -2332,7 +2332,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             got,
-            Some(serde_json::json!({"id":{"S":"u1"},"counter":{"N":"6"}}))
+            Some(serde_json::json!({"id":{"S":"u1"},"tally":{"N":"6"}}))
         );
 
         client
@@ -2355,7 +2355,7 @@ mod tests {
             jsonb_col: "data",
         };
 
-        let original = serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice"}});
+        let original = serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}});
         backend.put_item_raw(&shape, &original).await.unwrap();
 
         let apply: GeneralUpdateFn<'_> =
@@ -2403,7 +2403,7 @@ mod tests {
                     sk_type: None,
                     jsonb_col: &shape_owned.2,
                 },
-                &serde_json::json!({"id":{"S":"u1"},"counter":{"N":"0"}}),
+                &serde_json::json!({"id":{"S":"u1"},"tally":{"N":"0"}}),
             )
             .await
             .unwrap();
@@ -2422,14 +2422,14 @@ mod tests {
                 };
                 let apply: GeneralUpdateFn<'_> = Box::new(move |existing| {
                     let existing = existing.expect("row should be present");
-                    let cur: i64 = existing["counter"]["N"]
+                    let cur: i64 = existing["tally"]["N"]
                         .as_str()
                         .unwrap()
                         .parse()
                         .unwrap();
                     Ok(UpdateDecision::Apply(serde_json::json!({
                         "id":{"S":"u1"},
-                        "counter":{"N": format!("{}", cur + 1)},
+                        "tally":{"N": format!("{}", cur + 1)},
                     })))
                 });
                 backend
@@ -2464,7 +2464,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            got.unwrap()["counter"]["N"].as_str().unwrap(),
+            got.unwrap()["tally"]["N"].as_str().unwrap(),
             &N.to_string(),
             "lost-write: N concurrent increments should serialize"
         );
@@ -2539,7 +2539,7 @@ mod tests {
         backend
             .put_item_raw(
                 &shape,
-                &serde_json::json!({"id":{"S":"u1"},"counter":{"N":"10"}}),
+                &serde_json::json!({"id":{"S":"u1"},"tally":{"N":"10"}}),
             )
             .await
             .unwrap();
@@ -2551,7 +2551,7 @@ mod tests {
         .into_iter()
         .collect();
         let expr = parse_upd_e2e(
-            "ADD counter :inc",
+            "ADD tally :inc",
             &[(":inc", rekt_protocol::AttributeValue::N("5".into()))],
         );
         backend
@@ -2568,7 +2568,7 @@ mod tests {
             .get_item_raw(&shape, &KeyValue::S("u1".into()), None)
             .await
             .unwrap();
-        assert_eq!(got.unwrap()["counter"], serde_json::json!({"N":"15"}));
+        assert_eq!(got.unwrap()["tally"], serde_json::json!({"N":"15"}));
 
         client
             .batch_execute("DROP TABLE rekt_t_addnum;")
@@ -2713,7 +2713,7 @@ mod tests {
         backend
             .put_item_raw(
                 &shape,
-                &serde_json::json!({"id":{"S":"u1"},"name":{"S":"alice"}}),
+                &serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}}),
             )
             .await
             .unwrap();
@@ -2731,7 +2731,7 @@ mod tests {
             &[(":m", rekt_protocol::AttributeValue::S("hit".into()))],
         );
         let cond = parse_cond_e2e(
-            "begins_with(name, :p)",
+            "begins_with(label, :p)",
             &[(":p", rekt_protocol::AttributeValue::S("ali".into()))],
         );
         backend
@@ -2750,7 +2750,7 @@ mod tests {
             &[(":m", rekt_protocol::AttributeValue::S("nope".into()))],
         );
         let cond2 = parse_cond_e2e(
-            "begins_with(name, :p)",
+            "begins_with(label, :p)",
             &[(":p", rekt_protocol::AttributeValue::S("bob".into()))],
         );
         let err = backend
