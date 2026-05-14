@@ -17,6 +17,7 @@ use rekt_expressions::{ComparisonOp, Condition, Operand, Path};
 use rekt_protocol::AttributeValue;
 use rekt_storage::{
     Backend, BackendError, GeneralUpdateFn, KeyType, KeyValue, TableShape, UpdateDecision,
+    UpdateOutcome,
 };
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -361,16 +362,31 @@ impl Backend for PgBackend {
     async fn update_simple_raw(
         &self,
         shape: &TableShape<'_>,
+        pk: &KeyValue,
+        sk: Option<&KeyValue>,
         insert_item: &serde_json::Value,
         sets: &[(&str, &serde_json::Value)],
         removes: &[&str],
-    ) -> Result<serde_json::Value, BackendError> {
+    ) -> Result<UpdateOutcome, BackendError> {
+        check_sk_shape(shape, sk)?;
         let sql = build_update_sql(shape, sets.len(), removes.len());
 
-        // Parameter type vector mirrors the SQL: $1 = JSONB (insert_item),
-        // then (TEXT attr name, JSONB value) per SET, then TEXT attr name
-        // per REMOVE.
-        let mut types: Vec<Type> = Vec::with_capacity(1 + 2 * sets.len() + removes.len());
+        // Parameter type vector mirrors the SQL produced by
+        // build_update_sql: the leading key params (1 or 2) feed the
+        // `prev` CTE; then $N+1 = JSONB (insert_item); then per-SET
+        // (TEXT attr name, JSONB value) pairs; then per-REMOVE TEXT
+        // attr names.
+        let pk_pg = pg_type_for_keytype(shape.pk_type);
+        let mut types: Vec<Type> =
+            Vec::with_capacity(1 + sk.is_some() as usize + 1 + 2 * sets.len() + removes.len());
+        types.push(pk_pg);
+        if let Some(sk_v) = sk {
+            types.push(pg_type_for_keytype(match sk_v {
+                KeyValue::S(_) => KeyType::S,
+                KeyValue::N(_) => KeyType::N,
+                KeyValue::B(_) => KeyType::B,
+            }));
+        }
         types.push(Type::JSONB);
         for _ in sets {
             types.push(Type::TEXT);
@@ -387,13 +403,17 @@ impl Backend for PgBackend {
             .await
             .map_err(|e| map_pg_err(shape.table, e))?;
 
-        // Build the param slice. SET values get wrapped in `Json(&Value)`
-        // owned in a side Vec so the borrows survive until execute().
+        let pk_bound = Bound(pk);
+        let sk_bound = sk.map(Bound);
         let insert_json = Json(insert_item);
         let set_value_jsons: Vec<Json<&serde_json::Value>> =
             sets.iter().map(|(_, v)| Json(*v)).collect();
 
         let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(types.len());
+        params.push(&pk_bound);
+        if let Some(b) = sk_bound.as_ref() {
+            params.push(b);
+        }
         params.push(&insert_json);
         for (i, (name, _)) in sets.iter().enumerate() {
             params.push(name);
@@ -408,8 +428,14 @@ impl Backend for PgBackend {
             .instrument(tracing::debug_span!("pg.execute"))
             .await
             .map_err(|e| map_pg_err(shape.table, e))?;
+        // Column 0: new_data (post-update). Column 1: old_data (pre-update,
+        // NULL if the row didn't exist).
         let Json(new_item): Json<serde_json::Value> = row.get(0);
-        Ok(new_item)
+        let old_item: Option<Json<serde_json::Value>> = row.get(1);
+        Ok(UpdateOutcome {
+            new_item,
+            old_item: old_item.map(|Json(v)| v),
+        })
     }
 
     #[tracing::instrument(level = "debug", skip_all, name = "pg.update_with_simple_condition_raw", fields(table = %shape.table))]
@@ -421,13 +447,14 @@ impl Backend for PgBackend {
         sets: &[(&str, &serde_json::Value)],
         removes: &[&str],
         condition: &Condition,
-    ) -> Result<serde_json::Value, BackendError> {
+    ) -> Result<UpdateOutcome, BackendError> {
         // Pre-flight: sk shape must match the table shape.
         check_sk_shape(shape, sk)?;
 
         let mut builder = ParamBuilder::new();
 
-        // 1) pk (and sk) — $1, $2.
+        // 1) pk (and sk) — $1, $2. Same param indices feed both the
+        //    `prev` CTE's WHERE and the UPDATE's WHERE.
         let pk_idx = builder.bind_key(pk);
         let sk_idx = sk.map(|s| builder.bind_key(s));
 
@@ -448,8 +475,8 @@ impl Backend for PgBackend {
             expr = format!("({expr}) - ${name_idx}::text");
         }
 
-        // 3) WHERE: pk = $1 [AND sk = $2] AND (compiled condition).
-        let mut where_clause = format!(
+        // 3) key predicate, reused by both the `prev` CTE and the UPDATE.
+        let mut key_predicate = format!(
             "{} = ${}{}",
             quote_ident(shape.pk_col),
             pk_idx,
@@ -459,7 +486,7 @@ impl Backend for PgBackend {
             (shape.sk_col, shape.sk_type, sk_idx)
         {
             let _ = write!(
-                where_clause,
+                key_predicate,
                 " AND {} = ${}{}",
                 quote_ident(sk_col),
                 idx,
@@ -467,11 +494,18 @@ impl Backend for PgBackend {
             );
         }
         let cond_sql = compile_condition(&mut builder, &data_ref, condition)?;
-        let _ = write!(where_clause, " AND ({cond_sql})");
 
+        // The `prev` CTE captures pre-update state at the same
+        // statement snapshot. The UPDATE adds the user's condition;
+        // the CTE intentionally does NOT — we want the old item even
+        // if the condition would have failed (though in that case
+        // the UPDATE returns 0 rows and we map to CCFE, never reading
+        // prev).
         let sql = format!(
-            "UPDATE {table_ident} SET {jsonb_ident} = {expr} \
-             WHERE {where_clause} RETURNING {jsonb_ident}"
+            "WITH prev AS (SELECT {jsonb_ident} AS old_data FROM {table_ident} WHERE {key_predicate}) \
+             UPDATE {table_ident} SET {jsonb_ident} = {expr} \
+             WHERE {key_predicate} AND ({cond_sql}) \
+             RETURNING {jsonb_ident} AS new_data, (SELECT old_data FROM prev) AS old_data"
         );
 
         let client = self.client().await?;
@@ -492,7 +526,11 @@ impl Backend for PgBackend {
             None => Err(BackendError::ConditionalCheckFailed),
             Some(r) => {
                 let Json(new_item): Json<serde_json::Value> = r.get(0);
-                Ok(new_item)
+                let old_item: Option<Json<serde_json::Value>> = r.get(1);
+                Ok(UpdateOutcome {
+                    new_item,
+                    old_item: old_item.map(|Json(v)| v),
+                })
             }
         }
     }
@@ -504,7 +542,7 @@ impl Backend for PgBackend {
         pk: &KeyValue,
         sk: Option<&KeyValue>,
         apply: GeneralUpdateFn<'_>,
-    ) -> Result<serde_json::Value, BackendError> {
+    ) -> Result<UpdateOutcome, BackendError> {
         check_sk_shape(shape, sk)?;
 
         // Pre-compute the three SQL shapes (SELECT, UPDATE, INSERT) once.
@@ -643,7 +681,10 @@ impl Backend for PgBackend {
                         tx.commit()
                             .await
                             .map_err(|e| map_pg_err(shape.table, e))?;
-                        return Ok(new_item);
+                        return Ok(UpdateOutcome {
+                            new_item,
+                            old_item: existing,
+                        });
                     }
                     // 0 rows from the INSERT-DO-NOTHING branch only — loop.
                 }
@@ -664,7 +705,7 @@ impl Backend for PgBackend {
         &self,
         shape: &TableShape<'_>,
         insert_item: &serde_json::Value,
-    ) -> Result<serde_json::Value, BackendError> {
+    ) -> Result<UpdateOutcome, BackendError> {
         let sql = build_insert_only_sql(shape);
         let client = self.client().await?;
         let stmt = client
@@ -684,7 +725,12 @@ impl Backend for PgBackend {
             None => Err(BackendError::ConditionalCheckFailed),
             Some(r) => {
                 let Json(new_item): Json<serde_json::Value> = r.get(0);
-                Ok(new_item)
+                // Insert-only success means the row did NOT exist
+                // beforehand, so there's no pre-update item.
+                Ok(UpdateOutcome {
+                    new_item,
+                    old_item: None,
+                })
             }
         }
     }
@@ -694,23 +740,48 @@ impl Backend for PgBackend {
 /// varies by `n_sets` and `n_removes`, so we can't precompute it per
 /// table — but `prepare_typed_cached` keys on the SQL string, so warm
 /// shapes still hit the prepared-statement cache.
+///
+/// Parameter layout:
+///   $1[, $2]    — pk[, sk] for the `prev` CTE's WHERE clause
+///   $K+1        — JSONB insert_item (K = 1 or 2)
+///   $K+2,$K+3   — per-SET (TEXT name, JSONB value) pairs
+///   ...         — per-REMOVE TEXT names
+///
+/// Adding the CTE costs one snapshot lookup; the upsert itself still
+/// derives its key columns from JSONB via `GENERATED ALWAYS AS`.
 fn build_update_sql(shape: &TableShape<'_>, n_sets: usize, n_removes: usize) -> String {
     let table = quote_ident(shape.table);
     let pk_col = quote_ident(shape.pk_col);
     let jsonb_col = quote_ident(shape.jsonb_col);
+    let pk_cast = cast_for_keytype(shape.pk_type);
 
     let conflict_cols = match shape.sk_col {
         None => pk_col.clone(),
         Some(sk) => format!("{pk_col}, {sk}", sk = quote_ident(sk)),
     };
 
-    // Start the DO-UPDATE expression at `t.jsonb_col`; wrap with a
-    // `jsonb_set(_, ARRAY[$name], $value)` per SET; then append `- $name`
-    // per REMOVE.
-    //
-    // Params: $1 = INSERT-branch JSONB, then for each SET (name, value),
-    // then for each REMOVE name.
-    let mut param_idx: usize = 2;
+    // Build the WHERE clause for the snapshot CTE and assign the
+    // insert-jsonb param index right after the key params.
+    let (cte_where, insert_param_idx) = match (shape.sk_col, shape.sk_type) {
+        (None, _) => (format!("{pk_col} = $1{pk_cast}"), 2usize),
+        (Some(sk_col), Some(sk_type)) => {
+            let sk_quoted = quote_ident(sk_col);
+            let sk_cast = cast_for_keytype(sk_type);
+            (
+                format!("{pk_col} = $1{pk_cast} AND {sk_quoted} = $2{sk_cast}"),
+                3,
+            )
+        }
+        (Some(_), None) => unreachable!(
+            "TableShape `{}`: sk_col without sk_type",
+            shape.table
+        ),
+    };
+
+    // Build the DO UPDATE expression: starts at `t.jsonb_col`; wrap
+    // with `jsonb_set(_, ARRAY[$name], $value)` per SET; append
+    // `- $name` per REMOVE.
+    let mut param_idx: usize = insert_param_idx + 1;
     let mut expr = format!("{table}.{jsonb_col}");
     for _ in 0..n_sets {
         let name_p = param_idx;
@@ -724,11 +795,15 @@ fn build_update_sql(shape: &TableShape<'_>, n_sets: usize, n_removes: usize) -> 
         expr = format!("({expr}) - ${name_p}::text");
     }
 
+    // The `prev` CTE reads the pre-update row at the same statement
+    // snapshot as the upsert, so old_data is the value that existed
+    // *before* this statement ran.
     format!(
-        "INSERT INTO {table} ({jsonb_col}) VALUES ($1::jsonb) \
+        "WITH prev AS (SELECT {jsonb_col} AS old_data FROM {table} WHERE {cte_where}) \
+         INSERT INTO {table} ({jsonb_col}) VALUES (${insert_param_idx}::jsonb) \
          ON CONFLICT ({conflict_cols}) \
          DO UPDATE SET {jsonb_col} = {expr} \
-         RETURNING {jsonb_col}"
+         RETURNING {jsonb_col} AS new_data, (SELECT old_data FROM prev) AS old_data"
     )
 }
 
@@ -1384,6 +1459,8 @@ mod tests {
         backend
             .update_simple_raw(
                 &shape,
+                &KeyValue::S("u1".into()),
+                None,
                 &insert_item,
                 &[("label", &name_v), ("score", &score_v)],
                 &[],
@@ -1435,6 +1512,8 @@ mod tests {
         backend
             .update_simple_raw(
                 &shape,
+                &KeyValue::S("u1".into()),
+                None,
                 &insert_item,
                 &[("label", &name_v), ("score", &score_v)],
                 &[],
@@ -1489,6 +1568,8 @@ mod tests {
         backend
             .update_simple_raw(
                 &shape,
+                &KeyValue::S("u1".into()),
+                None,
                 &serde_json::json!({"id":{"S":"u1"}}),
                 &[],
                 &["deprecated", "never_existed"],
@@ -1540,6 +1621,8 @@ mod tests {
         backend
             .update_simple_raw(
                 &shape,
+                &KeyValue::S("u1".into()),
+                None,
                 &serde_json::json!({"id":{"S":"u1"},"flag":{"S":"new"}}),
                 &[("flag", &status_v)],
                 &["deprecated"],
@@ -1595,6 +1678,8 @@ mod tests {
         backend
             .update_simple_raw(
                 &shape,
+                &KeyValue::S("dev-1".into()),
+                Some(&KeyValue::N("1000".into())),
                 &serde_json::json!({
                     "device_id":{"S":"dev-1"},
                     "ts":{"N":"1000"},
@@ -1619,6 +1704,8 @@ mod tests {
         backend
             .update_simple_raw(
                 &shape,
+                &KeyValue::S("dev-1".into()),
+                Some(&KeyValue::N("2000".into())),
                 &serde_json::json!({
                     "device_id":{"S":"dev-1"},
                     "ts":{"N":"2000"},
@@ -1690,6 +1777,8 @@ mod tests {
         backend
             .update_simple_raw(
                 &shape,
+                &KeyValue::S("u1".into()),
+                None,
                 &insert_item,
                 &[
                     ("s", &s_v),

@@ -31,7 +31,7 @@ use rekt_protocol::{
     PutItemResponse, UpdateItemRequest, UpdateItemResponse,
 };
 use rekt_sigv4::{SigV4Error, Verifier};
-use rekt_storage::{Backend, BackendError, UpdateDecision};
+use rekt_storage::{Backend, BackendError, UpdateDecision, UpdateOutcome};
 use rekt_translator::{
     apply_update_expression, evaluate_condition, materialize_insert_only_update,
     materialize_simple_sql_update, materialize_simple_update, translate_delete_item,
@@ -327,7 +327,7 @@ async fn handle_update_item(state: &AppState, body: &Bytes) -> Result<Response, 
     // Dispatch on ConditionExpression routing. Phase 3a handles the no-
     // condition case; Phase 4c handles `attribute_not_exists(pk)`; Phase
     // 4d handles SimpleSql; the slow-path branch above caught NeedsTx.
-    let new_item = match plan.condition.as_ref().map(|c| c.routing) {
+    let outcome = match plan.condition.as_ref().map(|c| c.routing) {
         None => {
             let prims = materialize_simple_update(&plan, &req.key)?;
             let sets_borrowed: Vec<(&str, &serde_json::Value)> = prims
@@ -340,6 +340,8 @@ async fn handle_update_item(state: &AppState, body: &Bytes) -> Result<Response, 
                 .backend
                 .update_simple_raw(
                     &schema.shape(),
+                    &plan.pk,
+                    plan.sk.as_ref(),
                     &prims.insert_item,
                     &sets_borrowed,
                     &removes_borrowed,
@@ -385,29 +387,37 @@ async fn handle_update_item(state: &AppState, body: &Bytes) -> Result<Response, 
         ),
     };
 
-    Ok(json_ok(&build_update_response(plan.return_values, new_item)?))
+    Ok(json_ok(&build_update_response(plan.return_values, outcome)?))
 }
 
 /// Shape the UpdateItem response according to `ReturnValues`. Phase 7a
-/// supports `NONE` (empty body) and `ALL_NEW` (deserialize the post-
-/// update JSON back into an Item and set `Attributes`). 7b/7c will
-/// extend this with the `OLD` and `UPDATED_*` projections.
+/// supports `ALL_NEW` (post-update item); 7b adds `ALL_OLD` (pre-update
+/// item, or absent `Attributes` if the call inserted a new row). 7c
+/// will add the projected `UPDATED_*` variants on top.
 fn build_update_response(
     mode: ReturnValuesMode,
-    new_item: serde_json::Value,
+    outcome: UpdateOutcome,
 ) -> Result<UpdateItemResponse, ApiError> {
+    let to_item = |label: &'static str, v: serde_json::Value| -> Result<Item, ApiError> {
+        serde_json::from_value(v).map_err(|e| {
+            ApiError::Internal(format!(
+                "{label}: stored item is not valid DynamoDB-JSON: {e}"
+            ))
+        })
+    };
     match mode {
         ReturnValuesMode::None => Ok(UpdateItemResponse::default()),
-        ReturnValuesMode::AllNew => {
-            let item: Item = serde_json::from_value(new_item).map_err(|e| {
-                ApiError::Internal(format!(
-                    "ReturnValues=ALL_NEW: stored item is not valid DynamoDB-JSON: {e}"
-                ))
-            })?;
-            Ok(UpdateItemResponse {
-                attributes: Some(item),
-            })
-        }
+        ReturnValuesMode::AllNew => Ok(UpdateItemResponse {
+            attributes: Some(to_item("ReturnValues=ALL_NEW", outcome.new_item)?),
+        }),
+        ReturnValuesMode::AllOld => Ok(UpdateItemResponse {
+            // DDB returns no `Attributes` if the call created a new
+            // row — there was no pre-update item to surface.
+            attributes: outcome
+                .old_item
+                .map(|v| to_item("ReturnValues=ALL_OLD", v))
+                .transpose()?,
+        }),
     }
 }
 
@@ -440,12 +450,12 @@ async fn dispatch_slow_path(
         }
     };
 
-    let new_item = state
+    let outcome = state
         .backend
         .update_general_rmw_raw(&schema.shape(), &plan.pk, plan.sk.as_ref(), Box::new(apply))
         .await?;
 
-    Ok(json_ok(&build_update_response(plan.return_values, new_item)?))
+    Ok(json_ok(&build_update_response(plan.return_values, outcome)?))
 }
 
 fn json_ok<T: serde::Serialize>(value: &T) -> Response {

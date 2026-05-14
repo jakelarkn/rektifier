@@ -9,6 +9,7 @@ use rekt_server::{router, AppState};
 use rekt_sigv4::{PermissiveVerifier, Verifier};
 use rekt_storage::{
     Backend, BackendError, GeneralUpdateFn, KeyType, KeyValue, TableShape, UpdateDecision,
+    UpdateOutcome,
 };
 use rekt_translator::{evaluate_condition, TableSchema};
 use serde_json::{json, Value};
@@ -106,12 +107,17 @@ impl Backend for MockBackend {
     async fn update_simple_raw(
         &self,
         shape: &TableShape<'_>,
+        _pk: &KeyValue,
+        _sk: Option<&KeyValue>,
         insert_item: &serde_json::Value,
         sets: &[(&str, &serde_json::Value)],
         removes: &[&str],
-    ) -> Result<serde_json::Value, BackendError> {
+    ) -> Result<UpdateOutcome, BackendError> {
         // Derive pk/sk from insert_item (the key attrs are guaranteed
-        // present there by the translator).
+        // present there by the translator). The explicit `_pk`/`_sk`
+        // params match the new trait shape (PgBackend needs them for
+        // the prev-CTE WHERE) but the mock just reads from insert_item
+        // since it doesn't need a separate key-by-column lookup.
         let pk_value = insert_item
             .get(shape.pk_col)
             .and_then(extract_key_string)
@@ -136,9 +142,11 @@ impl Backend for MockBackend {
         let key = (shape.table.to_string(), pk_value, sk_value);
         let mut store = self.store.lock().unwrap();
 
+        let old_item = store.get(&key).cloned();
+
         // Upsert: start from existing row if present, else from insert_item;
         // apply SETs and REMOVEs over the chosen base.
-        let mut new_item = match store.get(&key) {
+        let mut new_item = match &old_item {
             Some(existing) => existing.clone(),
             None => insert_item.clone(),
         };
@@ -153,7 +161,7 @@ impl Backend for MockBackend {
         }
 
         store.insert(key, new_item.clone());
-        Ok(new_item)
+        Ok(UpdateOutcome { new_item, old_item })
     }
 
     async fn update_with_simple_condition_raw(
@@ -164,7 +172,7 @@ impl Backend for MockBackend {
         sets: &[(&str, &serde_json::Value)],
         removes: &[&str],
         condition: &Condition,
-    ) -> Result<serde_json::Value, BackendError> {
+    ) -> Result<UpdateOutcome, BackendError> {
         let pk_value = kv_to_string(pk);
         let sk_value = sk.map(kv_to_string).unwrap_or_default();
         let key = (shape.table.to_string(), pk_value, sk_value);
@@ -183,6 +191,8 @@ impl Backend for MockBackend {
             return Err(BackendError::ConditionalCheckFailed);
         }
 
+        let old_item = Some(item.clone());
+
         // Apply SETs + REMOVEs over the existing item.
         let mut new_item = item;
         let obj = new_item
@@ -195,7 +205,7 @@ impl Backend for MockBackend {
             obj.remove(*name);
         }
         store.insert(key, new_item.clone());
-        Ok(new_item)
+        Ok(UpdateOutcome { new_item, old_item })
     }
 
     async fn update_general_rmw_raw(
@@ -204,7 +214,7 @@ impl Backend for MockBackend {
         pk: &KeyValue,
         sk: Option<&KeyValue>,
         apply: GeneralUpdateFn<'_>,
-    ) -> Result<serde_json::Value, BackendError> {
+    ) -> Result<UpdateOutcome, BackendError> {
         // Mock equivalent of the PgBackend RMW loop. No actual locking;
         // the Mutex serializes access so the retry-on-race case doesn't
         // arise here.
@@ -220,7 +230,10 @@ impl Backend for MockBackend {
             UpdateDecision::Fail => Err(BackendError::ConditionalCheckFailed),
             UpdateDecision::Apply(new_item) => {
                 store.insert(key, new_item.clone());
-                Ok(new_item)
+                Ok(UpdateOutcome {
+                    new_item,
+                    old_item: existing,
+                })
             }
         }
     }
@@ -229,7 +242,7 @@ impl Backend for MockBackend {
         &self,
         shape: &TableShape<'_>,
         insert_item: &serde_json::Value,
-    ) -> Result<serde_json::Value, BackendError> {
+    ) -> Result<UpdateOutcome, BackendError> {
         // Same key derivation as put_item_raw / update_simple_raw.
         let pk_value = insert_item
             .get(shape.pk_col)
@@ -258,7 +271,10 @@ impl Backend for MockBackend {
             return Err(BackendError::ConditionalCheckFailed);
         }
         store.insert(key, insert_item.clone());
-        Ok(insert_item.clone())
+        Ok(UpdateOutcome {
+            new_item: insert_item.clone(),
+            old_item: None,
+        })
     }
 }
 
@@ -1084,8 +1100,8 @@ async fn update_insert_only_composite_key() {
 
 #[tokio::test]
 async fn update_reject_unsupported_return_values() {
-    // ALL_OLD / UPDATED_OLD / UPDATED_NEW remain Phase 7b/7c. Pick one
-    // here to keep the divergence honest at the dispatch boundary.
+    // UPDATED_OLD / UPDATED_NEW remain Phase 7c. Pick one here to keep
+    // the divergence honest at the dispatch boundary.
     let app = app();
     let resp = app
         .oneshot(ddb_request(
@@ -1095,7 +1111,7 @@ async fn update_reject_unsupported_return_values() {
                 "Key":{"id":{"S":"u1"}},
                 "UpdateExpression":"SET label = :n",
                 "ExpressionAttributeValues":{":n":{"S":"alice"}},
-                "ReturnValues":"ALL_OLD",
+                "ReturnValues":"UPDATED_NEW",
             }),
         ))
         .await
@@ -1342,6 +1358,158 @@ async fn update_accepts_reserved_name_when_aliased() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn update_return_values_all_old_on_insert_omits_attributes() {
+    // No prior row → the upsert created it. ALL_OLD has nothing to
+    // return; the response must omit `Attributes` entirely.
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u-fresh"}},
+                "UpdateExpression":"SET #l = :n",
+                "ExpressionAttributeNames":{"#l":"label"},
+                "ExpressionAttributeValues":{":n":{"S":"alice"}},
+                "ReturnValues":"ALL_OLD",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(body.get("Attributes").is_none());
+}
+
+#[tokio::test]
+async fn update_return_values_all_old_on_update_returns_pre_image() {
+    // Prior row exists → ALL_OLD must return the pre-update state.
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"label":{"S":"old"},"role":{"S":"admin"}}}),
+        ))
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET #l = :n",
+                "ExpressionAttributeNames":{"#l":"label"},
+                "ExpressionAttributeValues":{":n":{"S":"new"}},
+                "ReturnValues":"ALL_OLD",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let attrs = body
+        .get("Attributes")
+        .expect("ALL_OLD on existing row must populate Attributes");
+    // The pre-update state, not the post-update state.
+    assert_eq!(attrs.get("label").unwrap(), &json!({"S":"old"}));
+    assert_eq!(attrs.get("role").unwrap(), &json!({"S":"admin"}));
+}
+
+#[tokio::test]
+async fn update_return_values_all_old_insert_only_omits_attributes() {
+    // InsertOnlyOnPk succeeds iff the row was absent. ALL_OLD therefore
+    // omits Attributes by definition.
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u-fresh-2"}},
+                "UpdateExpression":"SET #l = :n",
+                "ConditionExpression":"attribute_not_exists(id)",
+                "ExpressionAttributeNames":{"#l":"label"},
+                "ExpressionAttributeValues":{":n":{"S":"bob"}},
+                "ReturnValues":"ALL_OLD",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(body.get("Attributes").is_none());
+}
+
+#[tokio::test]
+async fn update_return_values_all_old_sql_cond_returns_pre_image() {
+    // SimpleSql path — optimistic-lock pattern. ALL_OLD must reflect
+    // the row state before the update.
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"version":{"N":"1"}}}),
+        ))
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET version = :new",
+                "ConditionExpression":"version = :old",
+                "ExpressionAttributeValues":{":new":{"N":"2"},":old":{"N":"1"}},
+                "ReturnValues":"ALL_OLD",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let attrs = body.get("Attributes").unwrap();
+    assert_eq!(attrs.get("version").unwrap(), &json!({"N":"1"}));
+}
+
+#[tokio::test]
+async fn update_return_values_all_old_tx_returns_pre_image() {
+    // Slow (tx) path. ALL_OLD must come from the SELECT FOR UPDATE
+    // snapshot, not the post-write state.
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"origin":{"S":"hello"}}}),
+        ))
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET replica = #s",
+                "ExpressionAttributeNames":{"#s":"origin"},
+                "ReturnValues":"ALL_OLD",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let attrs = body.get("Attributes").unwrap();
+    assert_eq!(attrs.get("origin").unwrap(), &json!({"S":"hello"}));
+    // `replica` was added in this UPDATE; ALL_OLD must NOT include it.
+    assert!(attrs.get("replica").is_none());
 }
 
 #[tokio::test]

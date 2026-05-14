@@ -100,12 +100,14 @@ pub struct UpdateItemPlan {
 }
 
 /// Subset of DDB's `ReturnValues` enum that the dispatcher currently
-/// understands. Phase 7a lands `AllNew`; 7b/7c will extend.
+/// understands. Phase 7a landed `AllNew`; 7b adds `AllOld`. 7c will
+/// extend with the projected `UPDATED_*` variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReturnValuesMode {
     #[default]
     None,
     AllNew,
+    AllOld,
 }
 
 #[derive(Debug, Clone)]
@@ -259,11 +261,11 @@ pub enum TranslateError {
     )]
     UnsupportedConditionNestedPath { path: String },
 
-    /// Phase 7a accepts `NONE` (default, empty response) and `ALL_NEW`
-    /// (full post-update item). `ALL_OLD` / `UPDATED_OLD` / `UPDATED_NEW`
-    /// are deferred to Phase 7b/7c.
+    /// Phase 7a/7b accepts `NONE`, `ALL_NEW`, and `ALL_OLD`. The
+    /// `UPDATED_OLD` / `UPDATED_NEW` projected variants are deferred
+    /// to Phase 7c.
     #[error(
-        "only `ReturnValues=NONE` and `ALL_NEW` are supported in this phase (got `{got}`) — Phase 7b will add `ALL_OLD`; 7c adds `UPDATED_*`"
+        "only `ReturnValues=NONE`, `ALL_NEW`, and `ALL_OLD` are supported in this phase (got `{got}`) — Phase 7c will add `UPDATED_*`"
     )]
     UnsupportedReturnValues { got: String },
 }
@@ -318,11 +320,12 @@ pub fn translate_update_item(
     req: &UpdateItemRequest,
     schema: &TableSchema,
 ) -> Result<UpdateItemPlan, TranslateError> {
-    // 1. Resolve ReturnValues. NONE (default / absent) and ALL_NEW are
-    //    supported; the remaining DDB variants are Phase 7b/7c.
+    // 1. Resolve ReturnValues. NONE (default / absent), ALL_NEW, and
+    //    ALL_OLD are supported; UPDATED_OLD / UPDATED_NEW are Phase 7c.
     let return_values = match req.return_values.as_deref() {
         None | Some("NONE") => ReturnValuesMode::None,
         Some("ALL_NEW") => ReturnValuesMode::AllNew,
+        Some("ALL_OLD") => ReturnValuesMode::AllOld,
         Some(other) => {
             return Err(TranslateError::UnsupportedReturnValues {
                 got: other.to_string(),
@@ -1974,7 +1977,7 @@ mod tests {
     }
 
     #[test]
-    fn upd_reject_return_values_all_old() {
+    fn upd_accept_return_values_all_old() {
         let mut req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
@@ -1983,10 +1986,8 @@ mod tests {
             &[],
         );
         req.return_values = Some("ALL_OLD".into());
-        let err = translate_update_item(&req, &schema_hash_s()).unwrap_err();
-        assert!(
-            matches!(err, TranslateError::UnsupportedReturnValues { ref got } if got == "ALL_OLD")
-        );
+        let plan = translate_update_item(&req, &schema_hash_s()).unwrap();
+        assert_eq!(plan.return_values, ReturnValuesMode::AllOld);
     }
 
     #[test]

@@ -1657,6 +1657,130 @@ fn diff_update_return_values_all_new_add_numeric() {
     );
 }
 
+// ---- Phase 7b: ReturnValues=ALL_OLD --------------------------------------
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_all_old_on_insert_omits_attributes() {
+    // No prior row → both endpoints must omit `Attributes`.
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_rvao_ins"}}"##,
+        None,
+        &[
+            "--update-expression", "SET #l = :v",
+            "--expression-attribute-names", r##"{"#l":"label"}"##,
+            "--expression-attribute-values", r##"{":v":{"S":"alice"}}"##,
+            "--return-values", "ALL_OLD",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_all_old_on_update_returns_pre_image() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_rvao_upd"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_rvao_upd"},"label":{"S":"old"},"role":{"S":"admin"}}"##),
+        &[
+            "--update-expression", "SET #l = :v",
+            "--expression-attribute-names", r##"{"#l":"label"}"##,
+            "--expression-attribute-values", r##"{":v":{"S":"new"}}"##,
+            "--return-values", "ALL_OLD",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_all_old_with_remove() {
+    // ALL_OLD must include the attribute that this UPDATE removed.
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_rvao_rm"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_rvao_rm"},"a":{"S":"keep"},"b":{"S":"drop_target"}}"##),
+        &[
+            "--update-expression", "REMOVE b",
+            "--return-values", "ALL_OLD",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_all_old_insert_only_path() {
+    // InsertOnlyOnPk succeeds only when row is absent → ALL_OLD has
+    // nothing to return.
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_rvao_ionly"}}"##,
+        None,
+        &[
+            "--update-expression", "SET #l = :v",
+            "--condition-expression", "attribute_not_exists(id)",
+            "--expression-attribute-names", r##"{"#l":"label"}"##,
+            "--expression-attribute-values", r##"{":v":{"S":"bob"}}"##,
+            "--return-values", "ALL_OLD",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_all_old_sql_cond_path() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_rvao_sql"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_rvao_sql"},"version":{"N":"1"}}"##),
+        &[
+            "--update-expression", "SET version = :new",
+            "--condition-expression", "version = :old",
+            "--expression-attribute-values", r##"{":new":{"N":"2"},":old":{"N":"1"}}"##,
+            "--return-values", "ALL_OLD",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_all_old_tx_path() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_rvao_tx"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_rvao_tx"},"origin":{"S":"hello"}}"##),
+        &[
+            "--update-expression", "SET #dst = #src",
+            "--expression-attribute-names", r##"{"#src":"origin","#dst":"replica"}"##,
+            "--return-values", "ALL_OLD",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_all_old_add_numeric() {
+    // ADD :n on the tx path; ALL_OLD must reflect the pre-increment value.
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_rvao_add"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_rvao_add"},"counter":{"N":"10"}}"##),
+        &[
+            "--update-expression", "ADD #c :n",
+            "--expression-attribute-names", r##"{"#c":"counter"}"##,
+            "--expression-attribute-values", r##"{":n":{"N":"5"}}"##,
+            "--return-values", "ALL_OLD",
+        ],
+    );
+}
+
 // ---- Reserved-word rejection parity (edge cases) -------------------------
 //
 // These verify both endpoints reject bare reserved-word attribute names
