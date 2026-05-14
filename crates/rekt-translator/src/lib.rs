@@ -99,15 +99,49 @@ pub struct UpdateItemPlan {
     pub return_values: ReturnValuesMode,
 }
 
-/// Subset of DDB's `ReturnValues` enum that the dispatcher currently
-/// understands. Phase 7a landed `AllNew`; 7b adds `AllOld`. 7c will
-/// extend with the projected `UPDATED_*` variants.
+/// DDB's `ReturnValues` enum, fully supported. `None` (default) returns
+/// an empty body; `AllNew`/`AllOld` return the full post-/pre-update
+/// item; `UpdatedNew`/`UpdatedOld` return the same restricted to the
+/// top-level attributes the UpdateExpression touched (computed by
+/// [`touched_paths`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReturnValuesMode {
     #[default]
     None,
     AllNew,
     AllOld,
+    UpdatedNew,
+    UpdatedOld,
+}
+
+/// Top-level attribute names the UpdateExpression touches: union of
+/// SET targets, REMOVE paths, ADD targets, DELETE targets. Used by
+/// the dispatcher to project `UpdateOutcome` for `UPDATED_*`
+/// `ReturnValues` modes. Top-level only — Phase 8 nested-path lift
+/// will need to extend this to track the deepest projected ancestor.
+pub fn touched_paths(expr: &UpdateExpression) -> std::collections::BTreeSet<String> {
+    let mut paths = std::collections::BTreeSet::new();
+    for c in &expr.set {
+        if let Some(n) = c.path.top_name() {
+            paths.insert(n.to_string());
+        }
+    }
+    for p in &expr.remove {
+        if let Some(n) = p.top_name() {
+            paths.insert(n.to_string());
+        }
+    }
+    for a in &expr.add {
+        if let Some(n) = a.path.top_name() {
+            paths.insert(n.to_string());
+        }
+    }
+    for d in &expr.delete {
+        if let Some(n) = d.path.top_name() {
+            paths.insert(n.to_string());
+        }
+    }
+    paths
 }
 
 #[derive(Debug, Clone)]
@@ -261,12 +295,10 @@ pub enum TranslateError {
     )]
     UnsupportedConditionNestedPath { path: String },
 
-    /// Phase 7a/7b accepts `NONE`, `ALL_NEW`, and `ALL_OLD`. The
-    /// `UPDATED_OLD` / `UPDATED_NEW` projected variants are deferred
-    /// to Phase 7c.
-    #[error(
-        "only `ReturnValues=NONE`, `ALL_NEW`, and `ALL_OLD` are supported in this phase (got `{got}`) — Phase 7c will add `UPDATED_*`"
-    )]
+    /// All five DDB `ReturnValues` variants (`NONE`, `ALL_NEW`,
+    /// `ALL_OLD`, `UPDATED_NEW`, `UPDATED_OLD`) are accepted as of
+    /// Phase 7c; this variant remains for any future unknown string.
+    #[error("unknown `ReturnValues` value: `{got}`")]
     UnsupportedReturnValues { got: String },
 }
 
@@ -320,12 +352,13 @@ pub fn translate_update_item(
     req: &UpdateItemRequest,
     schema: &TableSchema,
 ) -> Result<UpdateItemPlan, TranslateError> {
-    // 1. Resolve ReturnValues. NONE (default / absent), ALL_NEW, and
-    //    ALL_OLD are supported; UPDATED_OLD / UPDATED_NEW are Phase 7c.
+    // 1. Resolve ReturnValues. All five DDB variants are supported.
     let return_values = match req.return_values.as_deref() {
         None | Some("NONE") => ReturnValuesMode::None,
         Some("ALL_NEW") => ReturnValuesMode::AllNew,
         Some("ALL_OLD") => ReturnValuesMode::AllOld,
+        Some("UPDATED_NEW") => ReturnValuesMode::UpdatedNew,
+        Some("UPDATED_OLD") => ReturnValuesMode::UpdatedOld,
         Some(other) => {
             return Err(TranslateError::UnsupportedReturnValues {
                 got: other.to_string(),
@@ -1991,7 +2024,7 @@ mod tests {
     }
 
     #[test]
-    fn upd_reject_return_values_updated_new() {
+    fn upd_accept_return_values_updated_new() {
         let mut req = upd(
             "users",
             &[("id", AttributeValue::S("u1".into()))],
@@ -2000,9 +2033,62 @@ mod tests {
             &[],
         );
         req.return_values = Some("UPDATED_NEW".into());
+        let plan = translate_update_item(&req, &schema_hash_s()).unwrap();
+        assert_eq!(plan.return_values, ReturnValuesMode::UpdatedNew);
+    }
+
+    #[test]
+    fn upd_accept_return_values_updated_old() {
+        let mut req = upd(
+            "users",
+            &[("id", AttributeValue::S("u1".into()))],
+            "SET flag = :v",
+            &[(":v", AttributeValue::S("active".into()))],
+            &[],
+        );
+        req.return_values = Some("UPDATED_OLD".into());
+        let plan = translate_update_item(&req, &schema_hash_s()).unwrap();
+        assert_eq!(plan.return_values, ReturnValuesMode::UpdatedOld);
+    }
+
+    #[test]
+    fn upd_reject_return_values_bogus_value() {
+        let mut req = upd(
+            "users",
+            &[("id", AttributeValue::S("u1".into()))],
+            "SET flag = :v",
+            &[(":v", AttributeValue::S("active".into()))],
+            &[],
+        );
+        req.return_values = Some("BOGUS".into());
         let err = translate_update_item(&req, &schema_hash_s()).unwrap_err();
         assert!(
-            matches!(err, TranslateError::UnsupportedReturnValues { ref got } if got == "UPDATED_NEW")
+            matches!(err, TranslateError::UnsupportedReturnValues { ref got } if got == "BOGUS")
+        );
+    }
+
+    #[test]
+    fn touched_paths_unions_all_clauses() {
+        // SET a, REMOVE b, ADD c, DELETE d → {a, b, c, d}.
+        let req = upd(
+            "users",
+            &[("id", AttributeValue::S("u1".into()))],
+            "SET a = :v REMOVE b ADD c :n DELETE d :s",
+            &[
+                (":v", AttributeValue::S("x".into())),
+                (":n", AttributeValue::N("1".into())),
+                (":s", AttributeValue::Ss(vec!["e".into()])),
+            ],
+            &[],
+        );
+        let plan = translate_update_item(&req, &schema_hash_s()).unwrap();
+        let paths = touched_paths(&plan.expression);
+        assert_eq!(
+            paths,
+            ["a", "b", "c", "d"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
         );
     }
 

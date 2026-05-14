@@ -1100,8 +1100,8 @@ async fn update_insert_only_composite_key() {
 
 #[tokio::test]
 async fn update_reject_unsupported_return_values() {
-    // UPDATED_OLD / UPDATED_NEW remain Phase 7c. Pick one here to keep
-    // the divergence honest at the dispatch boundary.
+    // All five DDB-defined variants are accepted as of Phase 7c. An
+    // unrecognized string still produces ValidationException.
     let app = app();
     let resp = app
         .oneshot(ddb_request(
@@ -1111,7 +1111,7 @@ async fn update_reject_unsupported_return_values() {
                 "Key":{"id":{"S":"u1"}},
                 "UpdateExpression":"SET label = :n",
                 "ExpressionAttributeValues":{":n":{"S":"alice"}},
-                "ReturnValues":"UPDATED_NEW",
+                "ReturnValues":"BOGUS",
             }),
         ))
         .await
@@ -1510,6 +1510,191 @@ async fn update_return_values_all_old_tx_returns_pre_image() {
     assert_eq!(attrs.get("origin").unwrap(), &json!({"S":"hello"}));
     // `replica` was added in this UPDATE; ALL_OLD must NOT include it.
     assert!(attrs.get("replica").is_none());
+}
+
+#[tokio::test]
+async fn update_return_values_updated_new_projects_touched() {
+    // SET touches `label`. UPDATED_NEW must contain ONLY `label`,
+    // not other attributes the row had before.
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"label":{"S":"old"},"role":{"S":"admin"}}}),
+        ))
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET #l = :n",
+                "ExpressionAttributeNames":{"#l":"label"},
+                "ExpressionAttributeValues":{":n":{"S":"new"}},
+                "ReturnValues":"UPDATED_NEW",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let attrs = body.get("Attributes").unwrap();
+    assert_eq!(attrs.get("label").unwrap(), &json!({"S":"new"}));
+    assert!(attrs.get("role").is_none(), "role wasn't touched");
+    assert!(attrs.get("id").is_none(), "id wasn't touched");
+}
+
+#[tokio::test]
+async fn update_return_values_updated_old_projects_touched_pre_image() {
+    // UPDATED_OLD on a SET must return the pre-update value of the
+    // touched attribute only.
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"label":{"S":"old"},"role":{"S":"admin"}}}),
+        ))
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET #l = :n",
+                "ExpressionAttributeNames":{"#l":"label"},
+                "ExpressionAttributeValues":{":n":{"S":"new"}},
+                "ReturnValues":"UPDATED_OLD",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let attrs = body.get("Attributes").unwrap();
+    assert_eq!(attrs.get("label").unwrap(), &json!({"S":"old"}));
+    assert!(attrs.get("role").is_none());
+}
+
+#[tokio::test]
+async fn update_return_values_updated_old_on_fresh_insert_omits_attributes() {
+    // No pre-update row → UPDATED_OLD has nothing to project.
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u-fresh-uo"}},
+                "UpdateExpression":"SET #l = :n",
+                "ExpressionAttributeNames":{"#l":"label"},
+                "ExpressionAttributeValues":{":n":{"S":"alice"}},
+                "ReturnValues":"UPDATED_OLD",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(body.get("Attributes").is_none());
+}
+
+#[tokio::test]
+async fn update_return_values_updated_new_on_remove_omits_removed_attr() {
+    // REMOVE touches `b`. UPDATED_NEW projects post-update item → `b`
+    // is gone → projection is empty → Attributes omitted.
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"a":{"S":"keep"},"b":{"S":"drop_target"}}}),
+        ))
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"REMOVE b",
+                "ReturnValues":"UPDATED_NEW",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(body.get("Attributes").is_none());
+}
+
+#[tokio::test]
+async fn update_return_values_updated_old_on_remove_returns_pre_value() {
+    // REMOVE touches `b`. UPDATED_OLD projects pre-update item → `b`
+    // existed → return its old value.
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"a":{"S":"keep"},"b":{"S":"drop_target"}}}),
+        ))
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"REMOVE b",
+                "ReturnValues":"UPDATED_OLD",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let attrs = body.get("Attributes").unwrap();
+    assert_eq!(attrs.get("b").unwrap(), &json!({"S":"drop_target"}));
+    assert!(attrs.get("a").is_none());
+}
+
+#[tokio::test]
+async fn update_return_values_updated_new_on_add_numeric() {
+    // ADD :n on tx path. UPDATED_NEW returns the incremented value.
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"},"tally":{"N":"10"}}}),
+        ))
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"ADD tally :n",
+                "ExpressionAttributeValues":{":n":{"N":"5"}},
+                "ReturnValues":"UPDATED_NEW",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let attrs = body.get("Attributes").unwrap();
+    assert_eq!(attrs.get("tally").unwrap(), &json!({"N":"15"}));
 }
 
 #[tokio::test]

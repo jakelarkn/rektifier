@@ -1781,6 +1781,130 @@ fn diff_update_return_values_all_old_add_numeric() {
     );
 }
 
+// ---- Phase 7c: ReturnValues=UPDATED_NEW / UPDATED_OLD --------------------
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_updated_new_set() {
+    // UPDATED_NEW must contain only the touched attribute, with its
+    // post-update value.
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_un_set"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_un_set"},"label":{"S":"old"},"role":{"S":"admin"}}"##),
+        &[
+            "--update-expression", "SET #l = :v",
+            "--expression-attribute-names", r##"{"#l":"label"}"##,
+            "--expression-attribute-values", r##"{":v":{"S":"new"}}"##,
+            "--return-values", "UPDATED_NEW",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_updated_old_set() {
+    // UPDATED_OLD must contain only the touched attribute, with its
+    // pre-update value.
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_uo_set"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_uo_set"},"label":{"S":"old"},"role":{"S":"admin"}}"##),
+        &[
+            "--update-expression", "SET #l = :v",
+            "--expression-attribute-names", r##"{"#l":"label"}"##,
+            "--expression-attribute-values", r##"{":v":{"S":"new"}}"##,
+            "--return-values", "UPDATED_OLD",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_updated_new_on_remove_omits_attrs() {
+    // REMOVE → touched attr no longer exists → UPDATED_NEW omits
+    // Attributes (or projection is empty — both endpoints should agree).
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_un_rm"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_un_rm"},"a":{"S":"keep"},"b":{"S":"drop_target"}}"##),
+        &[
+            "--update-expression", "REMOVE b",
+            "--return-values", "UPDATED_NEW",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_updated_old_on_remove_returns_pre_value() {
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_uo_rm"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_uo_rm"},"a":{"S":"keep"},"b":{"S":"drop_target"}}"##),
+        &[
+            "--update-expression", "REMOVE b",
+            "--return-values", "UPDATED_OLD",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_updated_old_on_fresh_insert_omits_attributes() {
+    // No prior row → UPDATED_OLD has nothing.
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_uo_fresh"}}"##,
+        None,
+        &[
+            "--update-expression", "SET #l = :v",
+            "--expression-attribute-names", r##"{"#l":"label"}"##,
+            "--expression-attribute-values", r##"{":v":{"S":"alice"}}"##,
+            "--return-values", "UPDATED_OLD",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_updated_new_add_numeric() {
+    // ADD :n on tx path → UPDATED_NEW returns incremented value only.
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_un_add"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_un_add"},"tally":{"N":"10"},"other":{"S":"untouched"}}"##),
+        &[
+            "--update-expression", "ADD tally :n",
+            "--expression-attribute-values", r##"{":n":{"N":"5"}}"##,
+            "--return-values", "UPDATED_NEW",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_update_return_values_updated_new_mixed_set_and_remove() {
+    // Two touched paths — verifies the projection includes both.
+    ensure_users_table();
+    assert_update_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_upd_un_mix"}}"##,
+        Some(r##"{"id":{"S":"diff_upd_un_mix"},"a":{"S":"old_a"},"b":{"S":"drop_target"},"c":{"S":"untouched"}}"##),
+        &[
+            "--update-expression", "SET a = :v REMOVE b",
+            "--expression-attribute-values", r##"{":v":{"S":"new_a"}}"##,
+            "--return-values", "UPDATED_NEW",
+        ],
+    );
+}
+
 // ---- Reserved-word rejection parity (edge cases) -------------------------
 //
 // These verify both endpoints reject bare reserved-word attribute names

@@ -34,9 +34,9 @@ use rekt_sigv4::{SigV4Error, Verifier};
 use rekt_storage::{Backend, BackendError, UpdateDecision, UpdateOutcome};
 use rekt_translator::{
     apply_update_expression, evaluate_condition, materialize_insert_only_update,
-    materialize_simple_sql_update, materialize_simple_update, translate_delete_item,
-    translate_get_item, translate_put_item, translate_update_item, ConditionRouting,
-    ReturnValuesMode, TableSchema, TranslateError,
+    materialize_simple_sql_update, materialize_simple_update, touched_paths,
+    translate_delete_item, translate_get_item, translate_put_item, translate_update_item,
+    ConditionRouting, ReturnValuesMode, TableSchema, TranslateError,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -387,16 +387,22 @@ async fn handle_update_item(state: &AppState, body: &Bytes) -> Result<Response, 
         ),
     };
 
-    Ok(json_ok(&build_update_response(plan.return_values, outcome)?))
+    let paths = touched_paths(&plan.expression);
+    Ok(json_ok(&build_update_response(
+        plan.return_values,
+        outcome,
+        &paths,
+    )?))
 }
 
-/// Shape the UpdateItem response according to `ReturnValues`. Phase 7a
-/// supports `ALL_NEW` (post-update item); 7b adds `ALL_OLD` (pre-update
-/// item, or absent `Attributes` if the call inserted a new row). 7c
-/// will add the projected `UPDATED_*` variants on top.
+/// Shape the UpdateItem response according to `ReturnValues`. Supports
+/// all five DDB variants. The `touched` set is consulted only for the
+/// `UPDATED_*` projected modes — caller can pass an empty set when the
+/// mode doesn't need it.
 fn build_update_response(
     mode: ReturnValuesMode,
     outcome: UpdateOutcome,
+    touched: &std::collections::BTreeSet<String>,
 ) -> Result<UpdateItemResponse, ApiError> {
     let to_item = |label: &'static str, v: serde_json::Value| -> Result<Item, ApiError> {
         serde_json::from_value(v).map_err(|e| {
@@ -418,7 +424,56 @@ fn build_update_response(
                 .map(|v| to_item("ReturnValues=ALL_OLD", v))
                 .transpose()?,
         }),
+        ReturnValuesMode::UpdatedNew => Ok(UpdateItemResponse {
+            attributes: project_attributes(
+                "ReturnValues=UPDATED_NEW",
+                Some(outcome.new_item),
+                touched,
+            )?,
+        }),
+        ReturnValuesMode::UpdatedOld => Ok(UpdateItemResponse {
+            attributes: project_attributes(
+                "ReturnValues=UPDATED_OLD",
+                outcome.old_item,
+                touched,
+            )?,
+        }),
     }
+}
+
+/// Restrict `source` (a stored DDB-JSON item or `None`) to the
+/// `touched` top-level attribute set. Returns `None` (so the response
+/// omits `Attributes`) when the source is `None` OR when none of the
+/// touched attributes are present — matches DDB's behavior on a
+/// REMOVE-only UpdateExpression's `UPDATED_NEW` (the removed attrs no
+/// longer exist) and a fresh-insert's `UPDATED_OLD`.
+fn project_attributes(
+    label: &'static str,
+    source: Option<serde_json::Value>,
+    touched: &std::collections::BTreeSet<String>,
+) -> Result<Option<Item>, ApiError> {
+    let Some(v) = source else { return Ok(None) };
+    let obj = match v {
+        serde_json::Value::Object(o) => o,
+        // Stored values are always JSON objects in this codebase.
+        other => {
+            return Err(ApiError::Internal(format!(
+                "{label}: stored value is not a JSON object (got {other:?})"
+            )));
+        }
+    };
+    let mut projected = serde_json::Map::new();
+    for name in touched {
+        if let Some(val) = obj.get(name) {
+            projected.insert(name.clone(), val.clone());
+        }
+    }
+    if projected.is_empty() {
+        return Ok(None);
+    }
+    let item: Item = serde_json::from_value(serde_json::Value::Object(projected))
+        .map_err(|e| ApiError::Internal(format!("{label}: projection decode failed: {e}")))?;
+    Ok(Some(item))
 }
 
 /// Slow-path orchestration (Phase 3b): builds a closure that, given the
@@ -455,7 +510,12 @@ async fn dispatch_slow_path(
         .update_general_rmw_raw(&schema.shape(), &plan.pk, plan.sk.as_ref(), Box::new(apply))
         .await?;
 
-    Ok(json_ok(&build_update_response(plan.return_values, outcome)?))
+    let paths = touched_paths(&plan.expression);
+    Ok(json_ok(&build_update_response(
+        plan.return_values,
+        outcome,
+        &paths,
+    )?))
 }
 
 fn json_ok<T: serde::Serialize>(value: &T) -> Response {
