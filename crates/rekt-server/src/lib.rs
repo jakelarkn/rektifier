@@ -28,15 +28,15 @@ use axum::Router;
 use bytes::Bytes;
 use rekt_protocol::{
     DeleteItemRequest, DeleteItemResponse, GetItemRequest, GetItemResponse, Item, PutItemRequest,
-    PutItemResponse, UpdateItemRequest, UpdateItemResponse,
+    PutItemResponse, QueryRequest, QueryResponse, UpdateItemRequest, UpdateItemResponse,
 };
 use rekt_sigv4::{SigV4Error, Verifier};
 use rekt_storage::{Backend, BackendError, UpdateDecision, UpdateOutcome};
 use rekt_translator::{
     apply_update_expression, evaluate_condition, materialize_insert_only_update,
     materialize_simple_sql_update, materialize_simple_update, touched_paths,
-    translate_delete_item, translate_get_item, translate_put_item, translate_update_item,
-    ConditionRouting, ReturnValuesMode, TableSchema, TranslateError,
+    translate_delete_item, translate_get_item, translate_put_item, translate_query,
+    translate_update_item, ConditionRouting, ReturnValuesMode, TableSchema, TranslateError,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -224,6 +224,7 @@ async fn dispatch(State(state): State<AppState>, req: Request) -> Result<Respons
         "GetItem" => handle_get_item(&state, &body).await,
         "DeleteItem" => handle_delete_item(&state, &body).await,
         "UpdateItem" => handle_update_item(&state, &body).await,
+        "Query" => handle_query(&state, &body).await,
         _ => Err(ApiError::UnknownOperation(format!(
             "operation `{op}` not implemented"
         ))),
@@ -241,13 +242,65 @@ async fn handle_put_item(state: &AppState, body: &Bytes) -> Result<Response, Api
     })?;
 
     let plan = translate_put_item(&req, schema)?;
-    state
-        .backend
-        .put_item_raw(&schema.shape(), &plan.item_json)
-        .await?;
+    let shape = schema.shape();
 
-    let resp = PutItemResponse::default();
-    Ok(json_ok(&resp))
+    // Conditional + unconditional both come back through the same
+    // "(pre-image, item)" surface; the only branch is which backend
+    // method we call. The slow path is fine for now — a fast-path
+    // optimization for `attribute_not_exists(pk)` mirroring
+    // `update_insert_only_raw` could come later behind benchmark
+    // numbers.
+    let old_item = match plan.condition.as_ref() {
+        None => {
+            state
+                .backend
+                .put_item_raw(&shape, &plan.pk, plan.sk.as_ref(), &plan.item_json)
+                .await?
+        }
+        Some(cond_plan) => {
+            let cond = cond_plan.condition.clone();
+            let eval: rekt_storage::ConditionEvalFn<'_> =
+                Box::new(move |existing| evaluate_condition(existing, &cond));
+            state
+                .backend
+                .put_with_condition_raw(
+                    &shape,
+                    &plan.pk,
+                    plan.sk.as_ref(),
+                    &plan.item_json,
+                    eval,
+                )
+                .await?
+        }
+    };
+
+    let attributes = put_delete_attributes(plan.return_values, old_item)?;
+    Ok(json_ok(&PutItemResponse { attributes }))
+}
+
+/// Project the backend-returned pre-image into the `Attributes` field
+/// per `ReturnValues`. Returns `None` for `ReturnValuesMode::None` and
+/// for `ALL_OLD` when no row existed. The other `ReturnValuesMode`
+/// variants are UpdateItem-only and rejected at translate time, so
+/// reaching them here is a translator/dispatcher drift bug.
+fn put_delete_attributes(
+    mode: ReturnValuesMode,
+    old_item: Option<serde_json::Value>,
+) -> Result<Option<Item>, ApiError> {
+    match mode {
+        ReturnValuesMode::None => Ok(None),
+        ReturnValuesMode::AllOld => match old_item {
+            None => Ok(None),
+            Some(v) => Ok(Some(serde_json::from_value(v).map_err(|e| {
+                ApiError::Internal(format!("stored item is not valid DynamoDB-JSON: {e}"))
+            })?)),
+        },
+        ReturnValuesMode::AllNew | ReturnValuesMode::UpdatedNew | ReturnValuesMode::UpdatedOld => {
+            Err(ApiError::Internal(format!(
+                "unreachable ReturnValues variant for Put/Delete: {mode:?}"
+            )))
+        }
+    }
 }
 
 #[tracing::instrument(level = "debug", skip_all, name = "server.get_item", fields(table = tracing::field::Empty))]
@@ -288,13 +341,28 @@ async fn handle_delete_item(state: &AppState, body: &Bytes) -> Result<Response, 
     })?;
 
     let plan = translate_delete_item(&req, schema)?;
-    state
-        .backend
-        .delete_item_raw(&schema.shape(), &plan.pk, plan.sk.as_ref())
-        .await?;
+    let shape = schema.shape();
 
-    let resp = DeleteItemResponse::default();
-    Ok(json_ok(&resp))
+    let old_item = match plan.condition.as_ref() {
+        None => {
+            state
+                .backend
+                .delete_item_raw(&shape, &plan.pk, plan.sk.as_ref())
+                .await?
+        }
+        Some(cond_plan) => {
+            let cond = cond_plan.condition.clone();
+            let eval: rekt_storage::ConditionEvalFn<'_> =
+                Box::new(move |existing| evaluate_condition(existing, &cond));
+            state
+                .backend
+                .delete_with_condition_raw(&shape, &plan.pk, plan.sk.as_ref(), eval)
+                .await?
+        }
+    };
+
+    let attributes = put_delete_attributes(plan.return_values, old_item)?;
+    Ok(json_ok(&DeleteItemResponse { attributes }))
 }
 
 #[tracing::instrument(level = "debug", skip_all, name = "server.update_item", fields(table = tracing::field::Empty))]
@@ -393,6 +461,56 @@ async fn handle_update_item(state: &AppState, body: &Bytes) -> Result<Response, 
         outcome,
         &paths,
     )?))
+}
+
+#[tracing::instrument(
+    level = "debug",
+    skip_all,
+    name = "server.query",
+    fields(table = tracing::field::Empty, consistent_read = tracing::field::Empty)
+)]
+async fn handle_query(state: &AppState, body: &Bytes) -> Result<Response, ApiError> {
+    let req: QueryRequest = serde_json::from_slice(body)
+        .map_err(|e| ApiError::Serialization(format!("invalid Query body: {e}")))?;
+    tracing::Span::current().record("table", req.table_name.as_str());
+    // ConsistentRead is silently honored — PG's snapshot isolation is
+    // already at least as strong as DDB's strongly-consistent mode for
+    // single-statement reads. Surface the flag in tracing so parallel-
+    // deployment debugging can see it landed; see COMPATIBILITY_NOTES.md.
+    if let Some(cr) = req.consistent_read {
+        tracing::Span::current().record("consistent_read", cr);
+    }
+
+    let schema = state.schemas.get(&req.table_name).ok_or_else(|| {
+        ApiError::ResourceNotFound(format!("Table not found: {}", req.table_name))
+    })?;
+
+    let plan = translate_query(&req, schema)?;
+    let outcome = state
+        .backend
+        .query_raw(
+            &schema.shape(),
+            &plan.pk,
+            plan.sk_condition.as_ref(),
+            None,
+        )
+        .await?;
+
+    let items: Vec<Item> = outcome
+        .items
+        .into_iter()
+        .map(|v| {
+            serde_json::from_value::<Item>(v).map_err(|e| {
+                ApiError::Internal(format!("stored item is not valid DynamoDB-JSON: {e}"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(json_ok(&QueryResponse {
+        items,
+        count: outcome.count,
+        scanned_count: outcome.scanned_count,
+    }))
 }
 
 /// Shape the UpdateItem response according to `ReturnValues`. Supports

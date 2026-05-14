@@ -8,8 +8,8 @@ use rekt_expressions::Condition;
 use rekt_server::{router, AppState};
 use rekt_sigv4::{PermissiveVerifier, Verifier};
 use rekt_storage::{
-    Backend, BackendError, GeneralUpdateFn, KeyType, KeyValue, TableShape, UpdateDecision,
-    UpdateOutcome,
+    Backend, BackendError, ConditionEvalFn, GeneralUpdateFn, KeyType, KeyValue, QueryOutcome,
+    SkCondition, TableShape, UpdateDecision, UpdateOutcome,
 };
 use rekt_translator::{evaluate_condition, TableSchema};
 use serde_json::{json, Value};
@@ -34,42 +34,75 @@ fn kv_to_string(kv: &KeyValue) -> String {
     }
 }
 
+/// Evaluate an `SkCondition` against a row's SK as stored in the mock
+/// (a `kv_to_string`-encoded value), with comparison semantics chosen
+/// by the table's SK type.
+fn sk_predicate(cond: &SkCondition, sk: &str, sk_type: KeyType) -> bool {
+    use std::cmp::Ordering;
+    let cmp = |target: &str| compare_sk_strings(sk, target, sk_type);
+    match cond {
+        SkCondition::Eq(v) => cmp(&kv_to_string(v)) == Ordering::Equal,
+        SkCondition::Lt(v) => cmp(&kv_to_string(v)) == Ordering::Less,
+        SkCondition::Le(v) => !matches!(cmp(&kv_to_string(v)), Ordering::Greater),
+        SkCondition::Gt(v) => cmp(&kv_to_string(v)) == Ordering::Greater,
+        SkCondition::Ge(v) => !matches!(cmp(&kv_to_string(v)), Ordering::Less),
+        SkCondition::Between(lo, hi) => {
+            !matches!(cmp(&kv_to_string(lo)), Ordering::Less)
+                && !matches!(cmp(&kv_to_string(hi)), Ordering::Greater)
+        }
+        SkCondition::BeginsWithS(prefix) => sk.starts_with(prefix.as_str()),
+    }
+}
+
+/// Ordering for two `kv_to_string`-encoded SKs. N keys compare as
+/// numerics (f64 — same precision caveat as the slow-path eval);
+/// S / B compare lexically.
+fn compare_sk_strings(a: &str, b: &str, sk_type: KeyType) -> std::cmp::Ordering {
+    match sk_type {
+        KeyType::N => {
+            let av = a.parse::<f64>().unwrap_or(0.0);
+            let bv = b.parse::<f64>().unwrap_or(0.0);
+            av.partial_cmp(&bv).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        KeyType::S | KeyType::B => a.cmp(b),
+    }
+}
+
 #[async_trait]
 impl Backend for MockBackend {
     async fn put_item_raw(
         &self,
         shape: &TableShape<'_>,
+        pk: &KeyValue,
+        sk: Option<&KeyValue>,
         item: &serde_json::Value,
-    ) -> Result<(), BackendError> {
-        // The mock doesn't actually evaluate the generated-column expressions.
-        // Production code does this in PG; for tests we cheat: look at the
-        // item's DDB-JSON shape to derive pk/sk values, since by convention
-        // pk_attr/sk_attr in the shape match attribute names.
-        let pk_value = item
-            .get(shape.pk_col)
-            .and_then(extract_key_string)
-            .ok_or_else(|| {
-                BackendError::Other(format!(
-                    "mock backend: item missing pk attribute `{}`",
-                    shape.pk_col
-                ))
-            })?;
-        let sk_value = match shape.sk_col {
-            Some(sk_col) => item
-                .get(sk_col)
-                .and_then(extract_key_string)
-                .ok_or_else(|| {
-                    BackendError::Other(format!(
-                        "mock backend: item missing sk attribute `{sk_col}`"
-                    ))
-                })?,
-            None => String::new(),
-        };
-        self.store
-            .lock()
-            .unwrap()
-            .insert((shape.table.to_string(), pk_value, sk_value), item.clone());
-        Ok(())
+    ) -> Result<Option<serde_json::Value>, BackendError> {
+        let pk_value = kv_to_string(pk);
+        let sk_value = sk.map(kv_to_string).unwrap_or_default();
+        let key = (shape.table.to_string(), pk_value, sk_value);
+        let mut store = self.store.lock().unwrap();
+        let old = store.insert(key, item.clone());
+        Ok(old)
+    }
+
+    async fn put_with_condition_raw(
+        &self,
+        shape: &TableShape<'_>,
+        pk: &KeyValue,
+        sk: Option<&KeyValue>,
+        item: &serde_json::Value,
+        condition: ConditionEvalFn<'_>,
+    ) -> Result<Option<serde_json::Value>, BackendError> {
+        let pk_value = kv_to_string(pk);
+        let sk_value = sk.map(kv_to_string).unwrap_or_default();
+        let key = (shape.table.to_string(), pk_value, sk_value);
+        let mut store = self.store.lock().unwrap();
+        let existing = store.get(&key).cloned();
+        if !condition(existing.as_ref()) {
+            return Err(BackendError::ConditionalCheckFailed);
+        }
+        store.insert(key, item.clone());
+        Ok(existing)
     }
 
     async fn get_item_raw(
@@ -93,15 +126,37 @@ impl Backend for MockBackend {
         shape: &TableShape<'_>,
         pk: &KeyValue,
         sk: Option<&KeyValue>,
-    ) -> Result<(), BackendError> {
+    ) -> Result<Option<serde_json::Value>, BackendError> {
         let pk_value = kv_to_string(pk);
         let sk_value = sk.map(kv_to_string).unwrap_or_default();
-        self.store
+        let old = self
+            .store
             .lock()
             .unwrap()
             .remove(&(shape.table.to_string(), pk_value, sk_value));
         // DDB DeleteItem is idempotent — Ok regardless of whether the row existed.
-        Ok(())
+        Ok(old)
+    }
+
+    async fn delete_with_condition_raw(
+        &self,
+        shape: &TableShape<'_>,
+        pk: &KeyValue,
+        sk: Option<&KeyValue>,
+        condition: ConditionEvalFn<'_>,
+    ) -> Result<Option<serde_json::Value>, BackendError> {
+        let pk_value = kv_to_string(pk);
+        let sk_value = sk.map(kv_to_string).unwrap_or_default();
+        let key = (shape.table.to_string(), pk_value, sk_value);
+        let mut store = self.store.lock().unwrap();
+        let existing = store.get(&key).cloned();
+        if !condition(existing.as_ref()) {
+            return Err(BackendError::ConditionalCheckFailed);
+        }
+        if existing.is_some() {
+            store.remove(&key);
+        }
+        Ok(existing)
     }
 
     async fn update_simple_raw(
@@ -238,6 +293,54 @@ impl Backend for MockBackend {
         }
     }
 
+    async fn query_raw(
+        &self,
+        shape: &TableShape<'_>,
+        pk: &KeyValue,
+        sk_condition: Option<&SkCondition>,
+        limit: Option<u32>,
+    ) -> Result<QueryOutcome, BackendError> {
+        let pk_value = kv_to_string(pk);
+        let store = self.store.lock().unwrap();
+
+        // Collect (sk_string, item) for every row in the partition,
+        // filtered by the SK predicate. The mock's keyspace is a flat
+        // HashMap, so we scan it and select rows whose (table, pk)
+        // matches.
+        let mut hits: Vec<(String, serde_json::Value)> = store
+            .iter()
+            .filter(|((t, p, _sk), _)| t == shape.table && p == &pk_value)
+            .filter(|((_, _, sk), _)| match (sk_condition, shape.sk_type) {
+                (None, _) => true,
+                (Some(cond), Some(sk_type)) => sk_predicate(cond, sk, sk_type),
+                // sk_condition Some on a hash-only table is rejected at
+                // the storage boundary; we shouldn't see it here.
+                (Some(_), None) => false,
+            })
+            .map(|((_, _, sk), v)| (sk.clone(), v.clone()))
+            .collect();
+
+        // Sort by SK in ascending order. Numeric comparison for N keys,
+        // lexical for S/B. The mock has no B-SK tests today.
+        if let Some(sk_type) = shape.sk_type {
+            hits.sort_by(|a, b| compare_sk_strings(&a.0, &b.0, sk_type));
+        }
+
+        let lim = limit.unwrap_or(1000) as usize;
+        if hits.len() > lim {
+            hits.truncate(lim);
+        }
+
+        let items: Vec<serde_json::Value> = hits.into_iter().map(|(_, v)| v).collect();
+        let n = items.len() as u32;
+        Ok(QueryOutcome {
+            items,
+            count: n,
+            scanned_count: n,
+            last_evaluated_key: None,
+        })
+    }
+
     async fn update_insert_only_raw(
         &self,
         shape: &TableShape<'_>,
@@ -311,9 +414,19 @@ fn schemas() -> HashMap<String, TableSchema> {
         sk_type: Some(KeyType::N),
         jsonb_col: "doc".into(),
     };
+    let messages = TableSchema {
+        name: "messages".into(),
+        pg_table: "messages".into(),
+        pk_attr: "thread".into(),
+        pk_type: KeyType::S,
+        sk_attr: Some("ts".into()),
+        sk_type: Some(KeyType::S),
+        jsonb_col: "data".into(),
+    };
     let mut m = HashMap::new();
     m.insert(users.name.clone(), users);
     m.insert(events.name.clone(), events);
+    m.insert(messages.name.clone(), messages);
     m
 }
 
@@ -622,6 +735,291 @@ async fn delete_with_extra_key_attr_is_validation_error() {
         .oneshot(ddb_request(
             "DeleteItem",
             json!({"TableName":"users","Key":{"id":{"S":"u1"},"extra":{"S":"x"}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let ty = body.get("__type").and_then(Value::as_str).unwrap();
+    assert!(ty.ends_with("#ValidationException"), "got: {ty}");
+}
+
+// ===== Conditional PutItem / DeleteItem + ReturnValues=ALL_OLD ================
+
+#[tokio::test]
+async fn put_attribute_not_exists_succeeds_on_missing_row() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({
+                "TableName":"users",
+                "Item":{"id":{"S":"new1"},"label":{"S":"alice"}},
+                "ConditionExpression":"attribute_not_exists(id)",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await, json!({}));
+}
+
+#[tokio::test]
+async fn put_attribute_not_exists_fails_when_row_exists() {
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"dup1"}}}),
+        ))
+        .await
+        .unwrap();
+    let resp = app
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({
+                "TableName":"users",
+                "Item":{"id":{"S":"dup1"},"label":{"S":"new"}},
+                "ConditionExpression":"attribute_not_exists(id)",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let ty = body.get("__type").and_then(Value::as_str).unwrap();
+    assert!(ty.ends_with("#ConditionalCheckFailedException"), "got: {ty}");
+}
+
+#[tokio::test]
+async fn put_simple_sql_condition_optimistic_lock() {
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"lock1"},"version":{"N":"1"}}}),
+        ))
+        .await
+        .unwrap();
+    // Matching version → success.
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({
+                "TableName":"users",
+                "Item":{"id":{"S":"lock1"},"version":{"N":"2"}},
+                "ConditionExpression":"version = :v",
+                "ExpressionAttributeValues":{":v":{"N":"1"}},
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Stale version → CCFE.
+    let resp = app
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({
+                "TableName":"users",
+                "Item":{"id":{"S":"lock1"},"version":{"N":"3"}},
+                "ConditionExpression":"version = :stale",
+                "ExpressionAttributeValues":{":stale":{"N":"1"}},
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let ty = body.get("__type").and_then(Value::as_str).unwrap();
+    assert!(ty.ends_with("#ConditionalCheckFailedException"), "got: {ty}");
+}
+
+#[tokio::test]
+async fn put_all_old_on_insert_omits_attributes() {
+    // Fresh key → no pre-image → Attributes omitted, even with ALL_OLD.
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({
+                "TableName":"users",
+                "Item":{"id":{"S":"fresh-put-old"},"label":{"S":"x"}},
+                "ReturnValues":"ALL_OLD",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(body.get("Attributes").is_none(), "got: {body}");
+}
+
+#[tokio::test]
+async fn put_all_old_on_overwrite_returns_pre_image() {
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"ow1"},"label":{"S":"v1"}}}),
+        ))
+        .await
+        .unwrap();
+    let resp = app
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({
+                "TableName":"users",
+                "Item":{"id":{"S":"ow1"},"label":{"S":"v2"}},
+                "ReturnValues":"ALL_OLD",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let attrs = body.get("Attributes").expect("ALL_OLD on overwrite returns Attributes");
+    assert_eq!(attrs.get("label").unwrap(), &json!({"S":"v1"}));
+}
+
+#[tokio::test]
+async fn put_rejects_unsupported_return_values_all_new() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({
+                "TableName":"users",
+                "Item":{"id":{"S":"u1"}},
+                "ReturnValues":"ALL_NEW",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let ty = body.get("__type").and_then(Value::as_str).unwrap();
+    assert!(ty.ends_with("#ValidationException"), "got: {ty}");
+}
+
+#[tokio::test]
+async fn delete_with_attribute_exists_fails_when_row_missing() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "DeleteItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"never"}},
+                "ConditionExpression":"attribute_exists(id)",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let ty = body.get("__type").and_then(Value::as_str).unwrap();
+    assert!(ty.ends_with("#ConditionalCheckFailedException"), "got: {ty}");
+}
+
+#[tokio::test]
+async fn delete_simple_sql_condition_optimistic_lock() {
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"dlock1"},"version":{"N":"5"}}}),
+        ))
+        .await
+        .unwrap();
+    // Stale → CCFE.
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "DeleteItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"dlock1"}},
+                "ConditionExpression":"version = :stale",
+                "ExpressionAttributeValues":{":stale":{"N":"1"}},
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // Matching → success.
+    let resp = app
+        .oneshot(ddb_request(
+            "DeleteItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"dlock1"}},
+                "ConditionExpression":"version = :v",
+                "ExpressionAttributeValues":{":v":{"N":"5"}},
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn delete_all_old_on_missing_omits_attributes() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "DeleteItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"never-d"}},
+                "ReturnValues":"ALL_OLD",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(body.get("Attributes").is_none(), "got: {body}");
+}
+
+#[tokio::test]
+async fn delete_all_old_returns_deleted_item() {
+    let app = app();
+    app.clone()
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"todel"},"label":{"S":"alice"}}}),
+        ))
+        .await
+        .unwrap();
+    let resp = app
+        .oneshot(ddb_request(
+            "DeleteItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"todel"}},
+                "ReturnValues":"ALL_OLD",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let attrs = body.get("Attributes").expect("ALL_OLD on existing returns Attributes");
+    assert_eq!(attrs.get("label").unwrap(), &json!({"S":"alice"}));
+}
+
+#[tokio::test]
+async fn delete_rejects_updated_new_return_values() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "DeleteItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "ReturnValues":"UPDATED_NEW",
+            }),
         ))
         .await
         .unwrap();
@@ -2440,4 +2838,346 @@ async fn bad_json_is_serialization_error() {
     let body = body_json(resp).await;
     let ty = body.get("__type").and_then(Value::as_str).unwrap();
     assert!(ty.ends_with("#SerializationException"));
+}
+
+// ===== Query (Q1) =============================================================
+
+/// Helper: PutItem against the mock so subsequent Query has data.
+async fn put_item(app: &axum::Router, table: &str, item: Value) {
+    let body = json!({"TableName": table, "Item": item});
+    let resp = app
+        .clone()
+        .oneshot(ddb_request("PutItem", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn query_pk_only_returns_full_partition() {
+    let app = app();
+    // Seed 3 rows in the same partition, plus one in another partition.
+    for ts in ["1000", "2000", "3000"] {
+        put_item(
+            &app,
+            "device_events",
+            json!({"device_id":{"S":"q-dev-1"},"ts":{"N":ts},"val":{"N":ts}}),
+        )
+        .await;
+    }
+    put_item(
+        &app,
+        "device_events",
+        json!({"device_id":{"S":"q-dev-other"},"ts":{"N":"500"},"val":{"N":"0"}}),
+    )
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName": "device_events",
+                "KeyConditionExpression": "device_id = :pk",
+                "ExpressionAttributeValues": {":pk":{"S":"q-dev-1"}}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["Count"], 3);
+    assert_eq!(body["ScannedCount"], 3);
+    let items = body["Items"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    // Items must be ordered by SK ascending.
+    let ts_seq: Vec<&str> = items
+        .iter()
+        .map(|i| i["ts"]["N"].as_str().unwrap())
+        .collect();
+    assert_eq!(ts_seq, vec!["1000", "2000", "3000"]);
+}
+
+#[tokio::test]
+async fn query_empty_partition() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName": "device_events",
+                "KeyConditionExpression": "device_id = :pk",
+                "ExpressionAttributeValues": {":pk":{"S":"q-empty"}}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["Count"], 0);
+    assert_eq!(body["Items"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn query_sk_range_inclusive_and_exclusive() {
+    let app = app();
+    for ts in ["100", "200", "300", "400", "500"] {
+        put_item(
+            &app,
+            "device_events",
+            json!({"device_id":{"S":"q-range-1"},"ts":{"N":ts},"val":{"S":"x"}}),
+        )
+        .await;
+    }
+
+    // ts >= 200 AND ts < 500: matches 200, 300, 400.
+    // KCE only allows one SK term, so split into two separate Query calls
+    // and intersect mentally. Here we just test sk >= 200.
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName": "device_events",
+                "KeyConditionExpression": "device_id = :pk AND ts >= :lo",
+                "ExpressionAttributeValues": {
+                    ":pk":{"S":"q-range-1"},
+                    ":lo":{"N":"200"}
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let ts_seq: Vec<&str> = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["ts"]["N"].as_str().unwrap())
+        .collect();
+    assert_eq!(ts_seq, vec!["200", "300", "400", "500"]);
+}
+
+#[tokio::test]
+async fn query_sk_between() {
+    let app = app();
+    for ts in ["100", "200", "300", "400", "500"] {
+        put_item(
+            &app,
+            "device_events",
+            json!({"device_id":{"S":"q-btw-1"},"ts":{"N":ts},"val":{"S":"x"}}),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName": "device_events",
+                "KeyConditionExpression": "device_id = :pk AND ts BETWEEN :lo AND :hi",
+                "ExpressionAttributeValues": {
+                    ":pk":{"S":"q-btw-1"},
+                    ":lo":{"N":"200"},
+                    ":hi":{"N":"400"}
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let ts_seq: Vec<&str> = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["ts"]["N"].as_str().unwrap())
+        .collect();
+    assert_eq!(ts_seq, vec!["200", "300", "400"]);
+}
+
+#[tokio::test]
+async fn query_sk_begins_with_string() {
+    let app = app();
+    for ts in ["2026-01-01", "2026-01-02", "2026-02-01", "2027-01-01"] {
+        put_item(
+            &app,
+            "messages",
+            json!({"thread":{"S":"t-1"},"ts":{"S":ts},"body":{"S":ts}}),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName": "messages",
+                "KeyConditionExpression": "thread = :pk AND begins_with(ts, :pfx)",
+                "ExpressionAttributeValues": {
+                    ":pk":{"S":"t-1"},
+                    ":pfx":{"S":"2026-01"}
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let ts_seq: Vec<&str> = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["ts"]["S"].as_str().unwrap())
+        .collect();
+    assert_eq!(ts_seq, vec!["2026-01-01", "2026-01-02"]);
+}
+
+#[tokio::test]
+async fn query_pk_eq_and_sk_eq() {
+    let app = app();
+    for ts in ["10", "20", "30"] {
+        put_item(
+            &app,
+            "device_events",
+            json!({"device_id":{"S":"q-eq"},"ts":{"N":ts},"val":{"S":ts}}),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName": "device_events",
+                "KeyConditionExpression": "device_id = :pk AND ts = :ts",
+                "ExpressionAttributeValues": {
+                    ":pk":{"S":"q-eq"},
+                    ":ts":{"N":"20"}
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["Count"], 1);
+    assert_eq!(body["Items"][0]["ts"]["N"], "20");
+}
+
+#[tokio::test]
+async fn query_missing_pk_returns_validation_exception() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName": "device_events",
+                "KeyConditionExpression": "ts = :ts",
+                "ExpressionAttributeValues": {":ts":{"N":"1"}}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let ty = body.get("__type").and_then(Value::as_str).unwrap();
+    assert!(ty.ends_with("#ValidationException"));
+}
+
+#[tokio::test]
+async fn query_or_returns_validation_exception() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName": "users",
+                "KeyConditionExpression": "id = :a OR id = :b",
+                "ExpressionAttributeValues": {
+                    ":a":{"S":"u1"},":b":{"S":"u2"}
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body
+        .get("__type")
+        .and_then(Value::as_str)
+        .unwrap()
+        .ends_with("#ValidationException"));
+}
+
+#[tokio::test]
+async fn query_unknown_table_returns_resource_not_found() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName": "nope",
+                "KeyConditionExpression": "id = :v",
+                "ExpressionAttributeValues": {":v":{"S":"u1"}}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body
+        .get("__type")
+        .and_then(Value::as_str)
+        .unwrap()
+        .ends_with("#ResourceNotFoundException"));
+}
+
+#[tokio::test]
+async fn query_consistent_read_silently_honored() {
+    let app = app();
+    put_item(
+        &app,
+        "users",
+        json!({"id":{"S":"q-cr-1"},"label":{"S":"alice"}}),
+    )
+    .await;
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName": "users",
+                "KeyConditionExpression": "id = :pk",
+                "ExpressionAttributeValues": {":pk":{"S":"q-cr-1"}},
+                "ConsistentRead": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["Count"], 1);
+}
+
+#[tokio::test]
+async fn query_placeholders_substitute() {
+    let app = app();
+    put_item(
+        &app,
+        "messages",
+        json!({"thread":{"S":"q-ph-1"},"ts":{"S":"2026-01-01"},"body":{"S":"x"}}),
+    )
+    .await;
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName": "messages",
+                "KeyConditionExpression": "#t = :pk AND begins_with(#r, :pfx)",
+                "ExpressionAttributeNames": {"#t":"thread","#r":"ts"},
+                "ExpressionAttributeValues": {
+                    ":pk":{"S":"q-ph-1"},
+                    ":pfx":{"S":"2026"}
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["Count"], 1);
 }

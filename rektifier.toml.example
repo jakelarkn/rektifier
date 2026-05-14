@@ -30,9 +30,33 @@ sk_attr   = "ts"
 sk_type   = "N"
 jsonb_col = "doc"
 
-# Hash-only B-PK example.
-# [[tables]]
-# name      = "blobs"
-# pk_attr   = "hash"
-# pk_type   = "B"
-# jsonb_col = "meta"
+# Hash-only N-PK. Used by diff tests for parity across key shapes.
+[[tables]]
+name      = "counters"
+pk_attr   = "id"
+pk_type   = "N"
+jsonb_col = "data"
+
+# Hash-only B-PK. Used by diff tests for parity across key shapes.
+[[tables]]
+name      = "blobs"
+pk_attr   = "binmark"
+pk_type   = "B"
+jsonb_col = "data"
+
+# Composite S + B sort key. Used by diff tests for parity across key shapes.
+[[tables]]
+name      = "binsorted"
+pk_attr   = "id"
+sk_attr   = "binmark"
+sk_type   = "B"
+jsonb_col = "data"
+
+# Composite S + S. Used by Query parity tests for `begins_with(sk, :v)`
+# and other S-typed sort-key predicates.
+[[tables]]
+name      = "messages"
+pk_attr   = "thread"
+sk_attr   = "ts"
+sk_type   = "S"
+jsonb_col = "data"

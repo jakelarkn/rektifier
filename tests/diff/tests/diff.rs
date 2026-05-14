@@ -248,6 +248,30 @@ fn ensure_device_events_table() {
     );
 }
 
+fn ensure_counters_table() {
+    ensure_ref_table("counters", &[("id", "N")], &[("id", "HASH")]);
+}
+
+fn ensure_blobs_table() {
+    ensure_ref_table("blobs", &[("binmark", "B")], &[("binmark", "HASH")]);
+}
+
+fn ensure_binsorted_table() {
+    ensure_ref_table(
+        "binsorted",
+        &[("id", "S"), ("binmark", "B")],
+        &[("id", "HASH"), ("binmark", "RANGE")],
+    );
+}
+
+fn ensure_messages_table() {
+    ensure_ref_table(
+        "messages",
+        &[("thread", "S"), ("ts", "S")],
+        &[("thread", "HASH"), ("ts", "RANGE")],
+    );
+}
+
 // ===== Test cases =============================================================
 
 #[test]
@@ -1979,5 +2003,607 @@ fn diff_aliased_reserved_name_is_accepted() {
             "--expression-attribute-names", r##"{"#n":"name"}"##,
             "--expression-attribute-values", r##"{":v":{"S":"alice"}}"##,
         ],
+    );
+}
+
+// ===== Conditional PutItem / DeleteItem + ReturnValues=ALL_OLD =================
+
+/// Run `PutItem` on both endpoints with optional seed and arbitrary
+/// flags, compare responses, then GET and compare. Mirrors
+/// `assert_update_round_trip_matches` for Put.
+fn assert_put_round_trip_matches(
+    table: &str,
+    key: &str,
+    seed_item: Option<&str>,
+    item: &str,
+    extra_args: &[&str],
+) {
+    delete_both(table, key);
+    if let Some(s) = seed_item {
+        aws(REF, &["dynamodb", "put-item", "--table-name", table, "--item", s]);
+        aws(OURS, &["dynamodb", "put-item", "--table-name", table, "--item", s]);
+    }
+    let mut args: Vec<&str> = vec![
+        "dynamodb", "put-item", "--table-name", table, "--item", item,
+    ];
+    args.extend_from_slice(extra_args);
+    let put_ref = strip_metadata(aws(REF, &args));
+    let put_ours = strip_metadata(aws(OURS, &args));
+    assert_eq!(
+        put_ref, put_ours,
+        "PutItem responses diverged for {table} / key={key}"
+    );
+    let mut get_ref = aws(
+        REF,
+        &["dynamodb", "get-item", "--table-name", table, "--key", key],
+    );
+    let mut get_ours = aws(
+        OURS,
+        &["dynamodb", "get-item", "--table-name", table, "--key", key],
+    );
+    sort_sets(&mut get_ref);
+    sort_sets(&mut get_ours);
+    assert_eq!(
+        get_ref, get_ours,
+        "GetItem after PutItem diverged for {table} / key={key}"
+    );
+}
+
+/// Run `DeleteItem` on both endpoints. Mirrors the helper above.
+fn assert_delete_round_trip_matches(
+    table: &str,
+    key: &str,
+    seed_item: Option<&str>,
+    extra_args: &[&str],
+) {
+    delete_both(table, key);
+    if let Some(s) = seed_item {
+        aws(REF, &["dynamodb", "put-item", "--table-name", table, "--item", s]);
+        aws(OURS, &["dynamodb", "put-item", "--table-name", table, "--item", s]);
+    }
+    let mut args: Vec<&str> = vec![
+        "dynamodb", "delete-item", "--table-name", table, "--key", key,
+    ];
+    args.extend_from_slice(extra_args);
+    let del_ref = strip_metadata(aws(REF, &args));
+    let del_ours = strip_metadata(aws(OURS, &args));
+    assert_eq!(
+        del_ref, del_ours,
+        "DeleteItem responses diverged for {table} / key={key}"
+    );
+    let mut get_ref = aws(
+        REF,
+        &["dynamodb", "get-item", "--table-name", table, "--key", key],
+    );
+    let mut get_ours = aws(
+        OURS,
+        &["dynamodb", "get-item", "--table-name", table, "--key", key],
+    );
+    sort_sets(&mut get_ref);
+    sort_sets(&mut get_ours);
+    assert_eq!(get_ref, get_ours, "GetItem after DeleteItem diverged");
+}
+
+// ---- Conditional PutItem -----------------------------------------------------
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_put_attribute_not_exists_succeeds_on_missing() {
+    ensure_users_table();
+    assert_put_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_put_ane_ok"}}"##,
+        None,
+        r##"{"id":{"S":"diff_put_ane_ok"},"label":{"S":"alice"}}"##,
+        &["--condition-expression", "attribute_not_exists(id)"],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_put_attribute_not_exists_fails_when_row_exists() {
+    ensure_users_table();
+    let key = r##"{"id":{"S":"diff_put_ane_dup"}}"##;
+    delete_both("users", key);
+    let seed = r##"{"id":{"S":"diff_put_ane_dup"}}"##;
+    aws(REF, &["dynamodb", "put-item", "--table-name", "users", "--item", seed]);
+    aws(OURS, &["dynamodb", "put-item", "--table-name", "users", "--item", seed]);
+    let args = [
+        "dynamodb", "put-item",
+        "--table-name", "users",
+        "--item", r##"{"id":{"S":"diff_put_ane_dup"},"label":{"S":"new"}}"##,
+        "--condition-expression", "attribute_not_exists(id)",
+    ];
+    let ref_err = run_for_error(REF, &args);
+    let ours_err = run_for_error(OURS, &args);
+    assert!(ref_err.contains("ConditionalCheckFailedException"));
+    assert!(ours_err.contains("ConditionalCheckFailedException"));
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_put_optimistic_lock_matched() {
+    ensure_users_table();
+    assert_put_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_put_oplock"}}"##,
+        Some(r##"{"id":{"S":"diff_put_oplock"},"version":{"N":"1"}}"##),
+        r##"{"id":{"S":"diff_put_oplock"},"version":{"N":"2"}}"##,
+        &[
+            "--condition-expression", "version = :v",
+            "--expression-attribute-values", r##"{":v":{"N":"1"}}"##,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_put_optimistic_lock_stale_is_ccfe() {
+    ensure_users_table();
+    let key = r##"{"id":{"S":"diff_put_oplock_stale"}}"##;
+    delete_both("users", key);
+    let seed = r##"{"id":{"S":"diff_put_oplock_stale"},"version":{"N":"5"}}"##;
+    aws(REF, &["dynamodb", "put-item", "--table-name", "users", "--item", seed]);
+    aws(OURS, &["dynamodb", "put-item", "--table-name", "users", "--item", seed]);
+    let args = [
+        "dynamodb", "put-item",
+        "--table-name", "users",
+        "--item", r##"{"id":{"S":"diff_put_oplock_stale"},"version":{"N":"6"}}"##,
+        "--condition-expression", "version = :v",
+        "--expression-attribute-values", r##"{":v":{"N":"1"}}"##,
+    ];
+    let ref_err = run_for_error(REF, &args);
+    let ours_err = run_for_error(OURS, &args);
+    assert!(ref_err.contains("ConditionalCheckFailedException"));
+    assert!(ours_err.contains("ConditionalCheckFailedException"));
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_put_all_old_on_overwrite_returns_pre_image() {
+    ensure_users_table();
+    assert_put_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_put_rvao_ow"}}"##,
+        Some(r##"{"id":{"S":"diff_put_rvao_ow"},"label":{"S":"v1"},"role":{"S":"admin"}}"##),
+        r##"{"id":{"S":"diff_put_rvao_ow"},"label":{"S":"v2"}}"##,
+        &["--return-values", "ALL_OLD"],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_put_all_old_on_insert_omits_attributes() {
+    ensure_users_table();
+    assert_put_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_put_rvao_fresh"}}"##,
+        None,
+        r##"{"id":{"S":"diff_put_rvao_fresh"},"label":{"S":"x"}}"##,
+        &["--return-values", "ALL_OLD"],
+    );
+}
+
+// ---- Conditional DeleteItem --------------------------------------------------
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_delete_attribute_exists_succeeds_when_present() {
+    ensure_users_table();
+    assert_delete_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_del_ae_ok"}}"##,
+        Some(r##"{"id":{"S":"diff_del_ae_ok"},"label":{"S":"x"}}"##),
+        &["--condition-expression", "attribute_exists(id)"],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_delete_attribute_exists_fails_when_row_missing() {
+    ensure_users_table();
+    let key = r##"{"id":{"S":"diff_del_ae_missing"}}"##;
+    delete_both("users", key);
+    let args = [
+        "dynamodb", "delete-item",
+        "--table-name", "users",
+        "--key", key,
+        "--condition-expression", "attribute_exists(id)",
+    ];
+    let ref_err = run_for_error(REF, &args);
+    let ours_err = run_for_error(OURS, &args);
+    assert!(ref_err.contains("ConditionalCheckFailedException"));
+    assert!(ours_err.contains("ConditionalCheckFailedException"));
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_delete_optimistic_lock_matched() {
+    ensure_users_table();
+    assert_delete_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_del_oplock"}}"##,
+        Some(r##"{"id":{"S":"diff_del_oplock"},"version":{"N":"3"}}"##),
+        &[
+            "--condition-expression", "version = :v",
+            "--expression-attribute-values", r##"{":v":{"N":"3"}}"##,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_delete_all_old_returns_deleted_item() {
+    ensure_users_table();
+    assert_delete_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_del_rvao"}}"##,
+        Some(r##"{"id":{"S":"diff_del_rvao"},"label":{"S":"alice"},"role":{"S":"admin"}}"##),
+        &["--return-values", "ALL_OLD"],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_delete_all_old_on_missing_omits_attributes() {
+    ensure_users_table();
+    assert_delete_round_trip_matches(
+        "users",
+        r##"{"id":{"S":"diff_del_rvao_missing"}}"##,
+        None,
+        &["--return-values", "ALL_OLD"],
+    );
+}
+
+// ===== Key-shape parity (N-PK, B-PK, S+B composite) ============================
+//
+// These tables let the diff layer cover what the PG-layer tests already
+// did but the diff layer didn't: non-string partition keys, binary
+// partition keys, and binary sort keys. The body of each test is
+// intentionally small — the goal is parity-across-impls for the key
+// machinery, not feature coverage that's already exercised against the
+// `users` / `device_events` tables.
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_n_pk_round_trip() {
+    ensure_counters_table();
+    assert_round_trip_matches(
+        "counters",
+        r#"{"id":{"N":"42"},"tally":{"N":"7"},"label":{"S":"a"}}"#,
+        r#"{"id":{"N":"42"}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_n_pk_update_increment() {
+    ensure_counters_table();
+    assert_update_round_trip_matches(
+        "counters",
+        r#"{"id":{"N":"100"}}"#,
+        Some(r#"{"id":{"N":"100"},"tally":{"N":"5"}}"#),
+        &[
+            "--update-expression", "ADD tally :n",
+            "--expression-attribute-values", r##"{":n":{"N":"3"}}"##,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_n_pk_conditional_delete_all_old() {
+    ensure_counters_table();
+    assert_delete_round_trip_matches(
+        "counters",
+        r#"{"id":{"N":"200"}}"#,
+        Some(r#"{"id":{"N":"200"},"label":{"S":"gone"}}"#),
+        &[
+            "--condition-expression", "attribute_exists(id)",
+            "--return-values", "ALL_OLD",
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_b_pk_round_trip() {
+    ensure_blobs_table();
+    assert_round_trip_matches(
+        "blobs",
+        r#"{"binmark":{"B":"AAEC/w=="},"label":{"S":"first"}}"#,
+        r#"{"binmark":{"B":"AAEC/w=="}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_b_pk_update_set() {
+    ensure_blobs_table();
+    assert_update_round_trip_matches(
+        "blobs",
+        r#"{"binmark":{"B":"EREREQ=="}}"#,
+        None,
+        &[
+            "--update-expression", "SET label = :v",
+            "--expression-attribute-values", r##"{":v":{"S":"set-on-b-pk"}}"##,
+        ],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_b_pk_put_all_old_overwrites() {
+    ensure_blobs_table();
+    assert_put_round_trip_matches(
+        "blobs",
+        r#"{"binmark":{"B":"IiIiIg=="}}"#,
+        Some(r#"{"binmark":{"B":"IiIiIg=="},"label":{"S":"v1"}}"#),
+        r#"{"binmark":{"B":"IiIiIg=="},"label":{"S":"v2"}}"#,
+        &["--return-values", "ALL_OLD"],
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_composite_b_sort_round_trip() {
+    ensure_binsorted_table();
+    assert_round_trip_matches(
+        "binsorted",
+        r#"{"id":{"S":"box-1"},"binmark":{"B":"MzM="},"label":{"S":"alpha"}}"#,
+        r#"{"id":{"S":"box-1"},"binmark":{"B":"MzM="}}"#,
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_composite_b_sort_two_keys_in_same_partition() {
+    // Two distinct items sharing the same partition but different B sort
+    // keys must coexist under both endpoints.
+    ensure_binsorted_table();
+    let pk = "shared-1";
+    let k1 = format!(r#"{{"id":{{"S":"{pk}"}},"binmark":{{"B":"AAA="}}}}"#);
+    let k2 = format!(r#"{{"id":{{"S":"{pk}"}},"binmark":{{"B":"AQE="}}}}"#);
+    delete_both("binsorted", &k1);
+    delete_both("binsorted", &k2);
+
+    let i1 = format!(r#"{{"id":{{"S":"{pk}"}},"binmark":{{"B":"AAA="}},"label":{{"S":"first"}}}}"#);
+    let i2 = format!(r#"{{"id":{{"S":"{pk}"}},"binmark":{{"B":"AQE="}},"label":{{"S":"second"}}}}"#);
+    aws(REF, &["dynamodb", "put-item", "--table-name", "binsorted", "--item", &i1]);
+    aws(REF, &["dynamodb", "put-item", "--table-name", "binsorted", "--item", &i2]);
+    aws(OURS, &["dynamodb", "put-item", "--table-name", "binsorted", "--item", &i1]);
+    aws(OURS, &["dynamodb", "put-item", "--table-name", "binsorted", "--item", &i2]);
+
+    for key in [&k1, &k2] {
+        let g_ref = aws(REF, &["dynamodb", "get-item", "--table-name", "binsorted", "--key", key]);
+        let g_ours = aws(OURS, &["dynamodb", "get-item", "--table-name", "binsorted", "--key", key]);
+        assert_eq!(g_ref, g_ours, "GetItem diverged for binsorted/{key}");
+    }
+}
+
+// ===== Query (Q1) =============================================================
+//
+// Differential parity tests for Query. Each test seeds a partition on both
+// endpoints, issues a Query with the same KCE, and asserts the responses
+// match. Sort-set normalization isn't needed since Items here have no
+// SS/NS/BS attributes. We DO sort by SK on the rektifier side already (PG
+// ORDER BY); DDB-local also sorts by sort-key for Query, so list equality
+// holds.
+
+/// Best-effort: delete an item from both endpoints. Allows repeated test
+/// runs to reset state regardless of prior outcomes.
+fn delete_both_composite(table: &str, pk_attr: &str, pk: &str, sk_attr: &str, sk_av: &str) {
+    let key = format!(
+        "{{\"{pk_attr}\":{{\"S\":\"{pk}\"}},\"{sk_attr}\":{sk_av}}}"
+    );
+    delete_both(table, &key);
+}
+
+/// Compact assertion: same KCE against both endpoints, expect identical
+/// `Items`, `Count`, `ScannedCount`. Tests that supply EAV use the
+/// `--expression-attribute-values` flag form via `extra_args`.
+fn assert_query_matches(table: &str, kce: &str, eav: &str, extra: &[&str]) {
+    let mut args: Vec<&str> = vec![
+        "dynamodb",
+        "query",
+        "--table-name",
+        table,
+        "--key-condition-expression",
+        kce,
+        "--expression-attribute-values",
+        eav,
+    ];
+    for a in extra {
+        args.push(a);
+    }
+    let q_ref = aws(REF, &args);
+    let q_ours = aws(OURS, &args);
+    assert_eq!(
+        q_ref["Count"], q_ours["Count"],
+        "Query Count diverged for {table}/{kce}\nref:  {q_ref}\nours: {q_ours}"
+    );
+    assert_eq!(
+        q_ref["ScannedCount"], q_ours["ScannedCount"],
+        "Query ScannedCount diverged for {table}/{kce}"
+    );
+    assert_eq!(
+        q_ref["Items"], q_ours["Items"],
+        "Query Items diverged for {table}/{kce}\nref:  {q_ref}\nours: {q_ours}"
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_pk_only() {
+    ensure_device_events_table();
+    // Use a unique pk so this test is idempotent across re-runs.
+    let pk = "diff-q-pk-only";
+    for ts in ["1000", "2000", "3000"] {
+        let item = format!(
+            "{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"{ts}\"}},\"val\":{{\"N\":\"{ts}\"}}}}"
+        );
+        let _ = aws(
+            REF,
+            &["dynamodb", "put-item", "--table-name", "device_events", "--item", &item],
+        );
+        let _ = aws(
+            OURS,
+            &["dynamodb", "put-item", "--table-name", "device_events", "--item", &item],
+        );
+    }
+    let eav = format!("{{\":pk\":{{\"S\":\"{pk}\"}}}}");
+    assert_query_matches("device_events", "device_id = :pk", &eav, &[]);
+
+    // Cleanup.
+    for ts in ["1000", "2000", "3000"] {
+        delete_both_composite("device_events", "device_id", pk, "ts", &format!("{{\"N\":\"{ts}\"}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_sk_equality() {
+    ensure_device_events_table();
+    let pk = "diff-q-sk-eq";
+    for ts in ["10", "20", "30"] {
+        let item = format!(
+            "{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"{ts}\"}},\"val\":{{\"S\":\"x\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb", "put-item", "--table-name", "device_events", "--item", &item]);
+        let _ = aws(OURS, &["dynamodb", "put-item", "--table-name", "device_events", "--item", &item]);
+    }
+    let eav = format!(
+        "{{\":pk\":{{\"S\":\"{pk}\"}},\":ts\":{{\"N\":\"20\"}}}}"
+    );
+    assert_query_matches("device_events", "device_id = :pk AND ts = :ts", &eav, &[]);
+
+    for ts in ["10", "20", "30"] {
+        delete_both_composite("device_events", "device_id", pk, "ts", &format!("{{\"N\":\"{ts}\"}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_sk_range() {
+    ensure_device_events_table();
+    let pk = "diff-q-sk-range";
+    for ts in ["100", "200", "300", "400", "500"] {
+        let item = format!(
+            "{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"{ts}\"}},\"val\":{{\"S\":\"x\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb", "put-item", "--table-name", "device_events", "--item", &item]);
+        let _ = aws(OURS, &["dynamodb", "put-item", "--table-name", "device_events", "--item", &item]);
+    }
+    let eav = format!(
+        "{{\":pk\":{{\"S\":\"{pk}\"}},\":lo\":{{\"N\":\"200\"}}}}"
+    );
+    assert_query_matches("device_events", "device_id = :pk AND ts >= :lo", &eav, &[]);
+
+    for ts in ["100", "200", "300", "400", "500"] {
+        delete_both_composite("device_events", "device_id", pk, "ts", &format!("{{\"N\":\"{ts}\"}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_sk_between() {
+    ensure_device_events_table();
+    let pk = "diff-q-sk-btw";
+    for ts in ["100", "200", "300", "400", "500"] {
+        let item = format!(
+            "{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"{ts}\"}},\"val\":{{\"S\":\"x\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb", "put-item", "--table-name", "device_events", "--item", &item]);
+        let _ = aws(OURS, &["dynamodb", "put-item", "--table-name", "device_events", "--item", &item]);
+    }
+    let eav = format!(
+        "{{\":pk\":{{\"S\":\"{pk}\"}},\":lo\":{{\"N\":\"200\"}},\":hi\":{{\"N\":\"400\"}}}}"
+    );
+    assert_query_matches(
+        "device_events",
+        "device_id = :pk AND ts BETWEEN :lo AND :hi",
+        &eav,
+        &[],
+    );
+
+    for ts in ["100", "200", "300", "400", "500"] {
+        delete_both_composite("device_events", "device_id", pk, "ts", &format!("{{\"N\":\"{ts}\"}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_sk_begins_with_string() {
+    ensure_messages_table();
+    let pk = "diff-q-bw";
+    for ts in ["2026-01-01", "2026-01-02", "2026-02-01", "2027-01-01"] {
+        let item = format!(
+            "{{\"thread\":{{\"S\":\"{pk}\"}},\"ts\":{{\"S\":\"{ts}\"}},\"body\":{{\"S\":\"x\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb", "put-item", "--table-name", "messages", "--item", &item]);
+        let _ = aws(OURS, &["dynamodb", "put-item", "--table-name", "messages", "--item", &item]);
+    }
+    let eav = format!(
+        "{{\":pk\":{{\"S\":\"{pk}\"}},\":pfx\":{{\"S\":\"2026-01\"}}}}"
+    );
+    assert_query_matches(
+        "messages",
+        "thread = :pk AND begins_with(ts, :pfx)",
+        &eav,
+        &[],
+    );
+
+    for ts in ["2026-01-01", "2026-01-02", "2026-02-01", "2027-01-01"] {
+        delete_both_composite("messages", "thread", pk, "ts", &format!("{{\"S\":\"{ts}\"}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_empty_partition() {
+    ensure_device_events_table();
+    let pk = "diff-q-empty-no-such-partition";
+    let eav = format!("{{\":pk\":{{\"S\":\"{pk}\"}}}}");
+    assert_query_matches("device_events", "device_id = :pk", &eav, &[]);
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_unknown_table_both_reject() {
+    // Both DDB-local and rektifier should reject a query against a
+    // non-existent table — the error class matters more than wording.
+    let stderr_ref = aws_expecting_failure(
+        REF,
+        &[
+            "dynamodb",
+            "query",
+            "--table-name",
+            "nope_no_such_table",
+            "--key-condition-expression",
+            "id = :pk",
+            "--expression-attribute-values",
+            "{\":pk\":{\"S\":\"x\"}}",
+        ],
+    );
+    let stderr_ours = aws_expecting_failure(
+        OURS,
+        &[
+            "dynamodb",
+            "query",
+            "--table-name",
+            "nope_no_such_table",
+            "--key-condition-expression",
+            "id = :pk",
+            "--expression-attribute-values",
+            "{\":pk\":{\"S\":\"x\"}}",
+        ],
+    );
+    assert!(
+        stderr_ref.contains("ResourceNotFoundException") || stderr_ref.contains("not found"),
+        "DDB-local error mention: {stderr_ref}"
+    );
+    assert!(
+        stderr_ours.contains("ResourceNotFoundException") || stderr_ours.contains("not found"),
+        "rektifier error mention: {stderr_ours}"
     );
 }

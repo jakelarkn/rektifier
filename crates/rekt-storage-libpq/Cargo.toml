@@ -19,4 +19,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 rekt-translator = { path = "../rekt-translator" }
+base64 = { workspace = true }
 tokio = { workspace = true }

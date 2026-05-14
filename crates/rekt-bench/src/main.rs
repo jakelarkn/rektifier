@@ -106,6 +106,30 @@ enum Workload {
     Put,
     Get,
     Mixed,
+    /// Unconditional DeleteItem of spread fresh PKs. Idempotent on
+    /// missing rows. Measures the cost of the `DELETE … RETURNING`
+    /// SQL emitted by `delete_item_raw` (regression check after the
+    /// RETURNING change).
+    Delete,
+    /// PutItem with `ConditionExpression: attribute_not_exists(id)` —
+    /// every op uses a fresh PK so the condition is always true.
+    /// Measures the cost of the conditional Put slow path
+    /// (`SELECT FOR UPDATE` → eval → INSERT-on-conflict-do-nothing).
+    PutCondInsertOnly,
+    /// PutItem with `ReturnValues=ALL_OLD` against working-set rows
+    /// — the unconditional CTE-wrapped path with a non-empty
+    /// pre-image to return. Pairs with `Put` to isolate the
+    /// pre-image-capture cost vs the rest of the upsert.
+    PutAllOld,
+    /// DeleteItem with `ConditionExpression: attribute_exists(id)`
+    /// against working-set rows. Once `working_set` ops elapse the
+    /// workload starts hitting missing rows (CCFE) — so run with a
+    /// working set sized for the total ops you expect.
+    DeleteCondExists,
+    /// DeleteItem with `ReturnValues=ALL_OLD` against working-set
+    /// rows. Same caveat about working-set sizing as
+    /// `DeleteCondExists`.
+    DeleteAllOld,
     /// `SET counter = :v` on a working-set row. Routes through the
     /// Phase 3a fast path (single `INSERT…ON CONFLICT DO UPDATE
     /// jsonb_set` statement, no row lock).
@@ -148,9 +172,15 @@ impl Workload {
     /// fresh-PK Update variant.
     fn needs_working_set(self) -> bool {
         match self {
-            Self::Put | Self::UpdateDirectInsertOnly => false,
+            Self::Put
+            | Self::Delete
+            | Self::UpdateDirectInsertOnly
+            | Self::PutCondInsertOnly => false,
             Self::Get
             | Self::Mixed
+            | Self::PutAllOld
+            | Self::DeleteCondExists
+            | Self::DeleteAllOld
             | Self::UpdateDirectSet
             | Self::UpdateDirectCond
             | Self::UpdateTxRmw
@@ -172,6 +202,28 @@ fn parse_dur(s: &str) -> Result<Duration, String> {
 trait Target: Send + Sync {
     async fn put(&self, pk: &str, payload: &Value) -> Result<()>;
     async fn get(&self, pk: &str) -> Result<()>;
+
+    /// Unconditional `DeleteItem`. PG path emits
+    /// `DELETE … WHERE … RETURNING data` so the cost is one
+    /// round-trip plus a `RETURNING` materialization.
+    async fn delete(&self, pk: &str) -> Result<()>;
+
+    /// `PutItem` with `ConditionExpression: attribute_not_exists(id)`.
+    /// Always succeeds (caller passes a fresh PK per op).
+    async fn put_cond_insert_only(&self, pk: &str, payload: &Value) -> Result<()>;
+
+    /// `PutItem` with `ReturnValues=ALL_OLD`. Exercises the
+    /// pre-image CTE in the unconditional path.
+    async fn put_all_old(&self, pk: &str, payload: &Value) -> Result<()>;
+
+    /// `DeleteItem` with `ConditionExpression: attribute_exists(id)`.
+    /// Caller pre-populates the working set; condition is true while
+    /// the row hasn't been deleted yet by a prior worker iteration.
+    async fn delete_cond_exists(&self, pk: &str) -> Result<()>;
+
+    /// `DeleteItem` with `ReturnValues=ALL_OLD`. Returns the deleted
+    /// row (or none if it was already missing).
+    async fn delete_all_old(&self, pk: &str) -> Result<()>;
 
     /// `SET counter = :v` — Phase 3a fast path.
     async fn update_fast_set(&self, pk: &str, value: i64) -> Result<()>;
@@ -225,6 +277,50 @@ impl Target for HttpTarget {
             "Key": {"id": {"S": pk}},
         });
         self.post("DynamoDB_20120810.GetItem", &body).await
+    }
+
+    async fn delete(&self, pk: &str) -> Result<()> {
+        let body = json!({
+            "TableName": self.table,
+            "Key": {"id": {"S": pk}},
+        });
+        self.post("DynamoDB_20120810.DeleteItem", &body).await
+    }
+
+    async fn put_cond_insert_only(&self, pk: &str, payload: &Value) -> Result<()> {
+        let body = json!({
+            "TableName": self.table,
+            "Item": full_item(pk, payload),
+            "ConditionExpression": "attribute_not_exists(id)",
+        });
+        self.post("DynamoDB_20120810.PutItem", &body).await
+    }
+
+    async fn put_all_old(&self, pk: &str, payload: &Value) -> Result<()> {
+        let body = json!({
+            "TableName": self.table,
+            "Item": full_item(pk, payload),
+            "ReturnValues": "ALL_OLD",
+        });
+        self.post("DynamoDB_20120810.PutItem", &body).await
+    }
+
+    async fn delete_cond_exists(&self, pk: &str) -> Result<()> {
+        let body = json!({
+            "TableName": self.table,
+            "Key": {"id": {"S": pk}},
+            "ConditionExpression": "attribute_exists(id)",
+        });
+        self.post("DynamoDB_20120810.DeleteItem", &body).await
+    }
+
+    async fn delete_all_old(&self, pk: &str) -> Result<()> {
+        let body = json!({
+            "TableName": self.table,
+            "Key": {"id": {"S": pk}},
+            "ReturnValues": "ALL_OLD",
+        });
+        self.post("DynamoDB_20120810.DeleteItem", &body).await
     }
 
     async fn update_fast_set(&self, pk: &str, value: i64) -> Result<()> {
@@ -363,20 +459,26 @@ struct PgTarget {
 #[async_trait::async_trait]
 impl Target for PgTarget {
     async fn put(&self, pk: &str, payload: &Value) -> Result<()> {
+        // Mirrors rektifier's CTE-wrapped put_item_raw: pre-image
+        // snapshot then upsert, RETURNING the prior data (which we
+        // discard here — the bench only times the work, not the
+        // surfacing of ALL_OLD).
         let item = full_item(pk, payload);
         let item_value = Value::Object(item.into_iter().collect());
         let client = self.pool.get().await.context("pool get")?;
         let sql = format!(
-            "INSERT INTO \"{0}\" (data) VALUES ($1) \
-             ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data",
+            "WITH prev AS (SELECT data AS old_data FROM \"{0}\" WHERE id = $1) \
+             INSERT INTO \"{0}\" (data) VALUES ($2) \
+             ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data \
+             RETURNING (SELECT old_data FROM prev) AS old_data",
             self.table
         );
         let stmt = client
-            .prepare_typed_cached(&sql, &[Type::JSONB])
+            .prepare_typed_cached(&sql, &[Type::TEXT, Type::JSONB])
             .await
             .context("prepare put")?;
-        client
-            .execute(&stmt, &[&Json(&item_value)])
+        let _row = client
+            .query_one(&stmt, &[&pk, &Json(&item_value)])
             .await
             .context("execute put")?;
         Ok(())
@@ -394,6 +496,112 @@ impl Target for PgTarget {
             .await
             .context("execute get")?;
         Ok(())
+    }
+
+    async fn delete(&self, pk: &str) -> Result<()> {
+        // Mirrors rektifier's `DELETE … RETURNING data`.
+        let client = self.pool.get().await.context("pool get")?;
+        let sql = format!(
+            "DELETE FROM \"{0}\" WHERE id = $1 RETURNING data",
+            self.table
+        );
+        let stmt = client
+            .prepare_typed_cached(&sql, &[Type::TEXT])
+            .await
+            .context("prepare delete")?;
+        let _row = client
+            .query_opt(&stmt, &[&pk])
+            .await
+            .context("execute delete")?;
+        Ok(())
+    }
+
+    async fn put_cond_insert_only(&self, pk: &str, payload: &Value) -> Result<()> {
+        // Rektifier's conditional Put currently routes everything
+        // through the SELECT-FOR-UPDATE slow path. The bench mirrors
+        // that — BEGIN → SELECT FOR UPDATE → INSERT ON CONFLICT DO
+        // NOTHING → COMMIT — so direct-pg measures the same shape.
+        let item = full_item(pk, payload);
+        let item_value = Value::Object(item.into_iter().collect());
+        let mut client = self.pool.get().await.context("pool get")?;
+        let tx = client.transaction().await.context("begin tx")?;
+        let select_sql = format!(
+            "SELECT data FROM \"{0}\" WHERE id = $1 FOR UPDATE",
+            self.table
+        );
+        let select_stmt = tx
+            .prepare_typed_cached(&select_sql, &[Type::TEXT])
+            .await
+            .context("prepare select")?;
+        let row = tx
+            .query_opt(&select_stmt, &[&pk])
+            .await
+            .context("select for update")?;
+        if row.is_some() {
+            tx.rollback().await.ok();
+            anyhow::bail!("ConditionalCheckFailed (attribute_not_exists)");
+        }
+        let insert_sql = format!(
+            "INSERT INTO \"{0}\" (data) VALUES ($1::jsonb) \
+             ON CONFLICT (id) DO NOTHING",
+            self.table
+        );
+        let insert_stmt = tx
+            .prepare_typed_cached(&insert_sql, &[Type::JSONB])
+            .await
+            .context("prepare insert")?;
+        let rows = tx
+            .execute(&insert_stmt, &[&Json(&item_value)])
+            .await
+            .context("execute insert")?;
+        if rows == 0 {
+            tx.rollback().await.ok();
+            anyhow::bail!("ConditionalCheckFailed (concurrent insert)");
+        }
+        tx.commit().await.context("commit")?;
+        Ok(())
+    }
+
+    async fn put_all_old(&self, pk: &str, payload: &Value) -> Result<()> {
+        // Same shape as `put` — the CTE already returns old_data;
+        // ALL_OLD is "free" on this path.
+        self.put(pk, payload).await
+    }
+
+    async fn delete_cond_exists(&self, pk: &str) -> Result<()> {
+        let mut client = self.pool.get().await.context("pool get")?;
+        let tx = client.transaction().await.context("begin tx")?;
+        let select_sql = format!(
+            "SELECT data FROM \"{0}\" WHERE id = $1 FOR UPDATE",
+            self.table
+        );
+        let select_stmt = tx
+            .prepare_typed_cached(&select_sql, &[Type::TEXT])
+            .await
+            .context("prepare select")?;
+        let row = tx
+            .query_opt(&select_stmt, &[&pk])
+            .await
+            .context("select for update")?;
+        if row.is_none() {
+            tx.rollback().await.ok();
+            anyhow::bail!("ConditionalCheckFailed (attribute_exists)");
+        }
+        let delete_sql = format!("DELETE FROM \"{0}\" WHERE id = $1", self.table);
+        let delete_stmt = tx
+            .prepare_typed_cached(&delete_sql, &[Type::TEXT])
+            .await
+            .context("prepare delete")?;
+        tx.execute(&delete_stmt, &[&pk])
+            .await
+            .context("execute delete")?;
+        tx.commit().await.context("commit")?;
+        Ok(())
+    }
+
+    async fn delete_all_old(&self, pk: &str) -> Result<()> {
+        // Same shape as `delete` — RETURNING is "free" on this path.
+        self.delete(pk).await
     }
 
     async fn update_fast_set(&self, pk: &str, value: i64) -> Result<()> {
@@ -871,6 +1079,28 @@ async fn dispatch_op(
                 target.get(&pk).await
             }
         }
+        Workload::Delete => {
+            // Fresh PKs that don't exist — idempotent delete; we're
+            // measuring the SQL path cost, not actually removing rows.
+            let pk = format!("del-{run_epoch_ms}-w{worker_id:02}-{counter:08}");
+            target.delete(&pk).await
+        }
+        Workload::PutCondInsertOnly => {
+            let pk = format!("pci-{run_epoch_ms}-w{worker_id:02}-{counter:08}");
+            target.put_cond_insert_only(&pk, payload).await
+        }
+        Workload::PutAllOld => {
+            let pk = working_set_key(counter, working_set);
+            target.put_all_old(&pk, payload).await
+        }
+        Workload::DeleteCondExists => {
+            let pk = working_set_key(counter, working_set);
+            target.delete_cond_exists(&pk).await
+        }
+        Workload::DeleteAllOld => {
+            let pk = working_set_key(counter, working_set);
+            target.delete_all_old(&pk).await
+        }
         Workload::UpdateDirectSet => {
             let pk = working_set_key(counter, working_set);
             target.update_fast_set(&pk, counter as i64).await
@@ -972,6 +1202,11 @@ fn workload_label(w: Workload) -> &'static str {
         Workload::Put => "PutItem",
         Workload::Get => "GetItem",
         Workload::Mixed => "mixed-50-50",
+        Workload::Delete => "DeleteItem (unconditional)",
+        Workload::PutCondInsertOnly => "PutItem-cond-insert-only",
+        Workload::PutAllOld => "PutItem-all-old",
+        Workload::DeleteCondExists => "DeleteItem-cond-attribute-exists",
+        Workload::DeleteAllOld => "DeleteItem-all-old",
         Workload::UpdateDirectSet => "UpdateItem-direct-set (3a)",
         Workload::UpdateDirectInsertOnly => "UpdateItem-direct-insert-only (4c)",
         Workload::UpdateDirectCond => "UpdateItem-direct-cond (4d)",

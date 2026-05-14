@@ -1,960 +1,66 @@
 //! Translate DynamoDB operations into backend-neutral plans.
 //!
-//! For MVP this is a pair of free functions covering `PutItem` and `GetItem`.
 //! Schemas may declare PK and SK with type S, N, or B; the translator
-//! enforces that the incoming attribute matches the declared type.
+//! enforces that the incoming attribute matches the declared type and
+//! parses the request's UpdateExpression / ConditionExpression /
+//! ReturnValues fields into [`plan`] structs the storage layer consumes.
 //!
-//! No expressions, no projections, no conditions yet — those live in their
-//! own crate.
+//! ## Module layout
+//!
+//! - [`schema`] — [`TableSchema`] + the `TableShape` adapter.
+//! - [`plan`] — per-op plan structs, [`ReturnValuesMode`], condition
+//!   routing, materialize-output primitives, [`touched_paths`].
+//! - [`error`] — [`TranslateError`] + the upstream-error `From` impls.
+//! - [`translate`] — the four public `translate_*_item` entry points
+//!   + shared `ReturnValues` and `ConditionExpression` resolvers.
+//! - [`classify`] — [`classify_condition`] (AST → [`ConditionRouting`]).
+//! - [`checks`] — path / operand / value-type validation helpers.
+//! - [`materialize`] — pre-flatten a simple-subset `UpdateItemPlan`
+//!   into storage-ready primitives.
+//! - [`keys`] (private) — key extraction / extra-attr rejection.
+//! - [`eval`] — in-Rust evaluators for the slow path
+//!   ([`apply_update_expression`], [`evaluate_condition`]).
 
 pub mod eval;
 pub use eval::{apply_update_expression, evaluate_condition, EvalError};
 
-use rekt_expressions::{
-    parse_condition_expression, parse_update_expression, substitute_condition, substitute_update,
-    ComparisonOp, Condition, Operand, ParseError, Path, PathSegment, SetRhs, SubstituteError,
-    UpdateExpression,
+mod checks;
+pub mod classify;
+pub mod error;
+mod key_condition;
+mod keys;
+pub mod materialize;
+pub mod plan;
+pub mod schema;
+pub mod translate;
+
+// Public re-exports so external callers can `use rekt_translator::X;`
+// for any of the headline types without knowing the submodule layout.
+pub use classify::classify_condition;
+pub use error::TranslateError;
+pub use materialize::{
+    materialize_insert_only_update, materialize_simple_sql_update, materialize_simple_update,
 };
-use rekt_protocol::{
-    AttributeValue, DeleteItemRequest, GetItemRequest, Item, PutItemRequest, UpdateItemRequest,
+pub use plan::{
+    touched_paths, ConditionPlan, ConditionRouting, DeleteItemPlan, GetItemPlan, PutItemPlan,
+    QueryPlan, ReturnValuesMode, SimpleSqlUpdatePrimitives, SimpleUpdatePrimitives,
+    UpdateItemPlan,
 };
-use rekt_storage::{KeyType, KeyValue, TableShape};
-use std::collections::BTreeMap;
-
-/// Description of a table that the translator and the storage layer agree on.
-/// Built once at server startup from config (+ PG verification).
-#[derive(Debug, Clone)]
-pub struct TableSchema {
-    /// DynamoDB-side table name (what clients send).
-    pub name: String,
-    /// Postgres table name. May differ from `name`.
-    pub pg_table: String,
-    /// Partition-key attribute name. Doubles as the PG column name.
-    pub pk_attr: String,
-    pub pk_type: KeyType,
-    /// Sort-key attribute name, if the table is composite. Doubles as the
-    /// PG column name.
-    pub sk_attr: Option<String>,
-    pub sk_type: Option<KeyType>,
-    /// PG column name for the full DynamoDB-JSON item blob (`jsonb` type).
-    pub jsonb_col: String,
-}
-
-impl TableSchema {
-    /// Borrow as a `TableShape` for handing to the storage layer.
-    pub fn shape(&self) -> TableShape<'_> {
-        TableShape {
-            table: &self.pg_table,
-            pk_col: &self.pk_attr,
-            pk_type: self.pk_type,
-            sk_col: self.sk_attr.as_deref(),
-            sk_type: self.sk_type,
-            jsonb_col: &self.jsonb_col,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PutItemPlan {
-    /// Full item in DynamoDB-JSON form, source of truth for the jsonb column.
-    /// PG derives the typed key columns from this via `GENERATED ALWAYS AS`,
-    /// so writes don't bind pk/sk separately. The translator still validates
-    /// that the expected key attributes are present and well-typed — that's
-    /// protocol-level validation, independent of how PG stores them.
-    pub item_json: serde_json::Value,
-}
-
-#[derive(Debug, Clone)]
-pub struct GetItemPlan {
-    pub pk: KeyValue,
-    pub sk: Option<KeyValue>,
-}
-
-#[derive(Debug, Clone)]
-pub struct DeleteItemPlan {
-    pub pk: KeyValue,
-    pub sk: Option<KeyValue>,
-}
-
-#[derive(Debug, Clone)]
-pub struct UpdateItemPlan {
-    pub pk: KeyValue,
-    pub sk: Option<KeyValue>,
-    /// The fully-resolved, schema-validated UpdateExpression. Storage
-    /// interprets this directly — the simple-path predicate
-    /// (`is_simple_update`) decides whether to emit pure-SQL or fall
-    /// back to read-modify-write.
-    pub expression: UpdateExpression,
-    /// The fully-resolved, schema-validated ConditionExpression, if the
-    /// request carried one. Storage uses `routing` to pick the SQL shape:
-    /// `InsertOnlyOnPk` becomes `INSERT … ON CONFLICT DO NOTHING` (Phase 4c);
-    /// `SimpleSql` becomes `UPDATE … WHERE cond-sql` (Phase 4d);
-    /// `NeedsTx` falls to the slow path with in-Rust evaluation
-    /// (Phase 4e). Always `None` in Phases 1–3.
-    pub condition: Option<ConditionPlan>,
-    /// What the response body should carry. `None` means an empty
-    /// response (DDB default). `AllNew` means the full post-update item.
-    /// Other DDB variants (`ALL_OLD` / `UPDATED_OLD` / `UPDATED_NEW`)
-    /// are Phase 7b/7c and are rejected at translate time.
-    pub return_values: ReturnValuesMode,
-}
-
-/// DDB's `ReturnValues` enum, fully supported. `None` (default) returns
-/// an empty body; `AllNew`/`AllOld` return the full post-/pre-update
-/// item; `UpdatedNew`/`UpdatedOld` return the same restricted to the
-/// top-level attributes the UpdateExpression touched (computed by
-/// [`touched_paths`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ReturnValuesMode {
-    #[default]
-    None,
-    AllNew,
-    AllOld,
-    UpdatedNew,
-    UpdatedOld,
-}
-
-/// Top-level attribute names the UpdateExpression touches: union of
-/// SET targets, REMOVE paths, ADD targets, DELETE targets. Used by
-/// the dispatcher to project `UpdateOutcome` for `UPDATED_*`
-/// `ReturnValues` modes. Top-level only — Phase 8 nested-path lift
-/// will need to extend this to track the deepest projected ancestor.
-pub fn touched_paths(expr: &UpdateExpression) -> std::collections::BTreeSet<String> {
-    let mut paths = std::collections::BTreeSet::new();
-    for c in &expr.set {
-        if let Some(n) = c.path.top_name() {
-            paths.insert(n.to_string());
-        }
-    }
-    for p in &expr.remove {
-        if let Some(n) = p.top_name() {
-            paths.insert(n.to_string());
-        }
-    }
-    for a in &expr.add {
-        if let Some(n) = a.path.top_name() {
-            paths.insert(n.to_string());
-        }
-    }
-    for d in &expr.delete {
-        if let Some(n) = d.path.top_name() {
-            paths.insert(n.to_string());
-        }
-    }
-    paths
-}
-
-#[derive(Debug, Clone)]
-pub struct ConditionPlan {
-    pub routing: ConditionRouting,
-    pub condition: Condition,
-}
-
-/// Where in the storage layer's dispatch tree this condition belongs.
-/// Phase 4b populates this; Phases 4c / 4d / 4e wire each variant
-/// through to a concrete backend path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConditionRouting {
-    /// Exactly `attribute_not_exists(<pk_attr>)`, no boolean composition.
-    /// The fast-path `INSERT … ON CONFLICT DO NOTHING` case.
-    InsertOnlyOnPk,
-    /// Any other v1 condition (compositions of `attribute_exists` /
-    /// `attribute_not_exists` / `=` / `<>` / `<` / `<=` / `>` / `>=`
-    /// via AND / OR / NOT). Compiles to a SQL WHERE fragment in 4d.
-    SimpleSql,
-    /// Conditions that can't be expressed in plain SQL (`begins_with`,
-    /// `contains`, `BETWEEN`, etc.). Reserved for Phase 4e; the parser
-    /// doesn't yet emit shapes that land here.
-    NeedsTx,
-}
-
-/// Storage-ready primitives for the simple-subset UpdateItem fast path.
-/// Produced by [`materialize_simple_update`] from a translated plan +
-/// the request's `Key`.
-#[derive(Debug, Clone)]
-pub struct SimpleUpdatePrimitives {
-    /// DDB-JSON for the INSERT branch: the request's key attrs merged
-    /// with the SET literals.
-    pub insert_item: serde_json::Value,
-    /// One `(top-level attr name, DDB-JSON value)` per SET clause.
-    pub sets: Vec<(String, serde_json::Value)>,
-    /// One top-level attr name per REMOVE clause.
-    pub removes: Vec<String>,
-}
-
-/// Storage-ready primitives for an UpdateItem with a `SimpleSql`-
-/// classified ConditionExpression. The condition is *not* compiled
-/// here — the backend's SQL compiler does that — but the SET/REMOVE
-/// pieces are pre-flattened identically to the no-condition fast path.
-/// Produced by [`materialize_simple_sql_update`].
-#[derive(Debug, Clone)]
-pub struct SimpleSqlUpdatePrimitives {
-    pub sets: Vec<(String, serde_json::Value)>,
-    pub removes: Vec<String>,
-}
-
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum TranslateError {
-    #[error("missing partition key attribute `{attr}` in item")]
-    MissingPartitionKey { attr: String },
-
-    #[error("missing sort key attribute `{attr}` in item")]
-    MissingSortKey { attr: String },
-
-    #[error("partition key `{attr}` has wrong type: schema says {expected:?}, got {got}")]
-    PartitionKeyTypeMismatch {
-        attr: String,
-        expected: KeyType,
-        got: &'static str,
-    },
-
-    #[error("sort key `{attr}` has wrong type: schema says {expected:?}, got {got}")]
-    SortKeyTypeMismatch {
-        attr: String,
-        expected: KeyType,
-        got: &'static str,
-    },
-
-    #[error("Key contains unexpected attribute `{attr}` (not a key attribute)")]
-    ExtraKeyAttribute { attr: String },
-
-    // ----- UpdateItem-specific -----
-    #[error("UpdateExpression is empty (must contain at least one clause)")]
-    EmptyUpdateExpression,
-
-    #[error("invalid UpdateExpression: {0}")]
-    InvalidUpdateExpression(String),
-
-    #[error("UpdateExpression references unknown placeholder: {0}")]
-    UnknownPlaceholder(String),
-
-    #[error(
-        "UpdateExpression touches key attribute `{attr}` — key attributes are determined by the `Key` field, not by `UpdateExpression`"
-    )]
-    UpdateTouchesKey { attr: String },
-
-    /// Nested paths (e.g. `meta.score`, `items[3]`) are valid DDB but
-    /// the translator only supports top-level paths in this phase. Phase
-    /// 8 lifts this restriction.
-    #[error(
-        "nested paths are not yet supported (got `{path}`) — Phase 8 will lift this restriction"
-    )]
-    UnsupportedNestedPath { path: String },
-
-    /// Phase 2 only supports `SET attr = :value` (literal). Phase 3 will
-    /// add path-refs / arithmetic / if_not_exists / list_append via the
-    /// read-modify-write fallback.
-    #[error("only literal SET right-hand sides are supported in this phase (got `{shape}`)")]
-    UnsupportedSetRhs { shape: &'static str },
-
-    /// ADD requires a numeric or set value. `ADD foo :s` where `:s` is
-    /// `{"S":"x"}` raises `ValidationException`.
-    #[error(
-        "An operand in the update expression has an incorrect data type: ADD requires N or SS/NS/BS (got `{got}`)"
-    )]
-    InvalidAddValueType { got: &'static str },
-
-    /// DELETE requires a set value. `DELETE foo :s` where `:s` isn't a
-    /// `SS`/`NS`/`BS` raises `ValidationException`.
-    #[error(
-        "An operand in the update expression has an incorrect data type: DELETE requires SS/NS/BS (got `{got}`)"
-    )]
-    InvalidDeleteValueType { got: &'static str },
-
-    #[error("invalid ConditionExpression: {0}")]
-    InvalidConditionExpression(String),
-
-    /// Bare attribute name in an UpdateExpression matched a DDB reserved
-    /// word. Caller should rewrite the expression to use an
-    /// ExpressionAttributeName alias (`#x` → "actualName"). Message
-    /// format mirrors DDB-local's wire output.
-    #[error(
-        "Invalid UpdateExpression: Attribute name is a reserved keyword; reserved keyword: {word}"
-    )]
-    ReservedWordInUpdateExpression { word: String },
-
-    /// Same as above but for ConditionExpression.
-    #[error(
-        "Invalid ConditionExpression: Attribute name is a reserved keyword; reserved keyword: {word}"
-    )]
-    ReservedWordInConditionExpression { word: String },
-
-    /// ConditionExpression handling lives in Phases 4c/4d/4e; the
-    /// no-condition fast path can't be safely reused for conditional
-    /// requests. Surfaced through the storage materializer until those
-    /// phases wire their own backend paths.
-    #[error(
-        "ConditionExpression is parsed and validated but storage execution is not yet implemented — Phase 4c will land `attribute_not_exists(pk)`; Phase 4d adds SQL-WHERE; Phase 4e adds the slow-path evaluator"
-    )]
-    UnsupportedConditionInFastPath,
-
-    /// Nested paths in conditions (e.g. `meta.score = :v`) are valid DDB
-    /// but Phase 4's v1 grammar is top-level paths only. Phase 8 lifts.
-    #[error(
-        "nested paths in ConditionExpression are not yet supported (got `{path}`) — Phase 8 will lift this restriction"
-    )]
-    UnsupportedConditionNestedPath { path: String },
-
-    /// All five DDB `ReturnValues` variants (`NONE`, `ALL_NEW`,
-    /// `ALL_OLD`, `UPDATED_NEW`, `UPDATED_OLD`) are accepted as of
-    /// Phase 7c; this variant remains for any future unknown string.
-    #[error("unknown `ReturnValues` value: `{got}`")]
-    UnsupportedReturnValues { got: String },
-}
-
-#[tracing::instrument(level = "debug", skip_all, name = "translate.put_item", fields(table = %schema.name))]
-pub fn translate_put_item(
-    req: &PutItemRequest,
-    schema: &TableSchema,
-) -> Result<PutItemPlan, TranslateError> {
-    // Validate the key attributes for protocol correctness. We discard the
-    // extracted KeyValues — PG derives the actual key columns from the JSONB
-    // via GENERATED ALWAYS AS, so the storage layer never binds them on writes.
-    let _ = extract_key(&req.item, &schema.pk_attr, schema.pk_type, KeyRole::Pk)?;
-    if let (Some(attr), Some(t)) = (&schema.sk_attr, schema.sk_type) {
-        let _ = extract_key(&req.item, attr, t, KeyRole::Sk)?;
-    }
-    let item_json =
-        serde_json::to_value(&req.item).expect("AttributeValue Serialize is infallible");
-    Ok(PutItemPlan { item_json })
-}
-
-#[tracing::instrument(level = "debug", skip_all, name = "translate.get_item", fields(table = %schema.name))]
-pub fn translate_get_item(
-    req: &GetItemRequest,
-    schema: &TableSchema,
-) -> Result<GetItemPlan, TranslateError> {
-    let pk = extract_key(&req.key, &schema.pk_attr, schema.pk_type, KeyRole::Pk)?;
-    let sk = match (&schema.sk_attr, schema.sk_type) {
-        (Some(attr), Some(t)) => Some(extract_key(&req.key, attr, t, KeyRole::Sk)?),
-        _ => None,
-    };
-    reject_extra_key_attrs(&req.key, schema)?;
-    Ok(GetItemPlan { pk, sk })
-}
-
-#[tracing::instrument(level = "debug", skip_all, name = "translate.delete_item", fields(table = %schema.name))]
-pub fn translate_delete_item(
-    req: &DeleteItemRequest,
-    schema: &TableSchema,
-) -> Result<DeleteItemPlan, TranslateError> {
-    let pk = extract_key(&req.key, &schema.pk_attr, schema.pk_type, KeyRole::Pk)?;
-    let sk = match (&schema.sk_attr, schema.sk_type) {
-        (Some(attr), Some(t)) => Some(extract_key(&req.key, attr, t, KeyRole::Sk)?),
-        _ => None,
-    };
-    reject_extra_key_attrs(&req.key, schema)?;
-    Ok(DeleteItemPlan { pk, sk })
-}
-
-#[tracing::instrument(level = "debug", skip_all, name = "translate.update_item", fields(table = %schema.name))]
-pub fn translate_update_item(
-    req: &UpdateItemRequest,
-    schema: &TableSchema,
-) -> Result<UpdateItemPlan, TranslateError> {
-    // 1. Resolve ReturnValues. All five DDB variants are supported.
-    let return_values = match req.return_values.as_deref() {
-        None | Some("NONE") => ReturnValuesMode::None,
-        Some("ALL_NEW") => ReturnValuesMode::AllNew,
-        Some("ALL_OLD") => ReturnValuesMode::AllOld,
-        Some("UPDATED_NEW") => ReturnValuesMode::UpdatedNew,
-        Some("UPDATED_OLD") => ReturnValuesMode::UpdatedOld,
-        Some(other) => {
-            return Err(TranslateError::UnsupportedReturnValues {
-                got: other.to_string(),
-            });
-        }
-    };
-
-    // 2. Validate the Key against the schema (same machinery as GetItem /
-    //    DeleteItem). Caller must supply pk (and sk if composite); no
-    //    foreign attributes in Key.
-    let pk = extract_key(&req.key, &schema.pk_attr, schema.pk_type, KeyRole::Pk)?;
-    let sk = match (&schema.sk_attr, schema.sk_type) {
-        (Some(attr), Some(t)) => Some(extract_key(&req.key, attr, t, KeyRole::Sk)?),
-        _ => None,
-    };
-    reject_extra_key_attrs(&req.key, schema)?;
-
-    // 3. Parse + resolve the UpdateExpression. ExpressionAttributeNames /
-    //    ExpressionAttributeValues are optional in the request.
-    let raw = parse_update_expression(&req.update_expression)?;
-    let empty_names: BTreeMap<String, String> = BTreeMap::new();
-    let empty_values: BTreeMap<String, AttributeValue> = BTreeMap::new();
-    let names = req
-        .expression_attribute_names
-        .as_ref()
-        .unwrap_or(&empty_names);
-    let values = req
-        .expression_attribute_values
-        .as_ref()
-        .unwrap_or(&empty_values);
-    let expression = substitute_update(raw, names, values)?;
-
-    // 4. Reject empty expressions.
-    if expression.set.is_empty()
-        && expression.remove.is_empty()
-        && expression.add.is_empty()
-        && expression.delete.is_empty()
-    {
-        return Err(TranslateError::EmptyUpdateExpression);
-    }
-
-    // 5. Per-clause validation. Top-level paths only across all clauses
-    //    (Phase 8 lifts); key attrs disallowed as the LHS of any write
-    //    (SET / REMOVE / ADD / DELETE). RHS embedded paths can read key
-    //    attrs (`SET a = id` is permitted).
-    //
-    // Fast path requires `is_simple()` (top-level SET = literal + REMOVE
-    // only); non-simple SET RHS, ADD, DELETE, and slow-path-bound
-    // conditions all route through the Phase 3b read-modify-write path.
-    for clause in &expression.set {
-        check_top_level(&clause.path)?;
-        check_not_key(&clause.path, schema)?;
-        check_set_rhs_paths_top_level(&clause.value)?;
-    }
-    for path in &expression.remove {
-        check_top_level(path)?;
-        check_not_key(path, schema)?;
-    }
-    for action in &expression.add {
-        check_top_level(&action.path)?;
-        check_not_key(&action.path, schema)?;
-        check_add_value_type(&action.value)?;
-    }
-    for action in &expression.delete {
-        check_top_level(&action.path)?;
-        check_not_key(&action.path, schema)?;
-        check_delete_value_type(&action.value)?;
-    }
-
-    // 6. Parse + validate + classify the ConditionExpression, if any.
-    //    Unlike SET / REMOVE paths, condition paths *may* reference key
-    //    attributes (that's how `attribute_not_exists(pk)` works).
-    let condition = match req.condition_expression.as_deref() {
-        None => None,
-        Some(c) if c.trim().is_empty() => None,
-        Some(c) => {
-            let raw = parse_condition_expression(c)?;
-            let cond = substitute_condition(raw, names, values)
-                .map_err(map_substitute_for_condition)?;
-            check_condition_paths_top_level(&cond)?;
-            let routing = classify_condition(&cond, schema);
-            Some(ConditionPlan {
-                routing,
-                condition: cond,
-            })
-        }
-    };
-
-    Ok(UpdateItemPlan {
-        pk,
-        sk,
-        expression,
-        condition,
-        return_values,
-    })
-}
-
-/// Classify a ConditionExpression into a routing variant the storage
-/// layer can dispatch on. The shape is determined by the AST plus the
-/// schema's pk attribute name. Phase 4c/4d/4e wire each variant.
-pub fn classify_condition(cond: &Condition, schema: &TableSchema) -> ConditionRouting {
-    if let Condition::AttributeNotExists(p) = cond {
-        if p.top_name() == Some(&schema.pk_attr) {
-            return ConditionRouting::InsertOnlyOnPk;
-        }
-    }
-    if condition_fits_sql(cond) {
-        ConditionRouting::SimpleSql
-    } else {
-        ConditionRouting::NeedsTx
-    }
-}
-
-/// True iff every comparison in `cond` can be expressed against a PG
-/// jsonb column without consulting the existing row in Rust. The
-/// concrete rules — equality works on any operand shapes; ordering
-/// requires one Path operand + one Value operand of type N or S so the
-/// SQL compiler can pick an extraction strategy — match what the
-/// libpq backend's compiler emits.
-fn condition_fits_sql(cond: &Condition) -> bool {
-    match cond {
-        Condition::AttributeExists(_) | Condition::AttributeNotExists(_) => true,
-        Condition::Compare { op, left, right } => match op {
-            ComparisonOp::Eq | ComparisonOp::Ne => true,
-            ComparisonOp::Lt | ComparisonOp::Le | ComparisonOp::Gt | ComparisonOp::Ge => {
-                ordering_has_typed_extraction(left, right)
-            }
-        },
-        // Phase 4e additions all live on the slow path. The Rust
-        // evaluator handles them in one place; promoting any to SQL
-        // can come later behind a benchmark number.
-        Condition::BeginsWith(_, _)
-        | Condition::Contains(_, _)
-        | Condition::Between(_, _, _)
-        | Condition::In(_, _)
-        | Condition::AttributeType(_, _) => false,
-        Condition::And(a, b) | Condition::Or(a, b) => condition_fits_sql(a) && condition_fits_sql(b),
-        Condition::Not(inner) => condition_fits_sql(inner),
-    }
-}
-
-fn ordering_has_typed_extraction(left: &Operand, right: &Operand) -> bool {
-    // One Path, one Value (in either order). The Value's AttributeValue
-    // type picks the extraction (N → numeric, S → text). Anything else
-    // (path-vs-path, value-vs-value, or a non-N/S value) lacks a
-    // well-defined SQL ordering and routes to NeedsTx.
-    let value = match (left, right) {
-        (Operand::Path(_), Operand::Value(v)) | (Operand::Value(v), Operand::Path(_)) => v,
-        _ => return false,
-    };
-    matches!(value, AttributeValue::N(_) | AttributeValue::S(_))
-}
-
-fn check_condition_paths_top_level(cond: &Condition) -> Result<(), TranslateError> {
-    match cond {
-        Condition::AttributeExists(p) | Condition::AttributeNotExists(p) => {
-            check_condition_path(p)
-        }
-        Condition::Compare { left, right, .. } => {
-            check_condition_operand(left)?;
-            check_condition_operand(right)
-        }
-        Condition::BeginsWith(p, o)
-        | Condition::Contains(p, o)
-        | Condition::AttributeType(p, o) => {
-            check_condition_path(p)?;
-            check_condition_operand(o)
-        }
-        Condition::Between(v, lo, hi) => {
-            check_condition_operand(v)?;
-            check_condition_operand(lo)?;
-            check_condition_operand(hi)
-        }
-        Condition::In(v, items) => {
-            check_condition_operand(v)?;
-            for item in items {
-                check_condition_operand(item)?;
-            }
-            Ok(())
-        }
-        Condition::And(a, b) | Condition::Or(a, b) => {
-            check_condition_paths_top_level(a)?;
-            check_condition_paths_top_level(b)
-        }
-        Condition::Not(inner) => check_condition_paths_top_level(inner),
-    }
-}
-
-fn check_condition_operand(o: &Operand) -> Result<(), TranslateError> {
-    match o {
-        Operand::Path(p) => check_condition_path(p),
-        Operand::Value(_) => Ok(()),
-    }
-}
-
-fn check_condition_path(p: &Path) -> Result<(), TranslateError> {
-    if p.is_top_level() {
-        Ok(())
-    } else {
-        Err(TranslateError::UnsupportedConditionNestedPath {
-            path: format_path(p),
-        })
-    }
-}
-
-/// Pre-decompose a Phase-2 UpdateItemPlan into the storage layer's
-/// fast-path primitives. The caller must pass the same `Key` it gave to
-/// `translate_update_item` so we can build the INSERT-branch JSONB.
-///
-/// Returns an error if the plan's expression is outside the simple
-/// subset — this is a defensive check; `translate_update_item` rejects
-/// such expressions already, but we'd rather not silently mis-route.
-pub fn materialize_simple_update(
-    plan: &UpdateItemPlan,
-    key: &Item,
-) -> Result<SimpleUpdatePrimitives, TranslateError> {
-    if !plan.expression.is_simple() {
-        return Err(TranslateError::UnsupportedSetRhs {
-            shape: "non-simple expression reached materializer",
-        });
-    }
-    // Condition handling is Phase 4c/4d/4e. Until then we refuse to route
-    // a conditional plan through the no-condition fast path (which would
-    // silently apply the update unconditionally — wrong).
-    if plan.condition.is_some() {
-        return Err(TranslateError::UnsupportedConditionInFastPath);
-    }
-
-    // Start the INSERT-branch jsonb at the request's key, then layer SETs
-    // on top so the new row has `{key + SET attrs}` when no row exists.
-    let mut insert_item =
-        serde_json::to_value(key).expect("AttributeValue Serialize is infallible");
-    let obj = insert_item
-        .as_object_mut()
-        .expect("Item serializes to a JSON object");
-
-    let mut sets: Vec<(String, serde_json::Value)> = Vec::with_capacity(plan.expression.set.len());
-    for clause in &plan.expression.set {
-        let attr = clause
-            .path
-            .top_name()
-            .expect("is_simple() guarantees top-level path")
-            .to_string();
-        let value = match &clause.value {
-            SetRhs::Operand(Operand::Value(v)) => {
-                serde_json::to_value(v).expect("AttributeValue Serialize is infallible")
-            }
-            _ => unreachable!("is_simple() guarantees Operand::Value RHS"),
-        };
-        obj.insert(attr.clone(), value.clone());
-        sets.push((attr, value));
-    }
-
-    let removes: Vec<String> = plan
-        .expression
-        .remove
-        .iter()
-        .map(|p| {
-            p.top_name()
-                .expect("is_simple() guarantees top-level path")
-                .to_string()
-        })
-        .collect();
-
-    Ok(SimpleUpdatePrimitives {
-        insert_item,
-        sets,
-        removes,
-    })
-}
-
-/// Materialize the JSONB to insert when routing an UpdateItem with
-/// `ConditionExpression: attribute_not_exists(pk)` through the storage
-/// layer's insert-only fast path (Phase 4c). The result is the request's
-/// key attrs merged with the SET-clause literals — exactly what
-/// DDB would create when the condition holds. REMOVE clauses don't
-/// contribute (they're no-ops against a row that doesn't exist yet).
-///
-/// Errors if the plan's update expression isn't simple, or if the
-/// classified condition routing isn't `InsertOnlyOnPk`.
-pub fn materialize_insert_only_update(
-    plan: &UpdateItemPlan,
-    key: &Item,
-) -> Result<serde_json::Value, TranslateError> {
-    if !plan.expression.is_simple() {
-        return Err(TranslateError::UnsupportedSetRhs {
-            shape: "non-simple expression reached insert-only materializer",
-        });
-    }
-    let cp = plan.condition.as_ref().ok_or(TranslateError::UnsupportedSetRhs {
-        shape: "insert-only materializer called without a condition",
-    })?;
-    if cp.routing != ConditionRouting::InsertOnlyOnPk {
-        return Err(TranslateError::UnsupportedSetRhs {
-            shape: "insert-only materializer called with non-InsertOnlyOnPk routing",
-        });
-    }
-    Ok(build_insert_item(plan, key))
-}
-
-/// Pre-flatten the SET/REMOVE clauses of a simple-subset
-/// UpdateItem into the (attr-name, ddb-json value) and attr-name
-/// lists the storage backends expect. Used for the SimpleSql fast
-/// path (which doesn't need an insert_item because there's no INSERT
-/// branch).
-///
-/// Errors if the plan's expression isn't simple, or if the classified
-/// condition routing isn't `SimpleSql` — the caller is dispatching to
-/// the wrong materializer in that case.
-pub fn materialize_simple_sql_update(
-    plan: &UpdateItemPlan,
-) -> Result<SimpleSqlUpdatePrimitives, TranslateError> {
-    if !plan.expression.is_simple() {
-        return Err(TranslateError::UnsupportedSetRhs {
-            shape: "non-simple expression reached SimpleSql materializer",
-        });
-    }
-    let cp = plan.condition.as_ref().ok_or(TranslateError::UnsupportedSetRhs {
-        shape: "SimpleSql materializer called without a condition",
-    })?;
-    if cp.routing != ConditionRouting::SimpleSql {
-        return Err(TranslateError::UnsupportedSetRhs {
-            shape: "SimpleSql materializer called with non-SimpleSql routing",
-        });
-    }
-    let (sets, removes) = build_sets_removes(plan);
-    Ok(SimpleSqlUpdatePrimitives { sets, removes })
-}
-
-/// Pre-flatten just the SET / REMOVE clauses of a simple-subset
-/// UpdateExpression. Caller must have already established
-/// `plan.expression.is_simple()`.
-fn build_sets_removes(
-    plan: &UpdateItemPlan,
-) -> (Vec<(String, serde_json::Value)>, Vec<String>) {
-    let sets: Vec<(String, serde_json::Value)> = plan
-        .expression
-        .set
-        .iter()
-        .map(|clause| {
-            let attr = clause
-                .path
-                .top_name()
-                .expect("is_simple() guarantees top-level path")
-                .to_string();
-            let value = match &clause.value {
-                SetRhs::Operand(Operand::Value(v)) => {
-                    serde_json::to_value(v).expect("AttributeValue Serialize is infallible")
-                }
-                _ => unreachable!("is_simple() guarantees Operand::Value RHS"),
-            };
-            (attr, value)
-        })
-        .collect();
-    let removes: Vec<String> = plan
-        .expression
-        .remove
-        .iter()
-        .map(|p| {
-            p.top_name()
-                .expect("is_simple() guarantees top-level path")
-                .to_string()
-        })
-        .collect();
-    (sets, removes)
-}
-
-/// Build `{key attrs ∪ SET literals}` as DDB-JSON. Shared by both
-/// fast-path materializers. Caller must have already established
-/// `plan.expression.is_simple()`.
-fn build_insert_item(plan: &UpdateItemPlan, key: &Item) -> serde_json::Value {
-    let mut insert_item =
-        serde_json::to_value(key).expect("AttributeValue Serialize is infallible");
-    let obj = insert_item
-        .as_object_mut()
-        .expect("Item serializes to a JSON object");
-    for clause in &plan.expression.set {
-        let attr = clause
-            .path
-            .top_name()
-            .expect("is_simple() guarantees top-level path")
-            .to_string();
-        let value = match &clause.value {
-            SetRhs::Operand(Operand::Value(v)) => {
-                serde_json::to_value(v).expect("AttributeValue Serialize is infallible")
-            }
-            _ => unreachable!("is_simple() guarantees Operand::Value RHS"),
-        };
-        obj.insert(attr, value);
-    }
-    insert_item
-}
-
-fn check_top_level(p: &Path) -> Result<(), TranslateError> {
-    if p.is_top_level() {
-        Ok(())
-    } else {
-        Err(TranslateError::UnsupportedNestedPath {
-            path: format_path(p),
-        })
-    }
-}
-
-fn check_not_key(p: &Path, schema: &TableSchema) -> Result<(), TranslateError> {
-    let name = match p.top_name() {
-        Some(n) => n,
-        None => return Ok(()),
-    };
-    if name == schema.pk_attr || schema.sk_attr.as_deref() == Some(name) {
-        return Err(TranslateError::UpdateTouchesKey {
-            attr: name.to_string(),
-        });
-    }
-    Ok(())
-}
-
-/// Verify every embedded path in a SET RHS is top-level. The translator
-/// permits non-literal RHS forms (path-ref, arithmetic, if_not_exists,
-/// list_append) as of Phase 3c — they route to the slow path — but
-/// nested paths are still a Phase 8 concern.
-fn check_set_rhs_paths_top_level(rhs: &SetRhs) -> Result<(), TranslateError> {
-    match rhs {
-        SetRhs::Operand(o) => check_operand_path_top_level(o),
-        SetRhs::Plus(a, b) | SetRhs::Minus(a, b) => {
-            check_operand_path_top_level(a)?;
-            check_operand_path_top_level(b)
-        }
-        SetRhs::IfNotExists(p, inner) => {
-            check_top_level(p)?;
-            check_set_rhs_paths_top_level(inner)
-        }
-        SetRhs::ListAppend(a, b) => {
-            check_set_rhs_paths_top_level(a)?;
-            check_set_rhs_paths_top_level(b)
-        }
-    }
-}
-
-fn check_operand_path_top_level(o: &Operand) -> Result<(), TranslateError> {
-    match o {
-        Operand::Path(p) => check_top_level(p),
-        Operand::Value(_) => Ok(()),
-    }
-}
-
-/// `ADD path :v` requires `:v` to be a Number (numeric add) or one of
-/// the set types (set union). DDB raises ValidationException on any
-/// other type at request time, so we surface the same rejection
-/// pre-storage.
-fn check_add_value_type(v: &AttributeValue) -> Result<(), TranslateError> {
-    match v {
-        AttributeValue::N(_)
-        | AttributeValue::Ss(_)
-        | AttributeValue::Ns(_)
-        | AttributeValue::Bs(_) => Ok(()),
-        other => Err(TranslateError::InvalidAddValueType {
-            got: other.type_name(),
-        }),
-    }
-}
-
-/// `DELETE path :v` requires `:v` to be a set type — DELETE is set
-/// subtraction only.
-fn check_delete_value_type(v: &AttributeValue) -> Result<(), TranslateError> {
-    match v {
-        AttributeValue::Ss(_) | AttributeValue::Ns(_) | AttributeValue::Bs(_) => Ok(()),
-        other => Err(TranslateError::InvalidDeleteValueType {
-            got: other.type_name(),
-        }),
-    }
-}
-
-fn format_path(p: &Path) -> String {
-    let mut out = String::new();
-    for (i, seg) in p.segments.iter().enumerate() {
-        match seg {
-            PathSegment::Name(n) => {
-                if i > 0 {
-                    out.push('.');
-                }
-                out.push_str(n);
-            }
-            PathSegment::Index(n) => {
-                out.push('[');
-                out.push_str(&n.to_string());
-                out.push(']');
-            }
-        }
-    }
-    out
-}
-
-impl From<ParseError> for TranslateError {
-    fn from(e: ParseError) -> Self {
-        // Discriminate Update vs Condition by the `kind` carried on the
-        // parse error. Stays in sync with `rekt-expressions::parser`,
-        // which tags every emitted error with its grammar.
-        let is_condition = match &e {
-            ParseError::Invalid { kind, .. } => *kind == "ConditionExpression",
-            ParseError::Empty { kind } => *kind == "ConditionExpression",
-            ParseError::DuplicateKeyword { .. } => false,
-        };
-        if is_condition {
-            TranslateError::InvalidConditionExpression(e.to_string())
-        } else {
-            TranslateError::InvalidUpdateExpression(e.to_string())
-        }
-    }
-}
-
-impl From<SubstituteError> for TranslateError {
-    fn from(e: SubstituteError) -> Self {
-        match e {
-            SubstituteError::UnknownName { name } => {
-                TranslateError::UnknownPlaceholder(format!("#{name}"))
-            }
-            SubstituteError::UnknownValue { name } => {
-                TranslateError::UnknownPlaceholder(format!(":{name}"))
-            }
-            // The blanket `From` defaults to the UpdateExpression
-            // phrasing; call sites that resolve a ConditionExpression
-            // remap it via `map_substitute_for_condition` so the wire
-            // message names the right expression.
-            SubstituteError::ReservedWord { word } => {
-                TranslateError::ReservedWordInUpdateExpression { word }
-            }
-        }
-    }
-}
-
-/// Remap a `SubstituteError::ReservedWord` raised during
-/// ConditionExpression resolution to the condition-specific variant,
-/// leaving placeholder errors unchanged.
-fn map_substitute_for_condition(e: SubstituteError) -> TranslateError {
-    match e {
-        SubstituteError::ReservedWord { word } => {
-            TranslateError::ReservedWordInConditionExpression { word }
-        }
-        other => other.into(),
-    }
-}
-
-#[derive(Copy, Clone)]
-enum KeyRole {
-    Pk,
-    Sk,
-}
-
-fn extract_key(
-    map: &Item,
-    attr: &str,
-    expected: KeyType,
-    role: KeyRole,
-) -> Result<KeyValue, TranslateError> {
-    let av = map.get(attr).ok_or_else(|| match role {
-        KeyRole::Pk => TranslateError::MissingPartitionKey {
-            attr: attr.to_string(),
-        },
-        KeyRole::Sk => TranslateError::MissingSortKey {
-            attr: attr.to_string(),
-        },
-    })?;
-
-    match (expected, av) {
-        (KeyType::S, AttributeValue::S(s)) => Ok(KeyValue::S(s.clone())),
-        (KeyType::N, AttributeValue::N(s)) => Ok(KeyValue::N(s.clone())),
-        (KeyType::B, AttributeValue::B(b)) => Ok(KeyValue::B(b.clone())),
-        (_, other) => Err(match role {
-            KeyRole::Pk => TranslateError::PartitionKeyTypeMismatch {
-                attr: attr.to_string(),
-                expected,
-                got: other.type_name(),
-            },
-            KeyRole::Sk => TranslateError::SortKeyTypeMismatch {
-                attr: attr.to_string(),
-                expected,
-                got: other.type_name(),
-            },
-        }),
-    }
-}
-
-fn reject_extra_key_attrs(key: &Item, schema: &TableSchema) -> Result<(), TranslateError> {
-    for attr in key.keys() {
-        let allowed = attr == &schema.pk_attr || schema.sk_attr.as_deref() == Some(attr.as_str());
-        if !allowed {
-            return Err(TranslateError::ExtraKeyAttribute { attr: attr.clone() });
-        }
-    }
-    Ok(())
-}
-
+pub use schema::TableSchema;
+pub use translate::{
+    translate_delete_item, translate_get_item, translate_put_item, translate_query,
+    translate_update_item,
+};
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use rekt_expressions::{Condition, Operand, SetRhs};
+    use rekt_protocol::{
+        AttributeValue, DeleteItemRequest, GetItemRequest, Item, PutItemRequest, QueryRequest,
+        UpdateItemRequest,
+    };
+    use rekt_storage::{KeyType, KeyValue, SkCondition};
     use std::collections::BTreeMap;
 
     fn schema_hash_s() -> TableSchema {
@@ -993,6 +99,18 @@ mod tests {
         }
     }
 
+    fn schema_composite_s_s() -> TableSchema {
+        TableSchema {
+            name: "messages".into(),
+            pg_table: "messages".into(),
+            pk_attr: "thread".into(),
+            pk_type: KeyType::S,
+            sk_attr: Some("ts".into()),
+            sk_type: Some(KeyType::S),
+            jsonb_col: "data".into(),
+        }
+    }
+
     fn item_of(pairs: &[(&str, AttributeValue)]) -> Item {
         let mut m: BTreeMap<String, AttributeValue> = BTreeMap::new();
         for (k, v) in pairs {
@@ -1009,6 +127,7 @@ mod tests {
                 ("id", AttributeValue::S("u1".into())),
                 ("label", AttributeValue::S("alice".into())),
             ]),
+            ..Default::default()
         };
         let plan = translate_put_item(&req, &schema_hash_s()).unwrap();
         assert_eq!(
@@ -1026,6 +145,7 @@ mod tests {
                 ("ts", AttributeValue::N("1234567890".into())),
                 ("val", AttributeValue::N("99".into())),
             ]),
+            ..Default::default()
         };
         let plan = translate_put_item(&req, &schema_composite_s_n()).unwrap();
         // PutItemPlan no longer carries pk/sk; PG derives them from the JSONB.
@@ -1044,6 +164,7 @@ mod tests {
                 ("hash", AttributeValue::B(Bytes::from_static(b"\x00\x01"))),
                 ("extent", AttributeValue::N("2".into())),
             ]),
+            ..Default::default()
         };
         let plan = translate_put_item(&req, &schema_hash_b()).unwrap();
         // base64 of {0x00, 0x01} is "AAE=".
@@ -1055,6 +176,7 @@ mod tests {
         let req = PutItemRequest {
             table_name: "users".into(),
             item: item_of(&[("id", AttributeValue::N("42".into()))]),
+            ..Default::default()
         };
         let err = translate_put_item(&req, &schema_hash_s()).unwrap_err();
         match err {
@@ -1079,6 +201,7 @@ mod tests {
                 ("device_id", AttributeValue::S("dev-1".into())),
                 ("ts", AttributeValue::S("not a number".into())),
             ]),
+            ..Default::default()
         };
         let err = translate_put_item(&req, &schema_composite_s_n()).unwrap_err();
         assert!(matches!(err, TranslateError::SortKeyTypeMismatch { .. }));
@@ -1089,6 +212,7 @@ mod tests {
         let req = PutItemRequest {
             table_name: "users".into(),
             item: item_of(&[("label", AttributeValue::S("alice".into()))]),
+            ..Default::default()
         };
         let err = translate_put_item(&req, &schema_hash_s()).unwrap_err();
         assert!(matches!(err, TranslateError::MissingPartitionKey { .. }));
@@ -1099,9 +223,78 @@ mod tests {
         let req = PutItemRequest {
             table_name: "events".into(),
             item: item_of(&[("device_id", AttributeValue::S("dev-1".into()))]),
+            ..Default::default()
         };
         let err = translate_put_item(&req, &schema_composite_s_n()).unwrap_err();
         assert!(matches!(err, TranslateError::MissingSortKey { .. }));
+    }
+
+    #[test]
+    fn put_carries_condition_and_return_values() {
+        let req = PutItemRequest {
+            table_name: "users".into(),
+            item: item_of(&[
+                ("id", AttributeValue::S("u1".into())),
+                ("label", AttributeValue::S("alice".into())),
+            ]),
+            condition_expression: Some("attribute_not_exists(id)".into()),
+            return_values: Some("ALL_OLD".into()),
+            ..Default::default()
+        };
+        let plan = translate_put_item(&req, &schema_hash_s()).unwrap();
+        assert_eq!(plan.pk, KeyValue::S("u1".into()));
+        assert_eq!(plan.return_values, ReturnValuesMode::AllOld);
+        let cond = plan.condition.expect("condition present");
+        assert_eq!(cond.routing, ConditionRouting::InsertOnlyOnPk);
+    }
+
+    #[test]
+    fn put_rejects_all_new_return_values() {
+        let req = PutItemRequest {
+            table_name: "users".into(),
+            item: item_of(&[("id", AttributeValue::S("u1".into()))]),
+            return_values: Some("ALL_NEW".into()),
+            ..Default::default()
+        };
+        match translate_put_item(&req, &schema_hash_s()).unwrap_err() {
+            TranslateError::UnsupportedReturnValuesForOp { op, got } => {
+                assert_eq!(op, "PutItem");
+                assert_eq!(got, "ALL_NEW");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_carries_condition_and_return_values() {
+        let req = DeleteItemRequest {
+            table_name: "users".into(),
+            key: item_of(&[("id", AttributeValue::S("u1".into()))]),
+            condition_expression: Some("attribute_exists(id)".into()),
+            return_values: Some("ALL_OLD".into()),
+            ..Default::default()
+        };
+        let plan = translate_delete_item(&req, &schema_hash_s()).unwrap();
+        assert_eq!(plan.return_values, ReturnValuesMode::AllOld);
+        let cond = plan.condition.expect("condition present");
+        assert_eq!(cond.routing, ConditionRouting::SimpleSql);
+    }
+
+    #[test]
+    fn delete_rejects_updated_new_return_values() {
+        let req = DeleteItemRequest {
+            table_name: "users".into(),
+            key: item_of(&[("id", AttributeValue::S("u1".into()))]),
+            return_values: Some("UPDATED_NEW".into()),
+            ..Default::default()
+        };
+        match translate_delete_item(&req, &schema_hash_s()).unwrap_err() {
+            TranslateError::UnsupportedReturnValuesForOp { op, got } => {
+                assert_eq!(op, "DeleteItem");
+                assert_eq!(got, "UPDATED_NEW");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
@@ -2293,5 +1486,298 @@ mod tests {
                 "expected reservation rejection for `{upper}`, got: {err:?}"
             );
         }
+    }
+
+    // ============================================================
+    // translate_query (Q1)
+    // ============================================================
+
+    fn query_req(
+        table: &str,
+        kce: &str,
+        values: &[(&str, AttributeValue)],
+        names: &[(&str, &str)],
+    ) -> QueryRequest {
+        QueryRequest {
+            table_name: table.into(),
+            key_condition_expression: kce.into(),
+            expression_attribute_names: if names.is_empty() {
+                None
+            } else {
+                Some(
+                    names
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                )
+            },
+            expression_attribute_values: if values.is_empty() {
+                None
+            } else {
+                Some(
+                    values
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.clone()))
+                        .collect(),
+                )
+            },
+            consistent_read: None,
+        }
+    }
+
+    #[test]
+    fn query_pk_only_hash() {
+        let req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        let plan = translate_query(&req, &schema_hash_s()).unwrap();
+        assert_eq!(plan.pk, KeyValue::S("u1".into()));
+        assert!(plan.sk_condition.is_none());
+    }
+
+    #[test]
+    fn query_pk_only_on_composite() {
+        // Composite table, pk-only KCE → full-partition scan.
+        let req = query_req(
+            "events",
+            "device_id = :pk",
+            &[(":pk", AttributeValue::S("dev-1".into()))],
+            &[],
+        );
+        let plan = translate_query(&req, &schema_composite_s_n()).unwrap();
+        assert_eq!(plan.pk, KeyValue::S("dev-1".into()));
+        assert!(plan.sk_condition.is_none());
+    }
+
+    #[test]
+    fn query_pk_eq_and_sk_eq() {
+        let req = query_req(
+            "events",
+            "device_id = :pk AND ts = :ts",
+            &[
+                (":pk", AttributeValue::S("dev-1".into())),
+                (":ts", AttributeValue::N("1000".into())),
+            ],
+            &[],
+        );
+        let plan = translate_query(&req, &schema_composite_s_n()).unwrap();
+        assert!(matches!(
+            plan.sk_condition,
+            Some(SkCondition::Eq(KeyValue::N(ref s))) if s == "1000"
+        ));
+    }
+
+    #[test]
+    fn query_sk_ordering_variants() {
+        for (op, expected_disc) in [
+            ("<", "Lt"),
+            ("<=", "Le"),
+            (">", "Gt"),
+            (">=", "Ge"),
+        ] {
+            let kce = format!("device_id = :pk AND ts {op} :ts");
+            let req = query_req(
+                "events",
+                &kce,
+                &[
+                    (":pk", AttributeValue::S("dev-1".into())),
+                    (":ts", AttributeValue::N("1000".into())),
+                ],
+                &[],
+            );
+            let plan = translate_query(&req, &schema_composite_s_n()).unwrap();
+            let got = match plan.sk_condition {
+                Some(SkCondition::Lt(_)) => "Lt",
+                Some(SkCondition::Le(_)) => "Le",
+                Some(SkCondition::Gt(_)) => "Gt",
+                Some(SkCondition::Ge(_)) => "Ge",
+                other => panic!("unexpected sk_condition: {other:?}"),
+            };
+            assert_eq!(got, expected_disc, "op={op}");
+        }
+    }
+
+    #[test]
+    fn query_sk_between() {
+        let req = query_req(
+            "events",
+            "device_id = :pk AND ts BETWEEN :lo AND :hi",
+            &[
+                (":pk", AttributeValue::S("dev-1".into())),
+                (":lo", AttributeValue::N("1000".into())),
+                (":hi", AttributeValue::N("2000".into())),
+            ],
+            &[],
+        );
+        let plan = translate_query(&req, &schema_composite_s_n()).unwrap();
+        assert!(matches!(
+            plan.sk_condition,
+            Some(SkCondition::Between(KeyValue::N(ref a), KeyValue::N(ref b)))
+                if a == "1000" && b == "2000"
+        ));
+    }
+
+    #[test]
+    fn query_sk_begins_with_s() {
+        let req = query_req(
+            "messages",
+            "thread = :pk AND begins_with(ts, :pfx)",
+            &[
+                (":pk", AttributeValue::S("t-1".into())),
+                (":pfx", AttributeValue::S("2026-".into())),
+            ],
+            &[],
+        );
+        let plan = translate_query(&req, &schema_composite_s_s()).unwrap();
+        assert!(matches!(
+            plan.sk_condition,
+            Some(SkCondition::BeginsWithS(ref s)) if s == "2026-"
+        ));
+    }
+
+    #[test]
+    fn query_begins_with_on_n_sk_rejected() {
+        let req = query_req(
+            "events",
+            "device_id = :pk AND begins_with(ts, :pfx)",
+            &[
+                (":pk", AttributeValue::S("dev-1".into())),
+                // The placeholder is S even though the SK is N — D8
+                // tests reject the begins_with itself, not the value.
+                (":pfx", AttributeValue::S("123".into())),
+            ],
+            &[],
+        );
+        let err = translate_query(&req, &schema_composite_s_n()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::KeyConditionBeginsWithRequiresStringSk { ref attr, .. }
+                if attr == "ts"
+        ));
+    }
+
+    #[test]
+    fn query_empty_kce_rejected() {
+        let req = query_req("users", "", &[], &[]);
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::KeyConditionMissingPkEquality { ref attr } if attr == "id"
+        ));
+    }
+
+    #[test]
+    fn query_missing_pk_equality() {
+        // Composite table, KCE only references SK.
+        let req = query_req(
+            "events",
+            "ts = :ts",
+            &[(":ts", AttributeValue::N("1".into()))],
+            &[],
+        );
+        let err = translate_query(&req, &schema_composite_s_n()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::KeyConditionMissingPkEquality { ref attr } if attr == "device_id"
+        ));
+    }
+
+    #[test]
+    fn query_pk_ordering_rejected() {
+        let req = query_req(
+            "users",
+            "id < :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::KeyConditionPkMustBeEquality { ref attr, op: "<" } if attr == "id"
+        ));
+    }
+
+    #[test]
+    fn query_or_rejected() {
+        let req = query_req(
+            "users",
+            "id = :a OR id = :b",
+            &[
+                (":a", AttributeValue::S("u1".into())),
+                (":b", AttributeValue::S("u2".into())),
+            ],
+            &[],
+        );
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::KeyConditionUnsupportedShape { .. }
+        ));
+    }
+
+    #[test]
+    fn query_attribute_exists_rejected() {
+        let req = query_req("users", "attribute_exists(id)", &[], &[]);
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::KeyConditionUnsupportedShape { .. }
+        ));
+    }
+
+    #[test]
+    fn query_non_key_attr_rejected() {
+        let req = query_req(
+            "users",
+            "label = :v",
+            &[(":v", AttributeValue::S("alice".into()))],
+            &[],
+        );
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::KeyConditionNonKeyAttr { ref attr } if attr == "label"
+        ));
+    }
+
+    #[test]
+    fn query_pk_type_mismatch() {
+        let req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::N("42".into()))],
+            &[],
+        );
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::KeyConditionPkTypeMismatch {
+                ref attr, expected: KeyType::S, got: "N"
+            } if attr == "id"
+        ));
+    }
+
+    #[test]
+    fn query_placeholders_substitute() {
+        // `#t = :pk AND #r begins_with :pfx` style: both name and value
+        // aliases resolve before validation.
+        let req = query_req(
+            "messages",
+            "#t = :pk AND begins_with(#r, :pfx)",
+            &[
+                (":pk", AttributeValue::S("t-1".into())),
+                (":pfx", AttributeValue::S("2026-".into())),
+            ],
+            &[("#t", "thread"), ("#r", "ts")],
+        );
+        let plan = translate_query(&req, &schema_composite_s_s()).unwrap();
+        assert_eq!(plan.pk, KeyValue::S("t-1".into()));
+        assert!(matches!(
+            plan.sk_condition,
+            Some(SkCondition::BeginsWithS(ref s)) if s == "2026-"
+        ));
     }
 }

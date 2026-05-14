@@ -115,3 +115,42 @@ bench-quick: bench-build
     ./target/release/rekt-bench run --target direct-pg  --workload get --concurrency 16 --duration 10s --warmup 2s --working-set 1000
     ./target/release/rekt-bench run --target rektifier  --workload get --concurrency 16 --duration 10s --warmup 2s --working-set 1000
     ./target/release/rekt-bench run --target ddb-local  --workload get --concurrency 16 --duration 10s --warmup 2s --working-set 1000
+
+# Bench the conditional Put/Delete + ALL_OLD paths plus a basic
+# DeleteItem regression check. Working set sized for ~10s of throughput
+# on the *-cond-exists* / *-all-old* delete workloads (they consume keys
+# as they go).
+#
+# Assumes: same prereqs as bench-quick.
+bench-conditional: bench-build
+    ./target/release/rekt-bench setup-ddb-local
+    @echo "=========================================="
+    @echo "DeleteItem (unconditional — regression check on the new RETURNING SQL)"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target direct-pg  --workload delete --concurrency 16 --duration 10s --warmup 2s
+    ./target/release/rekt-bench run --target rektifier  --workload delete --concurrency 16 --duration 10s --warmup 2s
+    ./target/release/rekt-bench run --target ddb-local  --workload delete --concurrency 16 --duration 10s --warmup 2s
+    @echo "=========================================="
+    @echo "PutItem with attribute_not_exists(id) (conditional Put slow path)"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target direct-pg  --workload put-cond-insert-only --concurrency 16 --duration 10s --warmup 2s
+    ./target/release/rekt-bench run --target rektifier  --workload put-cond-insert-only --concurrency 16 --duration 10s --warmup 2s
+    ./target/release/rekt-bench run --target ddb-local  --workload put-cond-insert-only --concurrency 16 --duration 10s --warmup 2s
+    @echo "=========================================="
+    @echo "PutItem with ReturnValues=ALL_OLD (pre-image CTE)"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target direct-pg  --workload put-all-old --concurrency 16 --duration 10s --warmup 2s --working-set 50000
+    ./target/release/rekt-bench run --target rektifier  --workload put-all-old --concurrency 16 --duration 10s --warmup 2s --working-set 50000
+    ./target/release/rekt-bench run --target ddb-local  --workload put-all-old --concurrency 16 --duration 10s --warmup 2s --working-set 50000
+    @echo "=========================================="
+    @echo "DeleteItem with attribute_exists(id) (conditional Delete slow path)"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target direct-pg  --workload delete-cond-exists --concurrency 16 --duration 10s --warmup 2s --working-set 50000
+    ./target/release/rekt-bench run --target rektifier  --workload delete-cond-exists --concurrency 16 --duration 10s --warmup 2s --working-set 50000
+    ./target/release/rekt-bench run --target ddb-local  --workload delete-cond-exists --concurrency 16 --duration 10s --warmup 2s --working-set 50000
+    @echo "=========================================="
+    @echo "DeleteItem with ReturnValues=ALL_OLD"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target direct-pg  --workload delete-all-old --concurrency 16 --duration 10s --warmup 2s --working-set 50000
+    ./target/release/rekt-bench run --target rektifier  --workload delete-all-old --concurrency 16 --duration 10s --warmup 2s --working-set 50000
+    ./target/release/rekt-bench run --target ddb-local  --workload delete-all-old --concurrency 16 --duration 10s --warmup 2s --working-set 50000

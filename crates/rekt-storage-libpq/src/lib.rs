@@ -9,21 +9,41 @@
 //! Column identifiers are quoted with `"..."` and any embedded quotes are
 //! doubled — Postgres can't bind identifiers as parameters, so quoting is
 //! what keeps SQL injection off the table.
+//!
+//! ## Module layout
+//!
+//! `lib.rs` defines [`PgBackend`] and the `impl Backend for PgBackend`
+//! trampoline; each method delegates to a `pub(crate)` function in one of
+//! the topic modules below:
+//!
+//! - [`types`] — foundational helpers ([`types::Bound`],
+//!   [`types::quote_ident`], `cast_for_keytype`, `map_pg_err`,
+//!   `check_sk_shape`).
+//! - [`shape`] — per-table cached SQL ([`shape::ShapeSql`] +
+//!   [`PgBackend::shape_sql`]) for put / get / delete.
+//! - [`condition_sql`] — Phase 4d ConditionExpression → SQL WHERE compiler
+//!   ([`condition_sql::ParamBuilder`], `compile_condition`).
+//! - [`update`] — UpdateItem SQL builders + the RMW prep
+//!   ([`update::RmwSqlPrep`]) + the four `update_*_raw` method bodies.
+//! - [`put_delete`] — bodies for `put_item_raw`, `get_item_raw`,
+//!   `delete_item_raw`, and the two `_with_condition_raw` siblings.
+
+mod condition_sql;
+mod put_delete;
+mod query;
+mod shape;
+mod types;
+mod update;
 
 use async_trait::async_trait;
-use bytes::BytesMut;
 use deadpool_postgres::{Manager, Pool};
-use rekt_expressions::{ComparisonOp, Condition, Operand, Path};
-use rekt_protocol::AttributeValue;
+use rekt_expressions::Condition;
 use rekt_storage::{
-    Backend, BackendError, GeneralUpdateFn, KeyType, KeyValue, TableShape, UpdateDecision,
-    UpdateOutcome,
+    Backend, BackendError, ConditionEvalFn, GeneralUpdateFn, KeyValue, QueryOutcome, SkCondition,
+    TableShape, UpdateOutcome,
 };
 use std::collections::HashMap;
-use std::fmt::Write;
 use std::sync::{Arc, RwLock};
-use tokio_postgres::error::SqlState;
-use tokio_postgres::types::{IsNull, Json, ToSql, Type};
 use tokio_postgres::NoTls;
 use tracing::Instrument;
 
@@ -32,22 +52,7 @@ pub struct PgBackend {
     /// Per-table cache of pre-formatted SQL and prepared-statement type
     /// vectors. Populated lazily on first touch from a `TableShape`. Keyed
     /// by `shape.table` (the PG table name).
-    sql_cache: RwLock<HashMap<String, Arc<ShapeSql>>>,
-}
-
-/// All the per-shape SQL state that used to be rebuilt every call.
-/// Computed once per distinct `TableShape`, then handed out as an `Arc`.
-struct ShapeSql {
-    put_sql: String,
-    get_sql: String,
-    delete_sql: String,
-    /// Parameter types for `put_item_raw`'s `prepare_typed_cached`: always
-    /// `[JSONB]` since writes only bind the jsonb column.
-    put_types: Vec<Type>,
-    /// Parameter types for `get_item_raw` and `delete_item_raw`: `[pk]` for
-    /// hash-only, `[pk, sk]` for composite. Each is `TEXT` (for `S`/`N` keys;
-    /// the SQL contains the `::numeric` cast) or `BYTEA` (for `B`).
-    key_types: Vec<Type>,
+    pub(crate) sql_cache: RwLock<HashMap<String, Arc<shape::ShapeSql>>>,
 }
 
 impl PgBackend {
@@ -75,290 +80,66 @@ impl PgBackend {
         Ok(Self::new(pool))
     }
 
-    async fn client(&self) -> Result<deadpool_postgres::Object, BackendError> {
+    pub(crate) async fn client(&self) -> Result<deadpool_postgres::Object, BackendError> {
         self.pool
             .get()
             .instrument(tracing::debug_span!("pg.pool_get"))
             .await
             .map_err(|e| BackendError::Other(format!("pool get failed: {e}")))
     }
-
-    /// Get or lazily-build the cached SQL for `shape`. Read-locks for the
-    /// common (hit) case; takes the write lock only on first touch per table.
-    fn shape_sql(&self, shape: &TableShape<'_>) -> Arc<ShapeSql> {
-        if let Some(s) = self.sql_cache.read().unwrap().get(shape.table) {
-            return Arc::clone(s);
-        }
-        let built = Arc::new(ShapeSql::build(shape));
-        let mut w = self.sql_cache.write().unwrap();
-        // Double-check: another thread may have inserted while we were
-        // acquiring the write lock.
-        Arc::clone(
-            w.entry(shape.table.to_string())
-                .or_insert_with(|| built.clone()),
-        )
-    }
-}
-
-/// Quote a SQL identifier per Postgres rules: wrap in `"..."` and double
-/// any embedded `"`. Combined with the operator-owned schema (rektifier
-/// never invents identifier names), this is sufficient to block injection.
-fn quote_ident(ident: &str) -> String {
-    let mut out = String::with_capacity(ident.len() + 2);
-    out.push('"');
-    for c in ident.chars() {
-        if c == '"' {
-            out.push('"');
-        }
-        out.push(c);
-    }
-    out.push('"');
-    out
-}
-
-/// Newtype that lets us pass a `&KeyValue` straight into tokio-postgres'
-/// parameter slot. We can't `impl ToSql for KeyValue` directly — orphan
-/// rules — and a `&dyn ToSql` returning helper has lifetime trouble for
-/// the `B` variant, so a tiny wrapper is the cleanest path.
-#[derive(Debug)]
-struct Bound<'a>(&'a KeyValue);
-
-impl ToSql for Bound<'_> {
-    fn to_sql(
-        &self,
-        ty: &Type,
-        out: &mut BytesMut,
-    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
-        match self.0 {
-            // Both `S` and `N` write UTF-8 text bytes. For `N`, the parameter
-            // is bound as TEXT at the prepare-typed layer and the SQL contains
-            // an explicit `$N::numeric` cast; PG converts text→numeric at the
-            // SQL level. DDB N is already a string on the wire, so we pass it
-            // through verbatim.
-            KeyValue::S(s) | KeyValue::N(s) => s.to_sql(ty, out),
-            KeyValue::B(b) => {
-                let slice: &[u8] = b.as_ref();
-                slice.to_sql(ty, out)
-            }
-        }
-    }
-
-    fn accepts(ty: &Type) -> bool {
-        // We bind the underlying value as either text (for `S` / `N`) or as a
-        // byte slice (for `B`). For non-text columns (`numeric`), we force the
-        // parameter's PG type to TEXT via `prepare_typed` at the call site and
-        // apply an explicit `$N::numeric` cast in the SQL — that way PG never
-        // asks us to bind into a NUMERIC parameter directly and we don't have
-        // to encode PG's numeric binary wire format ourselves.
-        matches!(
-            *ty,
-            Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN | Type::BYTEA
-        )
-    }
-
-    tokio_postgres::types::to_sql_checked!();
-}
-
-/// SQL-level cast suffix for a parameter declared as `KeyType`. `S` and `B`
-/// match their target column types natively; `N` is bound as text and cast
-/// to numeric at the SQL level.
-fn cast_for_keytype(t: KeyType) -> &'static str {
-    match t {
-        KeyType::S | KeyType::B => "",
-        KeyType::N => "::numeric",
-    }
-}
-
-/// PG `prepare_typed` type for a declared `KeyType`. `S`/`N` both bind as
-/// TEXT (the SQL contains the `::numeric` cast for `N`); `B` binds as BYTEA.
-fn pg_type_for_keytype(t: KeyType) -> Type {
-    match t {
-        KeyType::S | KeyType::N => Type::TEXT,
-        KeyType::B => Type::BYTEA,
-    }
-}
-
-impl ShapeSql {
-    fn build(shape: &TableShape<'_>) -> Self {
-        let table = quote_ident(shape.table);
-        let pk_col = quote_ident(shape.pk_col);
-        let jsonb_col = quote_ident(shape.jsonb_col);
-        let pk_cast = cast_for_keytype(shape.pk_type);
-        let pk_pg = pg_type_for_keytype(shape.pk_type);
-
-        match (shape.sk_col, shape.sk_type) {
-            (None, _) => Self {
-                put_sql: format!(
-                    "INSERT INTO {table} ({jsonb_col}) VALUES ($1) \
-                     ON CONFLICT ({pk_col}) \
-                     DO UPDATE SET {jsonb_col} = EXCLUDED.{jsonb_col}"
-                ),
-                get_sql: format!("SELECT {jsonb_col} FROM {table} WHERE {pk_col} = $1{pk_cast}"),
-                delete_sql: format!("DELETE FROM {table} WHERE {pk_col} = $1{pk_cast}"),
-                put_types: vec![Type::JSONB],
-                key_types: vec![pk_pg],
-            },
-            (Some(sk_col_name), Some(sk_type)) => {
-                let sk_col = quote_ident(sk_col_name);
-                let sk_cast = cast_for_keytype(sk_type);
-                let sk_pg = pg_type_for_keytype(sk_type);
-                Self {
-                    put_sql: format!(
-                        "INSERT INTO {table} ({jsonb_col}) VALUES ($1) \
-                         ON CONFLICT ({pk_col}, {sk_col}) \
-                         DO UPDATE SET {jsonb_col} = EXCLUDED.{jsonb_col}"
-                    ),
-                    get_sql: format!(
-                        "SELECT {jsonb_col} FROM {table} \
-                         WHERE {pk_col} = $1{pk_cast} AND {sk_col} = $2{sk_cast}"
-                    ),
-                    delete_sql: format!(
-                        "DELETE FROM {table} \
-                         WHERE {pk_col} = $1{pk_cast} AND {sk_col} = $2{sk_cast}"
-                    ),
-                    put_types: vec![Type::JSONB],
-                    key_types: vec![pk_pg, sk_pg],
-                }
-            }
-            (Some(_), None) => panic!(
-                "TableShape `{}`: sk_col is Some but sk_type is None — invariant violation",
-                shape.table
-            ),
-        }
-    }
-}
-
-/// Common precondition: caller passed `sk` iff shape has `sk_col`.
-fn check_sk_shape(shape: &TableShape<'_>, sk: Option<&KeyValue>) -> Result<(), BackendError> {
-    match (shape.sk_col, sk) {
-        (Some(_), Some(_)) | (None, None) => Ok(()),
-        (Some(_), None) => Err(BackendError::MissingSortKey {
-            name: shape.table.to_string(),
-        }),
-        (None, Some(_)) => Err(BackendError::UnexpectedSortKey {
-            name: shape.table.to_string(),
-        }),
-    }
-}
-
-fn map_pg_err(table: &str, e: tokio_postgres::Error) -> BackendError {
-    if e.code() == Some(&SqlState::UNDEFINED_TABLE) {
-        return BackendError::TableNotFound {
-            name: table.to_string(),
-        };
-    }
-    // `e.to_string()` collapses to "db error"; drill into the underlying
-    // DbError for the actual PG message + SQLSTATE.
-    let detail = match e.as_db_error() {
-        Some(db) => format!("{} ({})", db.message(), db.code().code()),
-        None => e.to_string(),
-    };
-    BackendError::Other(detail)
 }
 
 #[async_trait]
 impl Backend for PgBackend {
-    #[tracing::instrument(level = "debug", skip_all, name = "pg.put_item_raw", fields(table = %shape.table))]
     async fn put_item_raw(
         &self,
         shape: &TableShape<'_>,
+        pk: &KeyValue,
+        sk: Option<&KeyValue>,
         item: &serde_json::Value,
-    ) -> Result<(), BackendError> {
-        let sql = self.shape_sql(shape);
-        let client = self.client().await?;
-        let stmt = client
-            .prepare_typed_cached(&sql.put_sql, &sql.put_types)
-            .instrument(tracing::debug_span!("pg.prepare"))
-            .await
-            .map_err(|e| map_pg_err(shape.table, e))?;
-        client
-            .execute(&stmt, &[&Json(item)])
-            .instrument(tracing::debug_span!("pg.execute"))
-            .await
-            .map_err(|e| map_pg_err(shape.table, e))?;
-        Ok(())
+    ) -> Result<Option<serde_json::Value>, BackendError> {
+        put_delete::put_item_raw(self, shape, pk, sk, item).await
     }
 
-    #[tracing::instrument(level = "debug", skip_all, name = "pg.get_item_raw", fields(table = %shape.table))]
     async fn get_item_raw(
         &self,
         shape: &TableShape<'_>,
         pk: &KeyValue,
         sk: Option<&KeyValue>,
     ) -> Result<Option<serde_json::Value>, BackendError> {
-        check_sk_shape(shape, sk)?;
-        let sql = self.shape_sql(shape);
-        let client = self.client().await?;
-        let stmt = client
-            .prepare_typed_cached(&sql.get_sql, &sql.key_types)
-            .instrument(tracing::debug_span!("pg.prepare"))
-            .await
-            .map_err(|e| map_pg_err(shape.table, e))?;
-
-        let pk_bound = Bound(pk);
-        let query_result = match sk {
-            None => {
-                client
-                    .query_opt(&stmt, &[&pk_bound])
-                    .instrument(tracing::debug_span!("pg.query"))
-                    .await
-            }
-            Some(sk_val) => {
-                let sk_bound = Bound(sk_val);
-                client
-                    .query_opt(&stmt, &[&pk_bound, &sk_bound])
-                    .instrument(tracing::debug_span!("pg.query"))
-                    .await
-            }
-        };
-
-        let row = query_result.map_err(|e| map_pg_err(shape.table, e))?;
-        Ok(row.map(|r| {
-            let Json(v): Json<serde_json::Value> = r.get(0);
-            v
-        }))
+        put_delete::get_item_raw(self, shape, pk, sk).await
     }
 
-    #[tracing::instrument(level = "debug", skip_all, name = "pg.delete_item_raw", fields(table = %shape.table))]
     async fn delete_item_raw(
         &self,
         shape: &TableShape<'_>,
         pk: &KeyValue,
         sk: Option<&KeyValue>,
-    ) -> Result<(), BackendError> {
-        check_sk_shape(shape, sk)?;
-        let sql = self.shape_sql(shape);
-        let client = self.client().await?;
-        let stmt = client
-            .prepare_typed_cached(&sql.delete_sql, &sql.key_types)
-            .instrument(tracing::debug_span!("pg.prepare"))
-            .await
-            .map_err(|e| map_pg_err(shape.table, e))?;
-
-        let pk_bound = Bound(pk);
-        let exec_result = match sk {
-            None => {
-                client
-                    .execute(&stmt, &[&pk_bound])
-                    .instrument(tracing::debug_span!("pg.execute"))
-                    .await
-            }
-            Some(sk_val) => {
-                let sk_bound = Bound(sk_val);
-                client
-                    .execute(&stmt, &[&pk_bound, &sk_bound])
-                    .instrument(tracing::debug_span!("pg.execute"))
-                    .await
-            }
-        };
-
-        // DDB DeleteItem is idempotent — `Ok(())` whether 0 or 1 rows deleted.
-        // Errors map normally (TableNotFound, etc.).
-        exec_result.map_err(|e| map_pg_err(shape.table, e))?;
-        Ok(())
+    ) -> Result<Option<serde_json::Value>, BackendError> {
+        put_delete::delete_item_raw(self, shape, pk, sk).await
     }
 
-    #[tracing::instrument(level = "debug", skip_all, name = "pg.update_simple_raw", fields(table = %shape.table))]
+    async fn put_with_condition_raw(
+        &self,
+        shape: &TableShape<'_>,
+        pk: &KeyValue,
+        sk: Option<&KeyValue>,
+        item: &serde_json::Value,
+        condition: ConditionEvalFn<'_>,
+    ) -> Result<Option<serde_json::Value>, BackendError> {
+        put_delete::put_with_condition_raw(self, shape, pk, sk, item, condition).await
+    }
+
+    async fn delete_with_condition_raw(
+        &self,
+        shape: &TableShape<'_>,
+        pk: &KeyValue,
+        sk: Option<&KeyValue>,
+        condition: ConditionEvalFn<'_>,
+    ) -> Result<Option<serde_json::Value>, BackendError> {
+        put_delete::delete_with_condition_raw(self, shape, pk, sk, condition).await
+    }
+
     async fn update_simple_raw(
         &self,
         shape: &TableShape<'_>,
@@ -368,77 +149,9 @@ impl Backend for PgBackend {
         sets: &[(&str, &serde_json::Value)],
         removes: &[&str],
     ) -> Result<UpdateOutcome, BackendError> {
-        check_sk_shape(shape, sk)?;
-        let sql = build_update_sql(shape, sets.len(), removes.len());
-
-        // Parameter type vector mirrors the SQL produced by
-        // build_update_sql: the leading key params (1 or 2) feed the
-        // `prev` CTE; then $N+1 = JSONB (insert_item); then per-SET
-        // (TEXT attr name, JSONB value) pairs; then per-REMOVE TEXT
-        // attr names.
-        let pk_pg = pg_type_for_keytype(shape.pk_type);
-        let mut types: Vec<Type> =
-            Vec::with_capacity(1 + sk.is_some() as usize + 1 + 2 * sets.len() + removes.len());
-        types.push(pk_pg);
-        if let Some(sk_v) = sk {
-            types.push(pg_type_for_keytype(match sk_v {
-                KeyValue::S(_) => KeyType::S,
-                KeyValue::N(_) => KeyType::N,
-                KeyValue::B(_) => KeyType::B,
-            }));
-        }
-        types.push(Type::JSONB);
-        for _ in sets {
-            types.push(Type::TEXT);
-            types.push(Type::JSONB);
-        }
-        for _ in removes {
-            types.push(Type::TEXT);
-        }
-
-        let client = self.client().await?;
-        let stmt = client
-            .prepare_typed_cached(&sql, &types)
-            .instrument(tracing::debug_span!("pg.prepare"))
-            .await
-            .map_err(|e| map_pg_err(shape.table, e))?;
-
-        let pk_bound = Bound(pk);
-        let sk_bound = sk.map(Bound);
-        let insert_json = Json(insert_item);
-        let set_value_jsons: Vec<Json<&serde_json::Value>> =
-            sets.iter().map(|(_, v)| Json(*v)).collect();
-
-        let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(types.len());
-        params.push(&pk_bound);
-        if let Some(b) = sk_bound.as_ref() {
-            params.push(b);
-        }
-        params.push(&insert_json);
-        for (i, (name, _)) in sets.iter().enumerate() {
-            params.push(name);
-            params.push(&set_value_jsons[i]);
-        }
-        for name in removes {
-            params.push(name);
-        }
-
-        let row = client
-            .query_one(&stmt, &params)
-            .instrument(tracing::debug_span!("pg.execute"))
-            .await
-            .map_err(|e| map_pg_err(shape.table, e))?;
-        // Column 0: new_data (post-update). Column 1: old_data (pre-update,
-        // NULL if the row didn't exist).
-        let Json(new_item): Json<serde_json::Value> = row.get(0);
-        let old_item: Option<Json<serde_json::Value>> = row.get(1);
-        Ok(UpdateOutcome {
-            new_item,
-            old_item: old_item.map(|Json(v)| v),
-        })
+        update::update_simple_raw(self, shape, pk, sk, insert_item, sets, removes).await
     }
 
-    #[tracing::instrument(level = "debug", skip_all, name = "pg.update_with_simple_condition_raw", fields(table = %shape.table))]
     async fn update_with_simple_condition_raw(
         &self,
         shape: &TableShape<'_>,
@@ -448,94 +161,9 @@ impl Backend for PgBackend {
         removes: &[&str],
         condition: &Condition,
     ) -> Result<UpdateOutcome, BackendError> {
-        // Pre-flight: sk shape must match the table shape.
-        check_sk_shape(shape, sk)?;
-
-        let mut builder = ParamBuilder::new();
-
-        // 1) pk (and sk) — $1, $2. Same param indices feed both the
-        //    `prev` CTE's WHERE and the UPDATE's WHERE.
-        let pk_idx = builder.bind_key(pk);
-        let sk_idx = sk.map(|s| builder.bind_key(s));
-
-        // 2) SET-expression chain over `t.data`, then REMOVE chain.
-        let table_ident = quote_ident(shape.table);
-        let jsonb_ident = quote_ident(shape.jsonb_col);
-        let data_ref = format!("{table_ident}.{jsonb_ident}");
-        let mut expr = data_ref.clone();
-        for (name, value) in sets {
-            let name_idx = builder.bind_text((*name).to_string());
-            let value_idx = builder.bind_jsonb((*value).clone());
-            expr = format!(
-                "jsonb_set({expr}, ARRAY[${name_idx}::text], ${value_idx}::jsonb)"
-            );
-        }
-        for name in removes {
-            let name_idx = builder.bind_text((*name).to_string());
-            expr = format!("({expr}) - ${name_idx}::text");
-        }
-
-        // 3) key predicate, reused by both the `prev` CTE and the UPDATE.
-        let mut key_predicate = format!(
-            "{} = ${}{}",
-            quote_ident(shape.pk_col),
-            pk_idx,
-            cast_for_keytype(shape.pk_type),
-        );
-        if let (Some(sk_col), Some(sk_type), Some(idx)) =
-            (shape.sk_col, shape.sk_type, sk_idx)
-        {
-            let _ = write!(
-                key_predicate,
-                " AND {} = ${}{}",
-                quote_ident(sk_col),
-                idx,
-                cast_for_keytype(sk_type),
-            );
-        }
-        let cond_sql = compile_condition(&mut builder, &data_ref, condition)?;
-
-        // The `prev` CTE captures pre-update state at the same
-        // statement snapshot. The UPDATE adds the user's condition;
-        // the CTE intentionally does NOT — we want the old item even
-        // if the condition would have failed (though in that case
-        // the UPDATE returns 0 rows and we map to CCFE, never reading
-        // prev).
-        let sql = format!(
-            "WITH prev AS (SELECT {jsonb_ident} AS old_data FROM {table_ident} WHERE {key_predicate}) \
-             UPDATE {table_ident} SET {jsonb_ident} = {expr} \
-             WHERE {key_predicate} AND ({cond_sql}) \
-             RETURNING {jsonb_ident} AS new_data, (SELECT old_data FROM prev) AS old_data"
-        );
-
-        let client = self.client().await?;
-        let stmt = client
-            .prepare_typed_cached(&sql, &builder.types)
-            .instrument(tracing::debug_span!("pg.prepare"))
-            .await
-            .map_err(|e| map_pg_err(shape.table, e))?;
-
-        let params_refs: Vec<&(dyn ToSql + Sync)> =
-            builder.params.iter().map(|b| b.as_ref() as &(dyn ToSql + Sync)).collect();
-        let row = client
-            .query_opt(&stmt, &params_refs)
-            .instrument(tracing::debug_span!("pg.execute"))
-            .await
-            .map_err(|e| map_pg_err(shape.table, e))?;
-        match row {
-            None => Err(BackendError::ConditionalCheckFailed),
-            Some(r) => {
-                let Json(new_item): Json<serde_json::Value> = r.get(0);
-                let old_item: Option<Json<serde_json::Value>> = r.get(1);
-                Ok(UpdateOutcome {
-                    new_item,
-                    old_item: old_item.map(|Json(v)| v),
-                })
-            }
-        }
+        update::update_with_simple_condition_raw(self, shape, pk, sk, sets, removes, condition).await
     }
 
-    #[tracing::instrument(level = "debug", skip_all, name = "pg.update_general_rmw_raw", fields(table = %shape.table))]
     async fn update_general_rmw_raw(
         &self,
         shape: &TableShape<'_>,
@@ -543,493 +171,78 @@ impl Backend for PgBackend {
         sk: Option<&KeyValue>,
         apply: GeneralUpdateFn<'_>,
     ) -> Result<UpdateOutcome, BackendError> {
-        check_sk_shape(shape, sk)?;
-
-        // Pre-compute the three SQL shapes (SELECT, UPDATE, INSERT) once.
-        let table = quote_ident(shape.table);
-        let pk_col = quote_ident(shape.pk_col);
-        let jsonb_col = quote_ident(shape.jsonb_col);
-        let pk_cast = cast_for_keytype(shape.pk_type);
-        let pk_pg = pg_type_for_keytype(shape.pk_type);
-
-        let (select_sql, update_sql, key_types): (String, String, Vec<Type>) =
-            match (shape.sk_col, shape.sk_type) {
-                (None, _) => (
-                    format!(
-                        "SELECT {jsonb_col} FROM {table} \
-                         WHERE {pk_col} = $1{pk_cast} FOR UPDATE"
-                    ),
-                    format!(
-                        "UPDATE {table} SET {jsonb_col} = $1 \
-                         WHERE {pk_col} = $2{pk_cast}"
-                    ),
-                    vec![pk_pg.clone()],
-                ),
-                (Some(sk_col_name), Some(sk_type)) => {
-                    let sk_col = quote_ident(sk_col_name);
-                    let sk_cast = cast_for_keytype(sk_type);
-                    let sk_pg = pg_type_for_keytype(sk_type);
-                    (
-                        format!(
-                            "SELECT {jsonb_col} FROM {table} \
-                             WHERE {pk_col} = $1{pk_cast} AND {sk_col} = $2{sk_cast} FOR UPDATE"
-                        ),
-                        format!(
-                            "UPDATE {table} SET {jsonb_col} = $1 \
-                             WHERE {pk_col} = $2{pk_cast} AND {sk_col} = $3{sk_cast}"
-                        ),
-                        vec![pk_pg, sk_pg],
-                    )
-                }
-                (Some(_), None) => unreachable!(
-                    "TableShape `{}`: sk_col without sk_type",
-                    shape.table
-                ),
-            };
-        let insert_sql = build_insert_only_sql(shape);
-        // UPDATE param types are [JSONB, then the key types].
-        let mut update_types: Vec<Type> = Vec::with_capacity(1 + key_types.len());
-        update_types.push(Type::JSONB);
-        update_types.extend(key_types.iter().cloned());
-
-        let mut client = self.client().await?;
-        let tx = client
-            .transaction()
-            .instrument(tracing::debug_span!("pg.begin"))
-            .await
-            .map_err(|e| map_pg_err(shape.table, e))?;
-
-        // Prepare the three statements once; they're cached per
-        // (connection, sql) so repeated calls hit the same plan.
-        let select_stmt = tx
-            .prepare_typed_cached(&select_sql, &key_types)
-            .await
-            .map_err(|e| map_pg_err(shape.table, e))?;
-        let update_stmt = tx
-            .prepare_typed_cached(&update_sql, &update_types)
-            .await
-            .map_err(|e| map_pg_err(shape.table, e))?;
-        let insert_stmt = tx
-            .prepare_typed_cached(&insert_sql, &[Type::JSONB])
-            .await
-            .map_err(|e| map_pg_err(shape.table, e))?;
-
-        // Retry budget. The race-on-insert case converges in ≤2 iterations
-        // (once a row exists it can't be un-inserted, so the next SELECT
-        // finds it and goes down the UPDATE branch). 3 leaves margin.
-        const MAX_ITERS: usize = 3;
-        for _ in 0..MAX_ITERS {
-            // SELECT FOR UPDATE.
-            let pk_bound = Bound(pk);
-            let row = match sk {
-                None => {
-                    tx.query_opt(&select_stmt, &[&pk_bound])
-                        .instrument(tracing::debug_span!("pg.select_for_update"))
-                        .await
-                }
-                Some(sk_val) => {
-                    let sk_bound = Bound(sk_val);
-                    tx.query_opt(&select_stmt, &[&pk_bound, &sk_bound])
-                        .instrument(tracing::debug_span!("pg.select_for_update"))
-                        .await
-                }
-            }
-            .map_err(|e| map_pg_err(shape.table, e))?;
-
-            let existing: Option<serde_json::Value> = row.map(|r| {
-                let Json(v): Json<serde_json::Value> = r.get(0);
-                v
-            });
-
-            let decision = apply(existing.as_ref())?;
-            match decision {
-                UpdateDecision::Fail => {
-                    tx.rollback()
-                        .await
-                        .map_err(|e| map_pg_err(shape.table, e))?;
-                    return Err(BackendError::ConditionalCheckFailed);
-                }
-                UpdateDecision::Apply(new_item) => {
-                    let new_json = Json(&new_item);
-                    let rows = if existing.is_some() {
-                        // Row was present (and we hold its lock): plain UPDATE
-                        // by key always affects exactly 1 row.
-                        let pk_bound = Bound(pk);
-                        match sk {
-                            None => tx
-                                .execute(&update_stmt, &[&new_json, &pk_bound])
-                                .instrument(tracing::debug_span!("pg.update"))
-                                .await,
-                            Some(sk_val) => {
-                                let sk_bound = Bound(sk_val);
-                                tx.execute(&update_stmt, &[&new_json, &pk_bound, &sk_bound])
-                                    .instrument(tracing::debug_span!("pg.update"))
-                                    .await
-                            }
-                        }
-                        .map_err(|e| map_pg_err(shape.table, e))?
-                    } else {
-                        // Row was absent: race-guarded INSERT. 0 rows means a
-                        // concurrent transaction inserted between our SELECT
-                        // and this INSERT — loop and retry.
-                        tx.execute(&insert_stmt, &[&new_json])
-                            .instrument(tracing::debug_span!("pg.insert_on_conflict"))
-                            .await
-                            .map_err(|e| map_pg_err(shape.table, e))?
-                    };
-                    if rows > 0 {
-                        tx.commit()
-                            .await
-                            .map_err(|e| map_pg_err(shape.table, e))?;
-                        return Ok(UpdateOutcome {
-                            new_item,
-                            old_item: existing,
-                        });
-                    }
-                    // 0 rows from the INSERT-DO-NOTHING branch only — loop.
-                }
-            }
-        }
-
-        tx.rollback()
-            .await
-            .map_err(|e| map_pg_err(shape.table, e))?;
-        Err(BackendError::Other(
-            "update_general_rmw_raw exceeded retry budget (possible runaway race contention)"
-                .into(),
-        ))
+        update::update_general_rmw_raw(self, shape, pk, sk, apply).await
     }
 
-    #[tracing::instrument(level = "debug", skip_all, name = "pg.update_insert_only_raw", fields(table = %shape.table))]
     async fn update_insert_only_raw(
         &self,
         shape: &TableShape<'_>,
         insert_item: &serde_json::Value,
     ) -> Result<UpdateOutcome, BackendError> {
-        let sql = build_insert_only_sql(shape);
-        let client = self.client().await?;
-        let stmt = client
-            .prepare_typed_cached(&sql, &[Type::JSONB])
-            .instrument(tracing::debug_span!("pg.prepare"))
-            .await
-            .map_err(|e| map_pg_err(shape.table, e))?;
-        // INSERT … ON CONFLICT DO NOTHING RETURNING data: returns 1 row
-        // on successful insert, 0 rows when the conflict suppressed the
-        // INSERT — which means `attribute_not_exists(pk)` was false.
-        let row = client
-            .query_opt(&stmt, &[&Json(insert_item)])
-            .instrument(tracing::debug_span!("pg.execute"))
-            .await
-            .map_err(|e| map_pg_err(shape.table, e))?;
-        match row {
-            None => Err(BackendError::ConditionalCheckFailed),
-            Some(r) => {
-                let Json(new_item): Json<serde_json::Value> = r.get(0);
-                // Insert-only success means the row did NOT exist
-                // beforehand, so there's no pre-update item.
-                Ok(UpdateOutcome {
-                    new_item,
-                    old_item: None,
-                })
-            }
-        }
+        update::update_insert_only_raw(self, shape, insert_item).await
+    }
+
+    async fn query_raw(
+        &self,
+        shape: &TableShape<'_>,
+        pk: &KeyValue,
+        sk_condition: Option<&SkCondition>,
+        limit: Option<u32>,
+    ) -> Result<QueryOutcome, BackendError> {
+        query::query_raw(self, shape, pk, sk_condition, limit).await
     }
 }
-
-/// Build the per-call SQL for the simple-subset UpdateItem. The shape
-/// varies by `n_sets` and `n_removes`, so we can't precompute it per
-/// table — but `prepare_typed_cached` keys on the SQL string, so warm
-/// shapes still hit the prepared-statement cache.
-///
-/// Parameter layout:
-///   $1[, $2]    — pk[, sk] for the `prev` CTE's WHERE clause
-///   $K+1        — JSONB insert_item (K = 1 or 2)
-///   $K+2,$K+3   — per-SET (TEXT name, JSONB value) pairs
-///   ...         — per-REMOVE TEXT names
-///
-/// Adding the CTE costs one snapshot lookup; the upsert itself still
-/// derives its key columns from JSONB via `GENERATED ALWAYS AS`.
-fn build_update_sql(shape: &TableShape<'_>, n_sets: usize, n_removes: usize) -> String {
-    let table = quote_ident(shape.table);
-    let pk_col = quote_ident(shape.pk_col);
-    let jsonb_col = quote_ident(shape.jsonb_col);
-    let pk_cast = cast_for_keytype(shape.pk_type);
-
-    let conflict_cols = match shape.sk_col {
-        None => pk_col.clone(),
-        Some(sk) => format!("{pk_col}, {sk}", sk = quote_ident(sk)),
-    };
-
-    // Build the WHERE clause for the snapshot CTE and assign the
-    // insert-jsonb param index right after the key params.
-    let (cte_where, insert_param_idx) = match (shape.sk_col, shape.sk_type) {
-        (None, _) => (format!("{pk_col} = $1{pk_cast}"), 2usize),
-        (Some(sk_col), Some(sk_type)) => {
-            let sk_quoted = quote_ident(sk_col);
-            let sk_cast = cast_for_keytype(sk_type);
-            (
-                format!("{pk_col} = $1{pk_cast} AND {sk_quoted} = $2{sk_cast}"),
-                3,
-            )
-        }
-        (Some(_), None) => unreachable!(
-            "TableShape `{}`: sk_col without sk_type",
-            shape.table
-        ),
-    };
-
-    // Build the DO UPDATE expression: starts at `t.jsonb_col`; wrap
-    // with `jsonb_set(_, ARRAY[$name], $value)` per SET; append
-    // `- $name` per REMOVE.
-    let mut param_idx: usize = insert_param_idx + 1;
-    let mut expr = format!("{table}.{jsonb_col}");
-    for _ in 0..n_sets {
-        let name_p = param_idx;
-        let val_p = param_idx + 1;
-        param_idx += 2;
-        expr = format!("jsonb_set({expr}, ARRAY[${name_p}::text], ${val_p}::jsonb)");
-    }
-    for _ in 0..n_removes {
-        let name_p = param_idx;
-        param_idx += 1;
-        expr = format!("({expr}) - ${name_p}::text");
-    }
-
-    // The `prev` CTE reads the pre-update row at the same statement
-    // snapshot as the upsert, so old_data is the value that existed
-    // *before* this statement ran.
-    format!(
-        "WITH prev AS (SELECT {jsonb_col} AS old_data FROM {table} WHERE {cte_where}) \
-         INSERT INTO {table} ({jsonb_col}) VALUES (${insert_param_idx}::jsonb) \
-         ON CONFLICT ({conflict_cols}) \
-         DO UPDATE SET {jsonb_col} = {expr} \
-         RETURNING {jsonb_col} AS new_data, (SELECT old_data FROM prev) AS old_data"
-    )
-}
-
-/// SQL for the insert-only fast path (Phase 4c). Differs from
-/// `build_update_sql` only in `DO NOTHING` vs `DO UPDATE SET …`.
-/// One bound param: `$1::jsonb` = the synthesized full row.
-fn build_insert_only_sql(shape: &TableShape<'_>) -> String {
-    let table = quote_ident(shape.table);
-    let pk_col = quote_ident(shape.pk_col);
-    let jsonb_col = quote_ident(shape.jsonb_col);
-
-    let conflict_cols = match shape.sk_col {
-        None => pk_col,
-        Some(sk) => format!("{pk_col}, {sk}", sk = quote_ident(sk)),
-    };
-
-    format!(
-        "INSERT INTO {table} ({jsonb_col}) VALUES ($1::jsonb) \
-         ON CONFLICT ({conflict_cols}) DO NOTHING \
-         RETURNING {jsonb_col}"
-    )
-}
-
-// =============================================================================
-// ConditionExpression → SQL WHERE compiler (Phase 4d)
-// =============================================================================
-
-/// Accumulates positional parameters as we build the SQL string. The
-/// compiler binds attr names as TEXT, DDB-JSON values as JSONB, and the
-/// raw textual N/S form for typed ordering as TEXT (the SQL applies the
-/// `::numeric`/`::text` cast).
-struct ParamBuilder {
-    params: Vec<Box<dyn ToSql + Sync + Send>>,
-    types: Vec<Type>,
-}
-
-impl ParamBuilder {
-    fn new() -> Self {
-        Self {
-            params: Vec::new(),
-            types: Vec::new(),
-        }
-    }
-
-    fn next_idx(&self) -> usize {
-        self.params.len() + 1
-    }
-
-    fn bind_text(&mut self, s: String) -> usize {
-        let idx = self.next_idx();
-        self.params.push(Box::new(s));
-        self.types.push(Type::TEXT);
-        idx
-    }
-
-    fn bind_jsonb(&mut self, v: serde_json::Value) -> usize {
-        let idx = self.next_idx();
-        self.params.push(Box::new(Json(v)));
-        self.types.push(Type::JSONB);
-        idx
-    }
-
-    fn bind_key(&mut self, kv: &KeyValue) -> usize {
-        let idx = self.next_idx();
-        match kv {
-            KeyValue::S(s) | KeyValue::N(s) => {
-                self.params.push(Box::new(s.clone()));
-                self.types.push(Type::TEXT);
-            }
-            KeyValue::B(b) => {
-                self.params.push(Box::new(b.to_vec()));
-                self.types.push(Type::BYTEA);
-            }
-        }
-        idx
-    }
-}
-
-/// Walk a SimpleSql-classified `Condition` and emit a SQL WHERE fragment
-/// against `data_ref` (typically `"t".data`). Caller guarantees that
-/// every comparison fits the `condition_fits_sql` predicate from the
-/// translator — i.e., equality on any operand shapes, or ordering with
-/// one Path operand + one Value operand of type N or S. Anything else
-/// returns a `BackendError::Other("classifier divergence: …")` rather
-/// than a panic, so a translator/storage drift is loud.
-fn compile_condition(
-    b: &mut ParamBuilder,
-    data_ref: &str,
-    cond: &Condition,
-) -> Result<String, BackendError> {
-    match cond {
-        Condition::AttributeExists(p) => {
-            let idx = b.bind_text(top_attr(p)?);
-            Ok(format!("({data_ref} ? ${idx}::text)"))
-        }
-        Condition::AttributeNotExists(p) => {
-            let idx = b.bind_text(top_attr(p)?);
-            Ok(format!("(NOT ({data_ref} ? ${idx}::text))"))
-        }
-        Condition::Compare { op, left, right } => match op {
-            ComparisonOp::Eq | ComparisonOp::Ne => {
-                let l_sql = operand_as_jsonb(b, data_ref, left)?;
-                let r_sql = operand_as_jsonb(b, data_ref, right)?;
-                let op_str = if *op == ComparisonOp::Eq { "=" } else { "<>" };
-                // `IS [NOT] DISTINCT FROM` would treat NULL as a value; DDB
-                // semantics say "missing attr → comparison false", which is
-                // exactly what plain `=` / `<>` give us (NULL → false in WHERE).
-                Ok(format!("({l_sql} {op_str} {r_sql})"))
-            }
-            ComparisonOp::Lt | ComparisonOp::Le | ComparisonOp::Gt | ComparisonOp::Ge => {
-                compile_typed_ordering(b, data_ref, *op, left, right)
-            }
-        },
-        Condition::And(a, c) => {
-            let l = compile_condition(b, data_ref, a)?;
-            let r = compile_condition(b, data_ref, c)?;
-            Ok(format!("({l} AND {r})"))
-        }
-        Condition::Or(a, c) => {
-            let l = compile_condition(b, data_ref, a)?;
-            let r = compile_condition(b, data_ref, c)?;
-            Ok(format!("({l} OR {r})"))
-        }
-        Condition::Not(inner) => {
-            let s = compile_condition(b, data_ref, inner)?;
-            Ok(format!("(NOT {s})"))
-        }
-        // Phase 4e shapes route to the slow path via the translator's
-        // `condition_fits_sql == false`; reaching the SQL compiler with
-        // one of these is a classifier divergence.
-        Condition::BeginsWith(_, _)
-        | Condition::Contains(_, _)
-        | Condition::Between(_, _, _)
-        | Condition::In(_, _)
-        | Condition::AttributeType(_, _) => Err(BackendError::Other(
-            "classifier divergence: Phase 4e shape reached SQL compiler".into(),
-        )),
-    }
-}
-
-fn top_attr(p: &Path) -> Result<String, BackendError> {
-    p.top_name().map(str::to_string).ok_or_else(|| {
-        BackendError::Other("classifier divergence: non-top-level path reached SQL compiler".into())
-    })
-}
-
-/// Render an operand as a jsonb-typed SQL expression. For paths this is
-/// `data->attr`; for values it's `$N::jsonb` bound to the DDB-JSON form.
-fn operand_as_jsonb(
-    b: &mut ParamBuilder,
-    data_ref: &str,
-    op: &Operand,
-) -> Result<String, BackendError> {
-    match op {
-        Operand::Path(p) => {
-            let idx = b.bind_text(top_attr(p)?);
-            Ok(format!("{data_ref}->${idx}::text"))
-        }
-        Operand::Value(v) => {
-            let json_v =
-                serde_json::to_value(v).expect("AttributeValue Serialize is infallible");
-            let idx = b.bind_jsonb(json_v);
-            Ok(format!("${idx}::jsonb"))
-        }
-    }
-}
-
-/// Compile an ordering compare: one operand is a Path, the other is a
-/// Value of type N or S. Extract the typed scalar from the stored DDB
-/// JSON (`data#>>ARRAY['attr','N']` etc.), cast to numeric / text, and
-/// compare with a likewise-cast bound parameter.
-fn compile_typed_ordering(
-    b: &mut ParamBuilder,
-    data_ref: &str,
-    op: ComparisonOp,
-    left: &Operand,
-    right: &Operand,
-) -> Result<String, BackendError> {
-    // Normalize to (path, value) with the operator possibly flipped so
-    // the path is always on the LHS in the emitted SQL.
-    let (path, value, sql_op_str) = match (left, right) {
-        (Operand::Path(p), Operand::Value(v)) => (p, v, sql_op(op, false)),
-        (Operand::Value(v), Operand::Path(p)) => (p, v, sql_op(op, true)),
-        _ => {
-            return Err(BackendError::Other(
-                "classifier divergence: ordering must be Path/Value".into(),
-            ));
-        }
-    };
-    let attr_idx = b.bind_text(top_attr(path)?);
-    match value {
-        AttributeValue::N(n) => {
-            let val_idx = b.bind_text(n.clone());
-            Ok(format!(
-                "(({data_ref}#>>ARRAY[${attr_idx}::text, 'N']::text[])::numeric \
-                 {sql_op_str} ${val_idx}::numeric)"
-            ))
-        }
-        AttributeValue::S(s) => {
-            let val_idx = b.bind_text(s.clone());
-            Ok(format!(
-                "({data_ref}#>>ARRAY[${attr_idx}::text, 'S']::text[] \
-                 {sql_op_str} ${val_idx}::text)"
-            ))
-        }
-        _ => Err(BackendError::Other(
-            "classifier divergence: ordering RHS must be N or S".into(),
-        )),
-    }
-}
-
-fn sql_op(op: ComparisonOp, swap: bool) -> &'static str {
-    use ComparisonOp::*;
-    match (op, swap) {
-        (Lt, false) | (Gt, true) => "<",
-        (Le, false) | (Ge, true) => "<=",
-        (Gt, false) | (Lt, true) => ">",
-        (Ge, false) | (Le, true) => ">=",
-        _ => unreachable!("non-ordering op reached sql_op"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::quote_ident;
     use bytes::Bytes;
+    use rekt_storage::{KeyType, UpdateDecision};
+
+    /// Test helper: derive `KeyValue`s from an item JSON per a shape so
+    /// tests can stay terse. The CTE-based `put_item_raw` needs pk(+sk)
+    /// bound explicitly; deriving from the item we're inserting matches
+    /// what the translator does at runtime.
+    fn keys_from_item(
+        shape: &TableShape<'_>,
+        item: &serde_json::Value,
+    ) -> (KeyValue, Option<KeyValue>) {
+        fn kv(t: KeyType, v: &serde_json::Value) -> KeyValue {
+            match t {
+                KeyType::S => KeyValue::S(v["S"].as_str().expect("S attr").to_string()),
+                KeyType::N => KeyValue::N(v["N"].as_str().expect("N attr").to_string()),
+                KeyType::B => {
+                    use base64::Engine;
+                    let b = base64::engine::general_purpose::STANDARD
+                        .decode(v["B"].as_str().expect("B attr"))
+                        .expect("B base64");
+                    KeyValue::B(Bytes::from(b))
+                }
+            }
+        }
+        let pk = kv(shape.pk_type, &item[shape.pk_col]);
+        let sk = shape
+            .sk_col
+            .zip(shape.sk_type)
+            .map(|(c, t)| kv(t, &item[c]));
+        (pk, sk)
+    }
+
+    /// Convenience wrapper around the now-CTE-flavored `put_item_raw`
+    /// that derives pk/sk from the item. Tests that don't care about
+    /// the returned pre-image use this; tests that do call the trait
+    /// method directly.
+    async fn pg_put(
+        backend: &PgBackend,
+        shape: &TableShape<'_>,
+        item: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        let (pk, sk) = keys_from_item(shape, item);
+        backend
+            .put_item_raw(shape, &pk, sk.as_ref(), item)
+            .await
+            .unwrap()
+    }
 
     #[test]
     fn quote_ident_basic() {
@@ -1079,7 +292,7 @@ mod tests {
             jsonb_col: "data",
         };
         let item = serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}});
-        backend.put_item_raw(&shape, &item).await.unwrap();
+        let _ = pg_put(&backend, &shape, &item).await;
 
         let got = backend
             .get_item_raw(&shape, &KeyValue::S("u1".into()), None)
@@ -1089,7 +302,7 @@ mod tests {
 
         // Upsert: same key, different value, should replace.
         let item2 = serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice2"}});
-        backend.put_item_raw(&shape, &item2).await.unwrap();
+        let _ = pg_put(&backend, &shape, &item2).await;
         let got2 = backend
             .get_item_raw(&shape, &KeyValue::S("u1".into()), None)
             .await
@@ -1154,8 +367,8 @@ mod tests {
             serde_json::json!({"device_id":{"S":"dev-1"},"ts":{"N":"1000"},"val":{"N":"1"}});
         let item2 =
             serde_json::json!({"device_id":{"S":"dev-1"},"ts":{"N":big_ts},"val":{"N":"2"}});
-        backend.put_item_raw(&shape, &item1).await.unwrap();
-        backend.put_item_raw(&shape, &item2).await.unwrap();
+        let _ = pg_put(&backend, &shape, &item1).await;
+        let _ = pg_put(&backend, &shape, &item2).await;
 
         assert_eq!(
             backend
@@ -1220,7 +433,7 @@ mod tests {
         };
         // base64 of "\x00\x01\x02\xff" is "AAEC/w==".
         let item = serde_json::json!({"hash":{"B":"AAEC/w=="},"extent":{"N":"4"}});
-        backend.put_item_raw(&shape, &item).await.unwrap();
+        let _ = pg_put(&backend, &shape, &item).await;
 
         let got = backend
             .get_item_raw(
@@ -1267,9 +480,14 @@ mod tests {
             sk_type: None,
             jsonb_col: "data",
         };
-        // JSONB has no `id` attr — generated column yields NULL — PRIMARY KEY rejects.
+        // JSONB has no `id` attr — generated column yields NULL — PRIMARY KEY
+        // rejects. The pk_value we bind to the CTE is a separate concern (it
+        // only feeds the snapshot read, not the INSERT path).
         let bad_item = serde_json::json!({"label":{"S":"alice"}});
-        let err = backend.put_item_raw(&shape, &bad_item).await.unwrap_err();
+        let err = backend
+            .put_item_raw(&shape, &KeyValue::S("anything".into()), None, &bad_item)
+            .await
+            .unwrap_err();
         // PG raises a not-null-violation; we map to Other for now (translator
         // should catch this case earlier in the real call path).
         assert!(matches!(err, BackendError::Other(_)));
@@ -1306,7 +524,7 @@ mod tests {
             jsonb_col: "data",
         };
         let item = serde_json::json!({"id":{"S":"alice"},"label":{"S":"A"}});
-        backend.put_item_raw(&shape, &item).await.unwrap();
+        let _ = pg_put(&backend, &shape, &item).await;
         // Sanity: item is present.
         assert_eq!(
             backend
@@ -1370,8 +588,8 @@ mod tests {
         };
         let item_a = serde_json::json!({"device_id":{"S":"d1"},"ts":{"N":"100"},"v":{"N":"1"}});
         let item_b = serde_json::json!({"device_id":{"S":"d1"},"ts":{"N":"200"},"v":{"N":"2"}});
-        backend.put_item_raw(&shape, &item_a).await.unwrap();
-        backend.put_item_raw(&shape, &item_b).await.unwrap();
+        let _ = pg_put(&backend, &shape, &item_a).await;
+        let _ = pg_put(&backend, &shape, &item_b).await;
 
         // Delete only the (d1, 100) row; (d1, 200) survives.
         backend
@@ -1501,7 +719,7 @@ mod tests {
             "label":{"S":"alice"},
             "untouched":{"S":"keep_me"},
         });
-        backend.put_item_raw(&shape, &original).await.unwrap();
+        let _ = pg_put(&backend, &shape, &original).await;
 
         // Update: replace `name`, add a new `score`. Sibling `untouched`
         // must survive — that's the merge contract.
@@ -1561,7 +779,7 @@ mod tests {
             "label":{"S":"alice"},
             "deprecated":{"S":"gone"},
         });
-        backend.put_item_raw(&shape, &original).await.unwrap();
+        let _ = pg_put(&backend, &shape, &original).await;
 
         // REMOVE `deprecated` (present) and `never_existed` (absent).
         // Absent path is a no-op, must not error.
@@ -1615,7 +833,7 @@ mod tests {
             "flag":{"S":"old"},
             "deprecated":{"S":"x"},
         });
-        backend.put_item_raw(&shape, &original).await.unwrap();
+        let _ = pg_put(&backend, &shape, &original).await;
 
         let status_v = serde_json::json!({"S":"new"});
         backend
@@ -1698,7 +916,7 @@ mod tests {
             "val":{"N":"1"},
             "label":{"S":"keep_me"},
         });
-        backend.put_item_raw(&shape, &extra).await.unwrap();
+        let _ = pg_put(&backend, &shape, &extra).await;
 
         let value_v2 = serde_json::json!({"N":"99"});
         backend
@@ -1860,7 +1078,7 @@ mod tests {
         };
 
         let original = serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}});
-        backend.put_item_raw(&shape, &original).await.unwrap();
+        let _ = pg_put(&backend, &shape, &original).await;
 
         // Second insert-only call on the same key must fail and leave
         // the original row untouched.
@@ -1995,13 +1213,7 @@ mod tests {
             jsonb_col: "data",
         };
 
-        backend
-            .put_item_raw(
-                &shape,
-                &serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}}),
-            )
-            .await
-            .unwrap();
+        let _ = pg_put(&backend, &shape, &serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}})).await;
 
         let new_name = serde_json::json!({"S":"alice2"});
         backend
@@ -2079,13 +1291,7 @@ mod tests {
             jsonb_col: "data",
         };
 
-        backend
-            .put_item_raw(
-                &shape,
-                &serde_json::json!({"id":{"S":"u1"},"version":{"N":"3"}}),
-            )
-            .await
-            .unwrap();
+        let _ = pg_put(&backend, &shape, &serde_json::json!({"id":{"S":"u1"},"version":{"N":"3"}})).await;
 
         // Matching version → update applies (set version to 4).
         let new_v = serde_json::json!({"N":"4"});
@@ -2146,13 +1352,7 @@ mod tests {
             jsonb_col: "data",
         };
 
-        backend
-            .put_item_raw(
-                &shape,
-                &serde_json::json!({"id":{"S":"u1"},"score":{"N":"42"}}),
-            )
-            .await
-            .unwrap();
+        let _ = pg_put(&backend, &shape, &serde_json::json!({"id":{"S":"u1"},"score":{"N":"42"}})).await;
 
         // score < 100 → true.
         let new_score = serde_json::json!({"N":"50"});
@@ -2211,17 +1411,7 @@ mod tests {
             jsonb_col: "data",
         };
 
-        backend
-            .put_item_raw(
-                &shape,
-                &serde_json::json!({
-                    "id":{"S":"u1"},
-                    "flag":{"S":"active"},
-                    "version":{"N":"1"},
-                }),
-            )
-            .await
-            .unwrap();
+        let _ = pg_put(&backend, &shape, &serde_json::json!({ "id":{"S":"u1"}, "flag":{"S":"active"}, "version":{"N":"1"}, })).await;
 
         // Both terms true → update applies.
         let new_v = serde_json::json!({"N":"2"});
@@ -2288,13 +1478,7 @@ mod tests {
             jsonb_col: "data",
         };
 
-        backend
-            .put_item_raw(
-                &shape,
-                &serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}}),
-            )
-            .await
-            .unwrap();
+        let _ = pg_put(&backend, &shape, &serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}})).await;
 
         // attribute_not_exists(score) on a row that has no `score` → true.
         let v = serde_json::json!({"N":"7"});
@@ -2394,7 +1578,7 @@ mod tests {
         };
 
         let original = serde_json::json!({"id":{"S":"u1"},"tally":{"N":"5"}});
-        backend.put_item_raw(&shape, &original).await.unwrap();
+        let _ = pg_put(&backend, &shape, &original).await;
 
         // Closure: read counter, increment, write back.
         let apply: GeneralUpdateFn<'_> = Box::new(move |existing| {
@@ -2445,7 +1629,7 @@ mod tests {
         };
 
         let original = serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}});
-        backend.put_item_raw(&shape, &original).await.unwrap();
+        let _ = pg_put(&backend, &shape, &original).await;
 
         let apply: GeneralUpdateFn<'_> =
             Box::new(move |_existing| Ok(UpdateDecision::Fail));
@@ -2482,17 +1666,21 @@ mod tests {
             "data".to_string(),
         );
 
+        let init_shape = TableShape {
+            table: &shape_owned.0,
+            pk_col: &shape_owned.1,
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: &shape_owned.2,
+        };
+        let init_item = serde_json::json!({"id":{"S":"u1"},"tally":{"N":"0"}});
         backend
             .put_item_raw(
-                &TableShape {
-                    table: &shape_owned.0,
-                    pk_col: &shape_owned.1,
-                    pk_type: KeyType::S,
-                    sk_col: None,
-                    sk_type: None,
-                    jsonb_col: &shape_owned.2,
-                },
-                &serde_json::json!({"id":{"S":"u1"},"tally":{"N":"0"}}),
+                &init_shape,
+                &KeyValue::S("u1".into()),
+                None,
+                &init_item,
             )
             .await
             .unwrap();
@@ -2625,13 +1813,7 @@ mod tests {
             jsonb_col: "data",
         };
 
-        backend
-            .put_item_raw(
-                &shape,
-                &serde_json::json!({"id":{"S":"u1"},"tally":{"N":"10"}}),
-            )
-            .await
-            .unwrap();
+        let _ = pg_put(&backend, &shape, &serde_json::json!({"id":{"S":"u1"},"tally":{"N":"10"}})).await;
 
         let key: rekt_protocol::Item = [(
             "id".to_string(),
@@ -2679,13 +1861,7 @@ mod tests {
             jsonb_col: "data",
         };
 
-        backend
-            .put_item_raw(
-                &shape,
-                &serde_json::json!({"id":{"S":"u1"},"tags":{"SS":["a","b"]}}),
-            )
-            .await
-            .unwrap();
+        let _ = pg_put(&backend, &shape, &serde_json::json!({"id":{"S":"u1"},"tags":{"SS":["a","b"]}})).await;
 
         let key: rekt_protocol::Item = [(
             "id".to_string(),
@@ -2740,13 +1916,7 @@ mod tests {
             jsonb_col: "data",
         };
 
-        backend
-            .put_item_raw(
-                &shape,
-                &serde_json::json!({"id":{"S":"u1"},"tags":{"SS":["a","b"]},"keep":{"S":"x"}}),
-            )
-            .await
-            .unwrap();
+        let _ = pg_put(&backend, &shape, &serde_json::json!({"id":{"S":"u1"},"tags":{"SS":["a","b"]},"keep":{"S":"x"}})).await;
 
         let key: rekt_protocol::Item = [(
             "id".to_string(),
@@ -2799,13 +1969,7 @@ mod tests {
             jsonb_col: "data",
         };
 
-        backend
-            .put_item_raw(
-                &shape,
-                &serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}}),
-            )
-            .await
-            .unwrap();
+        let _ = pg_put(&backend, &shape, &serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}})).await;
 
         let key: rekt_protocol::Item = [(
             "id".to_string(),
@@ -2882,5 +2046,291 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, BackendError::TableNotFound { .. }));
+    }
+
+    // ============================================================
+    // Q1 — query_raw against real PG
+    // ============================================================
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn query_pk_only_returns_partition_ordered() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_q_pk_only;
+                 CREATE TABLE rekt_t_q_pk_only (
+                   doc       jsonb NOT NULL,
+                   device_id text    GENERATED ALWAYS AS (doc#>>'{device_id,S}')     STORED,
+                   ts        numeric GENERATED ALWAYS AS ((doc#>>'{ts,N}')::numeric) STORED,
+                   PRIMARY KEY (device_id, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_q_pk_only",
+            pk_col: "device_id",
+            pk_type: KeyType::S,
+            sk_col: Some("ts"),
+            sk_type: Some(KeyType::N),
+            jsonb_col: "doc",
+        };
+        for ts in ["3000", "1000", "2000"] {
+            let item =
+                serde_json::json!({"device_id":{"S":"dev-1"},"ts":{"N":ts},"val":{"N":ts}});
+            pg_put(&backend, &shape, &item).await;
+        }
+
+        let out = backend
+            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, None)
+            .await
+            .unwrap();
+        assert_eq!(out.count, 3);
+        assert_eq!(out.scanned_count, 3);
+        let ts_seq: Vec<&str> = out
+            .items
+            .iter()
+            .map(|i| i["ts"]["N"].as_str().unwrap())
+            .collect();
+        assert_eq!(ts_seq, vec!["1000", "2000", "3000"]);
+
+        client
+            .batch_execute("DROP TABLE rekt_t_q_pk_only;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn query_sk_predicates() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_q_sk;
+                 CREATE TABLE rekt_t_q_sk (
+                   doc       jsonb NOT NULL,
+                   device_id text    GENERATED ALWAYS AS (doc#>>'{device_id,S}')     STORED,
+                   ts        numeric GENERATED ALWAYS AS ((doc#>>'{ts,N}')::numeric) STORED,
+                   PRIMARY KEY (device_id, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_q_sk",
+            pk_col: "device_id",
+            pk_type: KeyType::S,
+            sk_col: Some("ts"),
+            sk_type: Some(KeyType::N),
+            jsonb_col: "doc",
+        };
+        for ts in ["100", "200", "300", "400", "500"] {
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({"device_id":{"S":"dev-1"},"ts":{"N":ts},"val":{"S":"x"}}),
+            )
+            .await;
+        }
+
+        let pk = KeyValue::S("dev-1".into());
+
+        // Eq
+        let out = backend
+            .query_raw(
+                &shape,
+                &pk,
+                Some(&SkCondition::Eq(KeyValue::N("300".into()))),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.count, 1);
+        assert_eq!(out.items[0]["ts"]["N"], "300");
+
+        // Lt → 100, 200
+        let out = backend
+            .query_raw(
+                &shape,
+                &pk,
+                Some(&SkCondition::Lt(KeyValue::N("300".into()))),
+                None,
+            )
+            .await
+            .unwrap();
+        let ts: Vec<&str> = out
+            .items
+            .iter()
+            .map(|i| i["ts"]["N"].as_str().unwrap())
+            .collect();
+        assert_eq!(ts, vec!["100", "200"]);
+
+        // Ge → 300, 400, 500
+        let out = backend
+            .query_raw(
+                &shape,
+                &pk,
+                Some(&SkCondition::Ge(KeyValue::N("300".into()))),
+                None,
+            )
+            .await
+            .unwrap();
+        let ts: Vec<&str> = out
+            .items
+            .iter()
+            .map(|i| i["ts"]["N"].as_str().unwrap())
+            .collect();
+        assert_eq!(ts, vec!["300", "400", "500"]);
+
+        // Between (inclusive)
+        let out = backend
+            .query_raw(
+                &shape,
+                &pk,
+                Some(&SkCondition::Between(
+                    KeyValue::N("200".into()),
+                    KeyValue::N("400".into()),
+                )),
+                None,
+            )
+            .await
+            .unwrap();
+        let ts: Vec<&str> = out
+            .items
+            .iter()
+            .map(|i| i["ts"]["N"].as_str().unwrap())
+            .collect();
+        assert_eq!(ts, vec!["200", "300", "400"]);
+
+        client
+            .batch_execute("DROP TABLE rekt_t_q_sk;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn query_sk_begins_with_string() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_q_bw;
+                 CREATE TABLE rekt_t_q_bw (
+                   data   jsonb NOT NULL,
+                   thread text GENERATED ALWAYS AS (data#>>'{thread,S}') STORED,
+                   ts     text GENERATED ALWAYS AS (data#>>'{ts,S}')     STORED,
+                   PRIMARY KEY (thread, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_q_bw",
+            pk_col: "thread",
+            pk_type: KeyType::S,
+            sk_col: Some("ts"),
+            sk_type: Some(KeyType::S),
+            jsonb_col: "data",
+        };
+        for ts in ["2026-01-01", "2026-01-02", "2026-02-01", "2027-01-01"] {
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({"thread":{"S":"t-1"},"ts":{"S":ts},"body":{"S":"x"}}),
+            )
+            .await;
+        }
+        let out = backend
+            .query_raw(
+                &shape,
+                &KeyValue::S("t-1".into()),
+                Some(&SkCondition::BeginsWithS("2026-01".into())),
+                None,
+            )
+            .await
+            .unwrap();
+        let ts: Vec<&str> = out
+            .items
+            .iter()
+            .map(|i| i["ts"]["S"].as_str().unwrap())
+            .collect();
+        assert_eq!(ts, vec!["2026-01-01", "2026-01-02"]);
+
+        // Verify LIKE-special chars in the prefix are escaped: a prefix
+        // of `%` should match nothing (not "everything").
+        let none = backend
+            .query_raw(
+                &shape,
+                &KeyValue::S("t-1".into()),
+                Some(&SkCondition::BeginsWithS("%".into())),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(none.count, 0);
+
+        client
+            .batch_execute("DROP TABLE rekt_t_q_bw;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn query_limit_honored() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_q_limit;
+                 CREATE TABLE rekt_t_q_limit (
+                   doc       jsonb NOT NULL,
+                   device_id text    GENERATED ALWAYS AS (doc#>>'{device_id,S}')     STORED,
+                   ts        numeric GENERATED ALWAYS AS ((doc#>>'{ts,N}')::numeric) STORED,
+                   PRIMARY KEY (device_id, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_q_limit",
+            pk_col: "device_id",
+            pk_type: KeyType::S,
+            sk_col: Some("ts"),
+            sk_type: Some(KeyType::N),
+            jsonb_col: "doc",
+        };
+        for ts in 1..=10 {
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({
+                    "device_id":{"S":"dev-1"},
+                    "ts":{"N": ts.to_string()},
+                    "val":{"N": ts.to_string()}
+                }),
+            )
+            .await;
+        }
+        let out = backend
+            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, Some(3))
+            .await
+            .unwrap();
+        assert_eq!(out.count, 3);
+        let ts: Vec<&str> = out
+            .items
+            .iter()
+            .map(|i| i["ts"]["N"].as_str().unwrap())
+            .collect();
+        assert_eq!(ts, vec!["1", "2", "3"]);
+
+        client
+            .batch_execute("DROP TABLE rekt_t_q_limit;")
+            .await
+            .unwrap();
     }
 }

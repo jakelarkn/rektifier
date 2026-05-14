@@ -100,11 +100,39 @@ pub trait Backend: Send + Sync + 'static {
     /// to derive `pk_col` (and `sk_col` if present) via `GENERATED ALWAYS
     /// AS ... STORED` columns — rektifier never binds key values on writes.
     /// Matches DynamoDB's default `PutItem` semantics (no `ConditionExpression`).
+    ///
+    /// Returns the pre-existing row at the same key, if any. Callers that
+    /// don't need it (e.g. `ReturnValues=NONE`) ignore the value; callers
+    /// implementing `ReturnValues=ALL_OLD` return it as the response's
+    /// `Attributes` field. `pk` (+ optional `sk`) is bound to a CTE that
+    /// snapshots the prior row at the same MVCC point as the upsert.
     async fn put_item_raw(
         &self,
         shape: &TableShape<'_>,
+        pk: &KeyValue,
+        sk: Option<&KeyValue>,
         item: &serde_json::Value,
-    ) -> Result<(), BackendError>;
+    ) -> Result<Option<serde_json::Value>, BackendError>;
+
+    /// Conditional PutItem. Reads the current row under `SELECT FOR UPDATE`,
+    /// invokes `condition` against it (with `None` for a missing row),
+    /// and on `true` replaces it with `item`. On `false` returns
+    /// [`BackendError::ConditionalCheckFailed`] and rolls back. Returns
+    /// the pre-update row (or `None` if it didn't exist) on success —
+    /// same shape as [`Backend::put_item_raw`].
+    ///
+    /// The condition is passed as a closure (rather than the AST
+    /// directly) so the storage layer doesn't have to depend on the
+    /// expression evaluator. The caller wraps
+    /// `rekt_translator::evaluate_condition` to match the trait shape.
+    async fn put_with_condition_raw(
+        &self,
+        shape: &TableShape<'_>,
+        pk: &KeyValue,
+        sk: Option<&KeyValue>,
+        item: &serde_json::Value,
+        condition: ConditionEvalFn<'_>,
+    ) -> Result<Option<serde_json::Value>, BackendError>;
 
     /// Returns `Ok(None)` when the table exists but no row matches.
     /// Returns `Err(BackendError::TableNotFound)` when the table itself
@@ -116,15 +144,32 @@ pub trait Backend: Send + Sync + 'static {
         sk: Option<&KeyValue>,
     ) -> Result<Option<serde_json::Value>, BackendError>;
 
-    /// Delete one row by full key. Idempotent: returns `Ok(())` whether
+    /// Delete one row by full key. Idempotent: returns `Ok(None)` whether
     /// the row existed or not, matching DynamoDB's default DeleteItem
-    /// semantics (`ReturnValues=NONE` and no `ConditionExpression`).
+    /// semantics. The returned `Option` carries the deleted row (when
+    /// one was removed) for `ReturnValues=ALL_OLD`; `ReturnValues=NONE`
+    /// callers ignore it.
     async fn delete_item_raw(
         &self,
         shape: &TableShape<'_>,
         pk: &KeyValue,
         sk: Option<&KeyValue>,
-    ) -> Result<(), BackendError>;
+    ) -> Result<Option<serde_json::Value>, BackendError>;
+
+    /// Conditional DeleteItem. Reads the current row under `SELECT FOR
+    /// UPDATE`, invokes `condition` against it (with `None` for a
+    /// missing row — so `attribute_not_exists(pk)` evaluates true,
+    /// `attribute_exists(pk)` false). On `true` → DELETE and return the
+    /// deleted row (or `None` if the row genuinely didn't exist and the
+    /// condition still passed, e.g. `attribute_not_exists(pk)`). On
+    /// `false` → [`BackendError::ConditionalCheckFailed`].
+    async fn delete_with_condition_raw(
+        &self,
+        shape: &TableShape<'_>,
+        pk: &KeyValue,
+        sk: Option<&KeyValue>,
+        condition: ConditionEvalFn<'_>,
+    ) -> Result<Option<serde_json::Value>, BackendError>;
 
     /// Apply the "simple subset" of a DynamoDB UpdateExpression to a single
     /// row, atomically. Emits one statement of the shape:
@@ -264,6 +309,55 @@ pub trait Backend: Send + Sync + 'static {
         sk: Option<&KeyValue>,
         apply: GeneralUpdateFn<'_>,
     ) -> Result<UpdateOutcome, BackendError>;
+
+    /// Query — bounded read over a single partition.
+    ///
+    /// Emits a `SELECT … FROM <table> WHERE pk_col = $1 [AND <sk-cond>]
+    /// ORDER BY sk_col ASC LIMIT $L` against the table's indexed key
+    /// columns. `pk` always equality-matches; `sk_condition` (when set)
+    /// adds the SK predicate. `limit` is the server's per-call cap (the
+    /// dispatcher applies a soft default of 1000 — see
+    /// `COMPATIBILITY_NOTES.md`).
+    ///
+    /// Q1 returns every matching row in `items`; `count` and
+    /// `scanned_count` are equal (Q3 will split them when
+    /// FilterExpression evaluates per row). `last_evaluated_key` is
+    /// always `None` in Q1 (Q2 will populate it for pagination).
+    async fn query_raw(
+        &self,
+        shape: &TableShape<'_>,
+        pk: &KeyValue,
+        sk_condition: Option<&SkCondition>,
+        limit: Option<u32>,
+    ) -> Result<QueryOutcome, BackendError>;
+}
+
+/// Sort-key predicate the translator hands to `query_raw`. PK is always
+/// equality-matched (DDB requires it), so it doesn't appear here.
+/// `BeginsWithS` carries the prefix string directly because Q1 only
+/// supports S-typed SK prefix matches — D8 in `PLAN-4` defers B-typed
+/// prefix to a follow-up.
+#[derive(Debug, Clone)]
+pub enum SkCondition {
+    Eq(KeyValue),
+    Lt(KeyValue),
+    Le(KeyValue),
+    Gt(KeyValue),
+    Ge(KeyValue),
+    Between(KeyValue, KeyValue),
+    BeginsWithS(String),
+}
+
+/// Result of a `query_raw` call. `count` is the post-filter item count
+/// (`= items.len()` in Q1; will diverge from `scanned_count` when Q3
+/// adds FilterExpression). `last_evaluated_key` is `None` in Q1 — Q2
+/// populates it for keyset pagination.
+#[derive(Debug, Clone, Default)]
+pub struct QueryOutcome {
+    pub items: Vec<serde_json::Value>,
+    pub count: u32,
+    pub scanned_count: u32,
+    pub last_evaluated_key: Option<(KeyValue, Option<KeyValue>)>,
 }
 
 /// Pre- and post-update view of a row, returned by the four
@@ -288,6 +382,15 @@ pub type GeneralUpdateFn<'a> = Box<
         + Sync
         + 'a,
 >;
+
+/// Caller-supplied condition evaluator for conditional Put / Delete.
+/// Receives the current row (`None` if missing) and returns `true` to
+/// proceed, `false` to reject with [`BackendError::ConditionalCheckFailed`].
+/// The dispatcher typically wraps `rekt_translator::evaluate_condition`
+/// over the parsed AST so the storage layer doesn't have to depend on
+/// the expression evaluator.
+pub type ConditionEvalFn<'a> =
+    Box<dyn Fn(Option<&serde_json::Value>) -> bool + Send + Sync + 'a>;
 
 /// What the slow path should do given the row state.
 #[derive(Debug, Clone)]

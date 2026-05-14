@@ -22,9 +22,37 @@ CREATE TABLE device_events (
   PRIMARY KEY (device_id, ts)
 );
 
--- Uncomment if you enable the `blobs` table in rektifier.toml:
--- DROP TABLE IF EXISTS blobs;
--- CREATE TABLE blobs (
---   meta jsonb NOT NULL,
---   hash bytea GENERATED ALWAYS AS (decode(meta#>>'{hash,B}', 'base64')) STORED PRIMARY KEY
--- );
+-- Hash-only N-PK. Mirrors rektifier.toml.example's `counters` table —
+-- the diff layer uses it to confirm parity on non-string PKs.
+DROP TABLE IF EXISTS counters;
+CREATE TABLE counters (
+  data jsonb   NOT NULL,
+  id   numeric GENERATED ALWAYS AS ((data#>>'{id,N}')::numeric) STORED PRIMARY KEY
+);
+
+-- Hash-only B-PK. The generated column decodes the base64 wire form of
+-- DDB `B` attributes into PG `bytea`.
+DROP TABLE IF EXISTS blobs;
+CREATE TABLE blobs (
+  data    jsonb NOT NULL,
+  binmark bytea GENERATED ALWAYS AS (decode(data#>>'{binmark,B}', 'base64')) STORED PRIMARY KEY
+);
+
+-- Composite S + B sort key.
+DROP TABLE IF EXISTS binsorted;
+CREATE TABLE binsorted (
+  data    jsonb NOT NULL,
+  id      text  GENERATED ALWAYS AS (data#>>'{id,S}')                              STORED,
+  binmark bytea GENERATED ALWAYS AS (decode(data#>>'{binmark,B}', 'base64'))      STORED,
+  PRIMARY KEY (id, binmark)
+);
+
+-- Composite S + S. Used by Query parity tests for `begins_with(sk, :v)`
+-- and other S-typed sort-key predicates.
+DROP TABLE IF EXISTS messages;
+CREATE TABLE messages (
+  data   jsonb NOT NULL,
+  thread text  GENERATED ALWAYS AS (data#>>'{thread,S}') STORED,
+  ts     text  GENERATED ALWAYS AS (data#>>'{ts,S}')     STORED,
+  PRIMARY KEY (thread, ts)
+);
