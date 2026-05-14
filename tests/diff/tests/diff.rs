@@ -1585,9 +1585,9 @@ fn diff_update_return_values_all_new_tx_path() {
         Some(r##"{"id":{"S":"diff_upd_rvan_tx"},"source":{"S":"hello"}}"##),
         &[
             "--update-expression",
-            "SET copy = #src",
+            "SET #dst = #src",
             "--expression-attribute-names",
-            r##"{"#src":"source"}"##,
+            r##"{"#src":"source","#dst":"copy"}"##,
             "--return-values",
             "ALL_NEW",
         ],
