@@ -37,7 +37,9 @@
 //! method). With no dupes, `DO UPDATE SET data = EXCLUDED.data` is
 //! deterministic.
 
-use crate::types::{cast_for_keytype, map_pg_err, pg_type_for_keytype, quote_ident, Bound};
+use crate::types::{
+    cast_for_keytype, check_sk_shape, map_pg_err, pg_type_for_keytype, quote_ident, Bound,
+};
 use crate::PgBackend;
 use rekt_storage::{BackendError, BatchWriteOutcome, KeyType, KeyValue, TableShape, WriteOp};
 use tokio_postgres::types::{Json, ToSql, Type};
@@ -62,41 +64,17 @@ pub(crate) async fn batch_write_raw(
     // original `WriteOp`s so we don't copy the jsonb payloads.
     let mut puts: Vec<&serde_json::Value> = Vec::new();
     let mut deletes: Vec<(&KeyValue, Option<&KeyValue>)> = Vec::new();
+    // Shape consistency: composite shape must have sk on every op;
+    // hash must not. The translator validates this per request but a
+    // backend-side guard catches future direct callers.
     for op in ops {
         match op {
             WriteOp::Put { sk, item, .. } => {
-                // Shape consistency: composite shape must have sk; hash
-                // must not. The translator validates this per request
-                // but a backend-side guard catches future direct callers.
-                match (shape.sk_col, sk) {
-                    (Some(_), Some(_)) | (None, None) => {}
-                    (Some(_), None) => {
-                        return Err(BackendError::MissingSortKey {
-                            name: shape.table.to_string(),
-                        });
-                    }
-                    (None, Some(_)) => {
-                        return Err(BackendError::UnexpectedSortKey {
-                            name: shape.table.to_string(),
-                        });
-                    }
-                }
+                check_sk_shape(shape, sk.as_ref())?;
                 puts.push(item);
             }
             WriteOp::Delete { pk, sk } => {
-                match (shape.sk_col, sk) {
-                    (Some(_), Some(_)) | (None, None) => {}
-                    (Some(_), None) => {
-                        return Err(BackendError::MissingSortKey {
-                            name: shape.table.to_string(),
-                        });
-                    }
-                    (None, Some(_)) => {
-                        return Err(BackendError::UnexpectedSortKey {
-                            name: shape.table.to_string(),
-                        });
-                    }
-                }
+                check_sk_shape(shape, sk.as_ref())?;
                 deletes.push((pk, sk.as_ref()));
             }
         }

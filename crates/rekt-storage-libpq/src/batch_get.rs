@@ -29,7 +29,9 @@
 //! order for BatchGetItem, and clients are required to not depend on
 //! one (D9 in `PLAN-6`).
 
-use crate::types::{cast_for_keytype, map_pg_err, pg_type_for_keytype, quote_ident, Bound};
+use crate::types::{
+    cast_for_keytype, check_sk_shape, map_pg_err, pg_type_for_keytype, quote_ident, Bound,
+};
 use crate::PgBackend;
 use rekt_storage::{BackendError, BatchGetOutcome, KeyType, KeyValue, TableShape};
 use tokio_postgres::types::{Json, ToSql, Type};
@@ -53,24 +55,13 @@ pub(crate) async fn batch_get_raw(
     }
 
     // Shape consistency: every key tuple must agree with the table's
-    // composite/hash configuration. The translator already enforces this
-    // per-key via `extract_key`, but a backend-side check guards against
-    // a future caller that builds a `Vec<(KeyValue, Option<KeyValue>)>`
-    // by hand without going through the translator.
+    // composite/hash configuration. The translator already enforces
+    // this per-key via `extract_key_pair`, but a backend-side check
+    // guards against a future caller that builds a
+    // `Vec<(KeyValue, Option<KeyValue>)>` by hand without going
+    // through the translator.
     for (_, sk) in keys {
-        match (shape.sk_col, sk) {
-            (Some(_), Some(_)) | (None, None) => {}
-            (Some(_), None) => {
-                return Err(BackendError::MissingSortKey {
-                    name: shape.table.to_string(),
-                });
-            }
-            (None, Some(_)) => {
-                return Err(BackendError::UnexpectedSortKey {
-                    name: shape.table.to_string(),
-                });
-            }
-        }
+        check_sk_shape(shape, sk.as_ref())?;
     }
 
     let table = quote_ident(shape.table);
