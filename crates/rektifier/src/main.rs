@@ -56,6 +56,7 @@ async fn main() -> Result<()> {
         backend: Arc::new(backend),
         schemas: Arc::new(schemas),
         batch_limits: rek_batch_limits(&config),
+        request_timeout: std::time::Duration::from_millis(config.server.request_timeout_ms),
     };
 
     let listener = tokio::net::TcpListener::bind(config.server.listen_addr)

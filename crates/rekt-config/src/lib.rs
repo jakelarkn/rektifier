@@ -50,6 +50,11 @@ const DDB_DEFAULT_NESTING_DEPTH: u32 = 32;
 const DDB_DEFAULT_BATCH_GET_MAX_KEYS: u32 = 100;
 const DDB_DEFAULT_BATCH_WRITE_MAX_REQUESTS: u32 = 25;
 
+/// Default per-request hard timeout. The DDB CLI client times out at
+/// 60s; we set a 30s budget so a hung backend produces a 408 well
+/// before the client gives up.
+const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("failed to read config file: {0}")]
@@ -101,6 +106,10 @@ impl BatchLimits {
 pub struct ServerConfig {
     pub listen_addr: SocketAddr,
     pub database_url: String,
+    /// Hard per-request timeout applied by tower-http's TimeoutLayer.
+    /// Defaults to 30s. Operators can override via
+    /// `server.request_timeout_ms` in TOML.
+    pub request_timeout_ms: u64,
 }
 
 /// Size limits. `None` = unlimited (the operator disabled that cap).
@@ -186,6 +195,8 @@ struct RawBatchLimits {
 struct RawServer {
     listen_addr: String,
     database_url: String,
+    #[serde(default)]
+    request_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -390,10 +401,21 @@ impl RawConfig {
             }
         };
 
+        let request_timeout_ms = match self.server.request_timeout_ms {
+            None => DEFAULT_REQUEST_TIMEOUT_MS,
+            Some(0) => {
+                return Err(ConfigError::validation(
+                    "server.request_timeout_ms must be > 0",
+                ));
+            }
+            Some(n) => n,
+        };
+
         Ok(Config {
             server: ServerConfig {
                 listen_addr,
                 database_url: self.server.database_url,
+                request_timeout_ms,
             },
             tables,
             batch_limits,

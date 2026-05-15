@@ -26,6 +26,14 @@ struct MockBackend {
     /// Keyed by (table, pk_string, sk_string-or-empty). String keys make
     /// hashing simple regardless of KeyType.
     store: Mutex<HashMap<(String, String, String), serde_json::Value>>,
+    /// Test hook (Obs-2): when set, `get_item_raw` panics with this
+    /// payload — exercises the `CatchPanicLayer` middleware.
+    panic_on_get: Option<&'static str>,
+    /// Test hook (Obs-2): when set, `get_item_raw` sleeps for this
+    /// duration before responding — exercises the `TimeoutLayer`
+    /// middleware. Combined with a short request_timeout in
+    /// `app_with`, surfaces a 408.
+    sleep_on_get: Option<std::time::Duration>,
 }
 
 fn kv_to_string(kv: &KeyValue) -> String {
@@ -112,6 +120,14 @@ impl Backend for MockBackend {
         pk: &KeyValue,
         sk: Option<&KeyValue>,
     ) -> Result<Option<serde_json::Value>, BackendError> {
+        // Obs-2 test hooks. Panic-on-get exercises CatchPanicLayer;
+        // sleep-on-get exercises TimeoutLayer.
+        if let Some(msg) = self.panic_on_get {
+            panic!("{msg}");
+        }
+        if let Some(d) = self.sleep_on_get {
+            tokio::time::sleep(d).await;
+        }
         let pk_value = kv_to_string(pk);
         let sk_value = sk.map(kv_to_string).unwrap_or_default();
         Ok(self
@@ -657,11 +673,19 @@ fn schemas() -> HashMap<String, TableSchema> {
 }
 
 fn app() -> axum::Router {
+    app_with(MockBackend::default(), std::time::Duration::from_secs(30))
+}
+
+/// Builder for tests that need a non-default backend (e.g. one that
+/// panics or sleeps to exercise the resilience middleware) or a
+/// custom request timeout.
+fn app_with(backend: MockBackend, request_timeout: std::time::Duration) -> axum::Router {
     let state = AppState {
         verifier: Arc::new(PermissiveVerifier) as Arc<dyn Verifier>,
-        backend: Arc::new(MockBackend::default()) as Arc<dyn Backend>,
+        backend: Arc::new(backend) as Arc<dyn Backend>,
         schemas: Arc::new(schemas()),
         batch_limits: rekt_server::BatchLimits::default(),
+        request_timeout,
     };
     router(state)
 }
@@ -5908,6 +5932,74 @@ async fn batch_write_binary_sk_via_binsorted() {
                     "id":{"S":"bw-bsk"},"binmark":{"B":"AAED"}
                 }}}
             ]}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ===== Obs-2: resilience middleware (CatchPanic + Timeout) ===================
+
+#[tokio::test]
+async fn panic_in_handler_returns_500_via_catch_panic_layer() {
+    let backend = MockBackend {
+        panic_on_get: Some("forced panic for Obs-2 test"),
+        ..Default::default()
+    };
+    let app = app_with(backend, std::time::Duration::from_secs(30));
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"x"}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = body_json(resp).await;
+    let ty = body["__type"].as_str().unwrap();
+    assert!(
+        ty.ends_with("#InternalServerError"),
+        "expected InternalServerError shape, got {ty}"
+    );
+    let msg = body["message"].as_str().unwrap();
+    assert!(
+        msg.contains("panic"),
+        "panic detail must appear in body, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn slow_handler_exceeds_timeout_returns_408() {
+    // Backend sleeps 200ms; timeout is 50ms — TimeoutLayer must
+    // interrupt with REQUEST_TIMEOUT.
+    let backend = MockBackend {
+        sleep_on_get: Some(std::time::Duration::from_millis(200)),
+        ..Default::default()
+    };
+    let app = app_with(backend, std::time::Duration::from_millis(50));
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"x"}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+}
+
+#[tokio::test]
+async fn fast_handler_under_timeout_passes() {
+    // Sanity check: a quick request under the timeout still succeeds
+    // — confirms TimeoutLayer isn't tripping on every request.
+    let backend = MockBackend {
+        sleep_on_get: Some(std::time::Duration::from_millis(10)),
+        ..Default::default()
+    };
+    let app = app_with(backend, std::time::Duration::from_millis(500));
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"x"}}}),
         ))
         .await
         .unwrap();

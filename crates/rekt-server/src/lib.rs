@@ -41,9 +41,14 @@ use rekt_translator::{
     translate_get_item, translate_put_item, translate_query, translate_scan,
     translate_update_item, ConditionRouting, ReturnValuesMode, TableSchema, TranslateError,
 };
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
+use tower_http::trace::TraceLayer;
 
 /// Hardcoded HTTP body-size ceiling. Defense-in-depth before any parsing;
 /// the per-table item-size limit (translator-enforced) lives on top of this.
@@ -64,6 +69,12 @@ pub struct AppState {
     /// values (100 / 25); operator can override via `[batch_limits]`
     /// in `rektifier.toml`. See `COMPATIBILITY_NOTES.md`.
     pub batch_limits: BatchLimits,
+    /// Per-request hard timeout. Wired into a `TimeoutLayer`; a
+    /// handler exceeding this returns 503 (tower-http's default) and
+    /// `TraceLayer::on_failure` logs the timeout. Defaults to 30s
+    /// for tests; the binary reads `[server].request_timeout_ms`
+    /// from `rektifier.toml`.
+    pub request_timeout: Duration,
 }
 
 /// Server-side projection of `rekt_config::BatchLimits`. Carried in
@@ -88,13 +99,48 @@ impl Default for BatchLimits {
     }
 }
 
-/// Build the axum router. Apply the body-size limit at the outermost layer
-/// so it triggers before any parsing or extraction.
+/// Build the axum router with the resilience middleware stack.
+///
+/// Layer order (axum applies outer-to-inner):
+/// 1. `CatchPanicLayer` (outermost) — a panic anywhere inside is
+///    caught and rendered as a structured 500 with an error log,
+///    rather than dropping the TCP connection.
+/// 2. `TraceLayer` — HTTP-level access logging at info; emits a log
+///    line per request including method/path/status/duration.
+/// 3. `TimeoutLayer` — per-request hard cap. tower-http converts
+///    excess into a 408 Request Timeout.
+/// 4. `RequestBodyLimitLayer` (innermost) — runs before any
+///    extraction so over-size bodies are rejected before parsing.
 pub fn router(state: AppState) -> Router {
+    let timeout = state.request_timeout;
     Router::new()
         .route("/", post(dispatch))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            timeout,
+        ))
+        .layer(TraceLayer::new_for_http())
+        .layer(CatchPanicLayer::custom(panic_to_500))
         .with_state(state)
+}
+
+/// `CatchPanicLayer` handler: render the panic as a DDB-shaped
+/// InternalServerError + log at error. Without this, axum drops the
+/// connection on panic and the SDK sees a transport error with no
+/// way to correlate to the cause.
+fn panic_to_500(err: Box<dyn Any + Send + 'static>) -> Response {
+    // Best-effort downcast: the panic payload is typically String or
+    // &str. Anything else gets a generic placeholder.
+    let detail: String = if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = err.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else {
+        "panic with non-string payload".to_string()
+    };
+    tracing::error!(panic = %detail, "handler panicked — returning 500");
+    ApiError::Internal(format!("panic: {detail}")).into_response()
 }
 
 // ===== Error type ==============================================================

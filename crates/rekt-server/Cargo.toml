@@ -12,7 +12,7 @@ rekt-sigv4 = { path = "../rekt-sigv4" }
 rekt-storage = { path = "../rekt-storage" }
 rekt-translator = { path = "../rekt-translator" }
 axum = "0.7"
-tower-http = { workspace = true, features = ["limit", "trace"] }
+tower-http = { workspace = true, features = ["limit", "trace", "catch-panic", "timeout"] }
 http = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
