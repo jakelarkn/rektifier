@@ -6325,3 +6325,240 @@ async fn transact_get_wrong_key_type_rejected() {
         .unwrap()
         .ends_with("#ValidationException"));
 }
+
+// ===== TransactGetItems T2 — multi-table + projection ========================
+
+#[tokio::test]
+async fn transact_get_multi_table_happy_path() {
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"mt-u1"},"label":{"S":"alice"}})).await;
+    put_item(
+        &app,
+        "device_events",
+        json!({
+            "device_id":{"S":"mt-d1"},
+            "ts":{"N":"99"},
+            "label":{"S":"e99"}
+        }),
+    )
+    .await;
+
+    let body = json!({
+        "TransactItems": [
+            {"Get":{"TableName":"users","Key":{"id":{"S":"mt-u1"}}}},
+            {"Get":{"TableName":"device_events",
+                    "Key":{"device_id":{"S":"mt-d1"},"ts":{"N":"99"}}}}
+        ]
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactGetItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let got = body_json(resp).await;
+    // D8: positional. Slot 0 is users; slot 1 is device_events.
+    assert_eq!(got["Responses"][0]["Item"]["label"]["S"], "alice");
+    assert_eq!(got["Responses"][1]["Item"]["label"]["S"], "e99");
+}
+
+#[tokio::test]
+async fn transact_get_multi_table_mixed_hit_miss() {
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"mt-hit"}})).await;
+    // events: nothing seeded
+    let body = json!({
+        "TransactItems": [
+            {"Get":{"TableName":"users","Key":{"id":{"S":"mt-hit"}}}},
+            {"Get":{"TableName":"users","Key":{"id":{"S":"mt-not"}}}},
+            {"Get":{"TableName":"device_events",
+                    "Key":{"device_id":{"S":"d"},"ts":{"N":"1"}}}}
+        ]
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactGetItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let got = body_json(resp).await;
+    assert!(got["Responses"][0].get("Item").is_some());
+    assert!(got["Responses"][1].get("Item").is_none());
+    assert!(got["Responses"][2].get("Item").is_none());
+}
+
+#[tokio::test]
+async fn transact_get_missing_table_of_n_rejects_whole_request() {
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"x"}})).await;
+    let body = json!({
+        "TransactItems": [
+            {"Get":{"TableName":"users","Key":{"id":{"S":"x"}}}},
+            {"Get":{"TableName":"does_not_exist","Key":{"id":{"S":"y"}}}}
+        ]
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactGetItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ResourceNotFoundException"));
+}
+
+#[tokio::test]
+async fn transact_get_with_projection_prunes_item() {
+    let app = app();
+    put_item(
+        &app,
+        "users",
+        json!({
+            "id":{"S":"tg-pj"},
+            "label":{"S":"L"},
+            "tier":{"S":"admin"},
+            "flag":{"S":"on"}
+        }),
+    )
+    .await;
+    let body = json!({
+        "TransactItems": [{
+            "Get": {
+                "TableName":"users",
+                "Key":{"id":{"S":"tg-pj"}},
+                "ProjectionExpression":"id, label"
+            }
+        }]
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactGetItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let got = body_json(resp).await;
+    let it = &got["Responses"][0]["Item"];
+    let mut keys: Vec<&str> = it.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+    keys.sort();
+    assert_eq!(keys, vec!["id", "label"]);
+}
+
+#[tokio::test]
+async fn transact_get_projection_per_item_independent() {
+    // Different items in the same TransactGet may carry different
+    // ProjectionExpressions; T2's per-item pruning honors each
+    // independently.
+    let app = app();
+    put_item(
+        &app,
+        "users",
+        json!({"id":{"S":"pi-1"},"label":{"S":"L1"},"flag":{"S":"x"}}),
+    )
+    .await;
+    put_item(
+        &app,
+        "users",
+        json!({"id":{"S":"pi-2"},"label":{"S":"L2"},"flag":{"S":"y"}}),
+    )
+    .await;
+    let body = json!({
+        "TransactItems": [
+            {"Get":{"TableName":"users","Key":{"id":{"S":"pi-1"}},
+                    "ProjectionExpression":"label"}},
+            {"Get":{"TableName":"users","Key":{"id":{"S":"pi-2"}},
+                    "ProjectionExpression":"id, flag"}}
+        ]
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactGetItems", body))
+        .await
+        .unwrap();
+    let got = body_json(resp).await;
+    let it0 = &got["Responses"][0]["Item"];
+    let it1 = &got["Responses"][1]["Item"];
+    let k0: Vec<&str> = it0.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+    let mut k1: Vec<&str> = it1.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+    k1.sort();
+    assert_eq!(k0, vec!["label"]);
+    assert_eq!(k1, vec!["flag", "id"]);
+}
+
+#[tokio::test]
+async fn transact_get_projection_with_ean_alias() {
+    let app = app();
+    put_item(
+        &app,
+        "users",
+        json!({"id":{"S":"pj-rw"},"label":{"S":"L"}}),
+    )
+    .await;
+    let body = json!({
+        "TransactItems": [{
+            "Get": {
+                "TableName":"users",
+                "Key":{"id":{"S":"pj-rw"}},
+                "ProjectionExpression":"#n, id",
+                "ExpressionAttributeNames":{"#n":"label"}
+            }
+        }]
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactGetItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let got = body_json(resp).await;
+    let it = &got["Responses"][0]["Item"];
+    let mut keys: Vec<&str> = it.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+    keys.sort();
+    assert_eq!(keys, vec!["id", "label"]);
+}
+
+#[tokio::test]
+async fn transact_get_projection_missing_attr_silently_dropped() {
+    // ProjectionExpression names an attr that isn't on the item.
+    // DDB: silently drops the missing attr (same as Query/Scan).
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"pj-miss"},"label":{"S":"L"}})).await;
+    let body = json!({
+        "TransactItems": [{
+            "Get": {
+                "TableName":"users",
+                "Key":{"id":{"S":"pj-miss"}},
+                "ProjectionExpression":"label, not_present"
+            }
+        }]
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactGetItems", body))
+        .await
+        .unwrap();
+    let got = body_json(resp).await;
+    let it = &got["Responses"][0]["Item"];
+    let keys: Vec<&str> = it.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+    assert_eq!(keys, vec!["label"]);
+}
+
+#[tokio::test]
+async fn transact_get_projection_nested_path_rejected() {
+    // v1 = top-level paths only.
+    let app = app();
+    let body = json!({
+        "TransactItems": [{
+            "Get": {
+                "TableName":"users",
+                "Key":{"id":{"S":"x"}},
+                "ProjectionExpression":"meta.nested"
+            }
+        }]
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactGetItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ValidationException"));
+}

@@ -4780,3 +4780,64 @@ fn diff_transact_get_composite_table_round_trip() {
         delete_both("device_events", &key);
     }
 }
+
+// ===== TransactGetItems T2 — multi-table + projection ========================
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_transact_get_multi_table_round_trip() {
+    ensure_users_table();
+    ensure_device_events_table();
+    let u_item = "{\"id\":{\"S\":\"tg-mt-u1\"},\"label\":{\"S\":\"alice\"}}";
+    let e_item = "{\"device_id\":{\"S\":\"tg-mt-d1\"},\"ts\":{\"N\":\"42\"},\"label\":{\"S\":\"E42\"}}";
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",u_item]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",u_item]);
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","device_events","--item",e_item]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","device_events","--item",e_item]);
+
+    let items = "[\
+        {\"Get\":{\"TableName\":\"users\",\"Key\":{\"id\":{\"S\":\"tg-mt-u1\"}}}},\
+        {\"Get\":{\"TableName\":\"device_events\",\"Key\":{\"device_id\":{\"S\":\"tg-mt-d1\"},\"ts\":{\"N\":\"42\"}}}}\
+    ]";
+    let r_ref = aws(REF, &["dynamodb","transact-get-items","--transact-items",items]);
+    let r_ours = aws(OURS, &["dynamodb","transact-get-items","--transact-items",items]);
+    assert_eq!(r_ref["Responses"][0]["Item"]["label"]["S"], r_ours["Responses"][0]["Item"]["label"]["S"]);
+    assert_eq!(r_ref["Responses"][1]["Item"]["label"]["S"], r_ours["Responses"][1]["Item"]["label"]["S"]);
+
+    delete_both("users", "{\"id\":{\"S\":\"tg-mt-u1\"}}");
+    delete_both(
+        "device_events",
+        "{\"device_id\":{\"S\":\"tg-mt-d1\"},\"ts\":{\"N\":\"42\"}}",
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_transact_get_projection_prunes_attributes() {
+    ensure_users_table();
+    let item =
+        "{\"id\":{\"S\":\"tg-pj\"},\"label\":{\"S\":\"L\"},\"tier\":{\"S\":\"admin\"},\"flag\":{\"S\":\"on\"}}";
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",item]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",item]);
+
+    let items = "[{\"Get\":{\
+        \"TableName\":\"users\",\
+        \"Key\":{\"id\":{\"S\":\"tg-pj\"}},\
+        \"ProjectionExpression\":\"id, label\"\
+    }}]";
+    let r_ref = aws(REF, &["dynamodb","transact-get-items","--transact-items",items]);
+    let r_ours = aws(OURS, &["dynamodb","transact-get-items","--transact-items",items]);
+
+    // Each side returns only id + label; sort keys for stable compare.
+    fn sorted_keys(v: &Value) -> Vec<String> {
+        let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    }
+    let ref_keys = sorted_keys(&r_ref["Responses"][0]["Item"]);
+    let our_keys = sorted_keys(&r_ours["Responses"][0]["Item"]);
+    assert_eq!(ref_keys, our_keys);
+    assert_eq!(ref_keys, vec!["id".to_string(), "label".to_string()]);
+
+    delete_both("users", "{\"id\":{\"S\":\"tg-pj\"}}");
+}
