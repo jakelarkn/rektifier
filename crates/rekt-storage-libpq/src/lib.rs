@@ -39,7 +39,9 @@ mod types;
 mod update;
 
 use async_trait::async_trait;
-use deadpool_postgres::{Manager, Pool};
+use deadpool_postgres::{
+    Manager, ManagerConfig, Pool, RecyclingMethod as DpRecyclingMethod, Runtime,
+};
 use rekt_expressions::Condition;
 use rekt_storage::{
     Backend, BackendError, BatchGetOutcome, BatchWriteOutcome, ConditionEvalFn, FilterEvalFn,
@@ -59,6 +61,42 @@ pub struct PgBackend {
     pub(crate) sql_cache: RwLock<HashMap<String, Arc<shape::ShapeSql>>>,
 }
 
+/// Pool tuning knobs accepted by `PgBackend::connect_with`. Mirrors
+/// `rekt_config::PgConfig` but local to this crate so the storage
+/// layer doesn't depend on the config loader.
+#[derive(Debug, Clone, Copy)]
+pub struct PoolConfig {
+    pub max_pool_size: u32,
+    pub wait_timeout_ms: u64,
+    pub create_timeout_ms: u64,
+    pub recycle_timeout_ms: u64,
+    pub recycling_method: RecyclingMethod,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum RecyclingMethod {
+    /// No validation. Fast; stale connections surface on next query.
+    Fast,
+    /// `SELECT 1` ping on recycle. Transparent PG-restart recovery.
+    Verified,
+    /// Verified + `DISCARD ALL` to drop session state.
+    Clean,
+}
+
+impl Default for PoolConfig {
+    /// Matches the previous hard-coded defaults so callers that don't
+    /// thread `[pg]` through see no behavior change.
+    fn default() -> Self {
+        Self {
+            max_pool_size: 16,
+            wait_timeout_ms: 5_000,
+            create_timeout_ms: 5_000,
+            recycle_timeout_ms: 1_000,
+            recycling_method: RecyclingMethod::Fast,
+        }
+    }
+}
+
 impl PgBackend {
     /// Wrap an existing pool. Prefer this when the caller wants to share a
     /// `Pool` with other components (e.g. `rekt-meta::verify`).
@@ -70,37 +108,93 @@ impl PgBackend {
     }
 
     pub fn connect(connection_string: &str) -> Result<Self, BackendError> {
+        Self::connect_with(connection_string, &PoolConfig::default())
+    }
+
+    /// Build a `PgBackend` with explicit pool config. Used by the
+    /// binary to apply `[pg]` overrides from `rektifier.toml`.
+    pub fn connect_with(
+        connection_string: &str,
+        cfg: &PoolConfig,
+    ) -> Result<Self, BackendError> {
         let pg_config: tokio_postgres::Config =
             connection_string
                 .parse()
                 .map_err(|e: tokio_postgres::Error| {
                     BackendError::Other(format!("invalid connection string: {e}"))
                 })?;
-        let manager = Manager::new(pg_config, NoTls);
+        let mgr_cfg = ManagerConfig {
+            recycling_method: match cfg.recycling_method {
+                RecyclingMethod::Fast => DpRecyclingMethod::Fast,
+                RecyclingMethod::Verified => DpRecyclingMethod::Verified,
+                RecyclingMethod::Clean => DpRecyclingMethod::Clean,
+            },
+        };
+        let manager = Manager::from_config(pg_config, NoTls, mgr_cfg);
         let pool = Pool::builder(manager)
-            .max_size(16)
+            // Tokio1 runtime adapter — required by deadpool for the
+            // wait_timeout / create_timeout / recycle_timeout
+            // machinery below to actually install timers.
+            .runtime(Runtime::Tokio1)
+            .max_size(cfg.max_pool_size as usize)
+            .wait_timeout(Some(std::time::Duration::from_millis(cfg.wait_timeout_ms)))
+            .create_timeout(Some(std::time::Duration::from_millis(
+                cfg.create_timeout_ms,
+            )))
+            .recycle_timeout(Some(std::time::Duration::from_millis(
+                cfg.recycle_timeout_ms,
+            )))
             .build()
-            .map_err(|e| BackendError::Other(format!("pool build failed: {e}")))?;
+            .map_err(|e| BackendError::ConnectFailed {
+                reason: format!("pool build failed: {e}"),
+            })?;
         Ok(Self::new(pool))
     }
 
     pub(crate) async fn client(&self) -> Result<deadpool_postgres::Object, BackendError> {
+        let start = std::time::Instant::now();
         self.pool
             .get()
             .instrument(tracing::debug_span!("pg.pool_get"))
             .await
-            .map_err(|e| {
-                // Pool-get failures are typically PG unreachable, pool
-                // exhaustion, or timeout (none of which we can
-                // discriminate at this layer until Obs-3 lands the
-                // explicit variants). Warn-level: operator-actionable
-                // and rate-limited by the pool's own internal retries.
-                tracing::warn!(
-                    error = %e,
-                    "PG pool get failed"
-                );
-                BackendError::Other(format!("pool get failed: {e}"))
-            })
+            .map_err(|e| classify_pool_error(e, start.elapsed()))
+    }
+}
+
+/// Map a deadpool pool-get error into a classified `BackendError` so
+/// Obs-4's retry layer can target the right variants. Logs at warn so
+/// operators see pool starvation / unreachable PG in real time.
+fn classify_pool_error(
+    e: deadpool_postgres::PoolError,
+    waited: std::time::Duration,
+) -> BackendError {
+    use deadpool_postgres::PoolError;
+    let waited_ms = waited.as_millis() as u64;
+    match e {
+        PoolError::Timeout(timeout_kind) => {
+            tracing::warn!(
+                waited_ms,
+                ?timeout_kind,
+                "PG pool exhausted (wait_timeout elapsed)"
+            );
+            BackendError::PoolExhausted { waited_ms }
+        }
+        PoolError::Backend(be) => {
+            tracing::warn!(error = %be, waited_ms, "PG connect failed");
+            BackendError::ConnectFailed {
+                reason: be.to_string(),
+            }
+        }
+        PoolError::Closed => {
+            tracing::warn!(waited_ms, "PG pool closed");
+            BackendError::ConnectFailed {
+                reason: "pool closed".into(),
+            }
+        }
+        other => {
+            tracing::warn!(error = %other, waited_ms, "PG pool error");
+            BackendError::Other(format!("pool get failed: {other}"))
+        }
     }
 }
 
@@ -315,8 +409,13 @@ mod tests {
     /// re-panic on the next request after any thread panicked while
     /// holding the lock, effectively killing the process under load.
     /// Now we explicitly recover from `PoisonError`.
-    #[test]
-    fn shape_sql_recovers_from_poisoned_lock() {
+    ///
+    /// Needs a tokio runtime because Obs-3 wired `wait_timeout` /
+    /// `create_timeout` into the pool builder, and deadpool's
+    /// timeout machinery requires `tokio::time` to be available
+    /// at build time.
+    #[tokio::test]
+    async fn shape_sql_recovers_from_poisoned_lock() {
         let backend = std::sync::Arc::new(
             PgBackend::connect("postgres://nobody@127.0.0.1:1/none").unwrap(),
         );

@@ -42,7 +42,15 @@ async fn main() -> Result<()> {
         "config loaded"
     );
 
-    let pool = build_pool(&config.server.database_url).context("building Postgres pool")?;
+    let pool = build_pool(&config.server.database_url, &config.pg)
+        .context("building Postgres pool")?;
+    tracing::info!(
+        max_pool_size = config.pg.max_pool_size,
+        wait_timeout_ms = config.pg.wait_timeout_ms,
+        create_timeout_ms = config.pg.create_timeout_ms,
+        recycling_method = ?config.pg.recycling_method,
+        "PG pool configured"
+    );
 
     rekt_meta::verify(&config.tables, &pool)
         .await
@@ -109,13 +117,29 @@ fn init_tracing() -> TracingGuard {
     }
 }
 
-fn build_pool(database_url: &str) -> Result<Pool> {
+fn build_pool(database_url: &str, pg_cfg: &rekt_config::PgConfig) -> Result<Pool> {
+    use deadpool_postgres::{ManagerConfig, RecyclingMethod as DpRecyclingMethod, Runtime};
     let pg_config: tokio_postgres::Config = database_url
         .parse()
         .with_context(|| format!("parsing database_url `{database_url}`"))?;
-    let manager = Manager::new(pg_config, NoTls);
+    let mgr_cfg = ManagerConfig {
+        recycling_method: match pg_cfg.recycling_method {
+            rekt_config::RecyclingMethod::Fast => DpRecyclingMethod::Fast,
+            rekt_config::RecyclingMethod::Verified => DpRecyclingMethod::Verified,
+            rekt_config::RecyclingMethod::Clean => DpRecyclingMethod::Clean,
+        },
+    };
+    let manager = Manager::from_config(pg_config, NoTls, mgr_cfg);
     let pool = Pool::builder(manager)
-        .max_size(16)
+        .runtime(Runtime::Tokio1)
+        .max_size(pg_cfg.max_pool_size as usize)
+        .wait_timeout(Some(std::time::Duration::from_millis(pg_cfg.wait_timeout_ms)))
+        .create_timeout(Some(std::time::Duration::from_millis(
+            pg_cfg.create_timeout_ms,
+        )))
+        .recycle_timeout(Some(std::time::Duration::from_millis(
+            pg_cfg.recycle_timeout_ms,
+        )))
         .build()
         .context("deadpool Pool::builder")?;
     Ok(pool)

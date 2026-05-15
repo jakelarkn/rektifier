@@ -263,6 +263,27 @@ impl From<BackendError> for ApiError {
             BackendError::ConditionalCheckFailed => {
                 ApiError::ConditionalCheckFailed("The conditional request failed".into())
             }
+            // Pool starvation: the storage layer already logged at
+            // warn in classify_pool_error. Surface as 500 with a
+            // hint-shaped message — operators reading the wire
+            // response can correlate to the pool log line by the
+            // waited_ms field.
+            BackendError::PoolExhausted { waited_ms } => {
+                tracing::error!(
+                    waited_ms,
+                    "PG pool exhausted -> InternalServerError (500)"
+                );
+                ApiError::Internal(format!(
+                    "PG connection pool exhausted after {waited_ms} ms"
+                ))
+            }
+            BackendError::ConnectFailed { reason } => {
+                tracing::error!(
+                    reason = %reason,
+                    "PG connect failed -> InternalServerError (500)"
+                );
+                ApiError::Internal(format!("PG connection failed: {reason}"))
+            }
             // Every Other -> ApiError::Internal becomes a 500. The PG
             // layer already logged the detailed cause (table, SQLSTATE,
             // pg_message) in `map_pg_err`; this site emits an

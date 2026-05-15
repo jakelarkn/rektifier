@@ -4,8 +4,35 @@
 # binary at it via `REKTIFIER_CONFIG=/path/to/rektifier.toml`.
 
 [server]
-listen_addr  = "127.0.0.1:9000"
-database_url = "postgres://rektifier:rektifier@localhost:5432/rektifier"
+listen_addr        = "127.0.0.1:9000"
+database_url       = "postgres://rektifier:rektifier@localhost:5432/rektifier"
+# Hard per-request timeout. tower-http TimeoutLayer converts excess
+# to a 408 Request Timeout — the wire response shape that DDB SDKs
+# already understand. The DDB CLI client times out client-side at
+# 60s; 30s leaves headroom for one server-side retry attempt.
+request_timeout_ms = 30000
+
+# Postgres pool tuning. Defaults match the pre-Obs-3 hard-coded
+# values; only override if your workload needs different sizing.
+[pg]
+max_pool_size      = 16
+wait_timeout_ms    = 5000     # fail fast under pool starvation
+create_timeout_ms  = 5000     # fail fast when PG is down/unreachable
+recycle_timeout_ms = 1000
+# "fast" (no validation, default) | "verified" (SELECT 1 on recycle —
+# ~1ms per recycle but transparent PG restart recovery) | "clean"
+# (verified + DISCARD ALL, drops session state).
+recycling_method   = "fast"
+
+# Retry policy for transient PG errors (08* connection class,
+# 57P0[1-5] admin_shutdown family, 40001 serialization_failure,
+# 40P01 deadlock_detected) and BackendError::PoolExhausted /
+# ConnectFailed. Wired by Obs-4.
+[pg.retry]
+max_attempts       = 3        # 1 = disable retries
+initial_backoff_ms = 50
+max_backoff_ms     = 1000
+jitter_pct         = 25       # 0..=100
 
 # Size caps — defaults match DDB. Raise or remove ("unlimited") to use
 # rektifier as "DDB API without the artificial cliffs."

@@ -229,3 +229,99 @@ max_item_size_bytes = -100
     // -100 isn't a u64 nor "unlimited"; serde rejects the integer at parse time.
     assert!(matches!(r, Err(ConfigError::ParseToml(_))));
 }
+
+// ===== Obs-3: [pg] validation =================================================
+
+#[test]
+fn pg_zero_max_pool_size_rejected() {
+    let r = load_from_str(
+        r#"
+[server]
+listen_addr  = "127.0.0.1:9000"
+database_url = "postgres://x"
+
+[pg]
+max_pool_size = 0
+"#,
+    );
+    let msg = match r {
+        Err(ConfigError::Validation { reason }) => reason,
+        other => panic!("expected Validation, got {other:?}"),
+    };
+    assert!(msg.contains("max_pool_size"), "got: {msg}");
+}
+
+#[test]
+fn pg_unknown_recycling_method_rejected() {
+    let r = load_from_str(
+        r#"
+[server]
+listen_addr  = "127.0.0.1:9000"
+database_url = "postgres://x"
+
+[pg]
+recycling_method = "wat"
+"#,
+    );
+    let msg = match r {
+        Err(ConfigError::Validation { reason }) => reason,
+        other => panic!("expected Validation, got {other:?}"),
+    };
+    assert!(msg.contains("recycling_method"), "got: {msg}");
+}
+
+#[test]
+fn pg_retry_initial_gt_max_rejected() {
+    let r = load_from_str(
+        r#"
+[server]
+listen_addr  = "127.0.0.1:9000"
+database_url = "postgres://x"
+
+[pg.retry]
+initial_backoff_ms = 5000
+max_backoff_ms     = 1000
+"#,
+    );
+    let msg = match r {
+        Err(ConfigError::Validation { reason }) => reason,
+        other => panic!("expected Validation, got {other:?}"),
+    };
+    assert!(msg.contains("initial_backoff_ms"), "got: {msg}");
+}
+
+#[test]
+fn pg_retry_jitter_pct_over_100_rejected() {
+    let r = load_from_str(
+        r#"
+[server]
+listen_addr  = "127.0.0.1:9000"
+database_url = "postgres://x"
+
+[pg.retry]
+jitter_pct = 200
+"#,
+    );
+    let msg = match r {
+        Err(ConfigError::Validation { reason }) => reason,
+        other => panic!("expected Validation, got {other:?}"),
+    };
+    assert!(msg.contains("jitter_pct"), "got: {msg}");
+}
+
+#[test]
+fn server_zero_request_timeout_rejected() {
+    let r = load_from_str(
+        r#"
+[server]
+listen_addr        = "127.0.0.1:9000"
+database_url       = "postgres://x"
+request_timeout_ms = 0
+"#,
+    );
+    let msg = match r {
+        Err(ConfigError::Validation { reason }) => reason,
+        other => panic!("expected Validation, got {other:?}"),
+    };
+    assert!(msg.contains("request_timeout_ms"), "got: {msg}");
+}

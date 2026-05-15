@@ -90,6 +90,20 @@ pub enum BackendError {
     #[error("the conditional request failed")]
     ConditionalCheckFailed,
 
+    /// Pool exhausted: every connection is in use and the
+    /// `wait_timeout` elapsed before one became available. Retryable
+    /// (Obs-4): the request may succeed on a fresh attempt once load
+    /// drops.
+    #[error("PG connection pool exhausted (waited {waited_ms} ms)")]
+    PoolExhausted { waited_ms: u64 },
+
+    /// Could not open a connection to PG (TCP refused, auth failure,
+    /// timeout, etc). Retryable for the TCP / timeout subclasses;
+    /// auth failures are operator-actionable. v1 doesn't discriminate
+    /// — the retry layer treats every `ConnectFailed` as transient.
+    #[error("PG connection failed: {reason}")]
+    ConnectFailed { reason: String },
+
     #[error("storage error: {0}")]
     Other(String),
 }

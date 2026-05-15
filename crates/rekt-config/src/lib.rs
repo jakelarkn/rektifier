@@ -55,6 +55,19 @@ const DDB_DEFAULT_BATCH_WRITE_MAX_REQUESTS: u32 = 25;
 /// before the client gives up.
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 
+/// Default deadpool max pool size. Matches the previous hard-coded
+/// value so operators upgrading without a `[pg]` block see no change.
+const DEFAULT_PG_MAX_POOL_SIZE: u32 = 16;
+/// Fail fast when the pool is saturated instead of blocking the
+/// handler. The TimeoutLayer (Obs-2) catches anything that escapes
+/// this, but explicit pool-level timeout produces a clearer error
+/// (`PoolExhausted` vs generic `RequestTimeout`).
+const DEFAULT_PG_WAIT_TIMEOUT_MS: u64 = 5_000;
+/// Fail fast when opening a new connection — defends against PG being
+/// reachable-but-unresponsive.
+const DEFAULT_PG_CREATE_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_PG_RECYCLE_TIMEOUT_MS: u64 = 1_000;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("failed to read config file: {0}")]
@@ -82,6 +95,71 @@ pub struct Config {
     pub server: ServerConfig,
     pub tables: Vec<TableConfig>,
     pub batch_limits: BatchLimits,
+    pub pg: PgConfig,
+}
+
+/// Postgres pool + retry config. All fields have DDB-/deadpool-
+/// reasonable defaults so an upgrading deployment can omit the
+/// `[pg]` section entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PgConfig {
+    pub max_pool_size: u32,
+    pub wait_timeout_ms: u64,
+    pub create_timeout_ms: u64,
+    pub recycle_timeout_ms: u64,
+    pub recycling_method: RecyclingMethod,
+    pub retry: PgRetryConfig,
+}
+
+/// Mirrors `deadpool_postgres::RecyclingMethod` but kept in this
+/// crate so `rekt-config` doesn't depend on `deadpool-postgres`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecyclingMethod {
+    /// Don't validate on recycle. Fast but stale connections after
+    /// a PG restart surface on the next query rather than
+    /// transparently reconnecting.
+    Fast,
+    /// Issue a trivial query (`SELECT 1`) on recycle. ~1ms per
+    /// recycle; transparent PG restart.
+    Verified,
+    /// `Verified` + `DISCARD ALL` to drop session state. Heavier;
+    /// recommended only when callers rely on session-state isolation.
+    Clean,
+}
+
+/// Retry policy for transient PG errors (08*, 57P0[1-5], 40001,
+/// 40P01) and `BackendError::PoolExhausted` / `ConnectFailed`.
+/// Wired by Obs-4; parsed here so Obs-3's config diff lands once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PgRetryConfig {
+    pub max_attempts: u32,
+    pub initial_backoff_ms: u64,
+    pub max_backoff_ms: u64,
+    pub jitter_pct: u32,
+}
+
+impl PgConfig {
+    pub fn defaults() -> Self {
+        Self {
+            max_pool_size: DEFAULT_PG_MAX_POOL_SIZE,
+            wait_timeout_ms: DEFAULT_PG_WAIT_TIMEOUT_MS,
+            create_timeout_ms: DEFAULT_PG_CREATE_TIMEOUT_MS,
+            recycle_timeout_ms: DEFAULT_PG_RECYCLE_TIMEOUT_MS,
+            recycling_method: RecyclingMethod::Fast,
+            retry: PgRetryConfig::defaults(),
+        }
+    }
+}
+
+impl PgRetryConfig {
+    pub fn defaults() -> Self {
+        Self {
+            max_attempts: 3,
+            initial_backoff_ms: 50,
+            max_backoff_ms: 1_000,
+            jitter_pct: 25,
+        }
+    }
 }
 
 /// Server-level quantity caps on the batch ops. Defaults match DDB
@@ -178,7 +256,39 @@ struct RawConfig {
     #[serde(default)]
     batch_limits: Option<RawBatchLimits>,
     #[serde(default)]
+    pg: Option<RawPg>,
+    #[serde(default)]
     tables: Vec<RawTable>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPg {
+    #[serde(default)]
+    max_pool_size: Option<u32>,
+    #[serde(default)]
+    wait_timeout_ms: Option<u64>,
+    #[serde(default)]
+    create_timeout_ms: Option<u64>,
+    #[serde(default)]
+    recycle_timeout_ms: Option<u64>,
+    #[serde(default)]
+    recycling_method: Option<String>,
+    #[serde(default)]
+    retry: Option<RawPgRetry>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPgRetry {
+    #[serde(default)]
+    max_attempts: Option<u32>,
+    #[serde(default)]
+    initial_backoff_ms: Option<u64>,
+    #[serde(default)]
+    max_backoff_ms: Option<u64>,
+    #[serde(default)]
+    jitter_pct: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -411,6 +521,8 @@ impl RawConfig {
             Some(n) => n,
         };
 
+        let pg = resolve_pg(self.pg.as_ref())?;
+
         Ok(Config {
             server: ServerConfig {
                 listen_addr,
@@ -419,6 +531,7 @@ impl RawConfig {
             },
             tables,
             batch_limits,
+            pg,
         })
     }
 }
@@ -427,6 +540,77 @@ impl RawConfig {
 /// - Fields the raw block doesn't mention → inherit from base.
 /// - Fields with `LimitField::Number(n)` → set to `Some(n)`.
 /// - Fields with `LimitField::Unlimited` → set to `None` (cap disabled).
+fn resolve_pg(raw: Option<&RawPg>) -> Result<PgConfig, ConfigError> {
+    let mut out = PgConfig::defaults();
+    let Some(raw) = raw else { return Ok(out) };
+    if let Some(n) = raw.max_pool_size {
+        if n == 0 {
+            return Err(ConfigError::validation("pg.max_pool_size must be > 0"));
+        }
+        out.max_pool_size = n;
+    }
+    if let Some(n) = raw.wait_timeout_ms {
+        if n == 0 {
+            return Err(ConfigError::validation("pg.wait_timeout_ms must be > 0"));
+        }
+        out.wait_timeout_ms = n;
+    }
+    if let Some(n) = raw.create_timeout_ms {
+        if n == 0 {
+            return Err(ConfigError::validation("pg.create_timeout_ms must be > 0"));
+        }
+        out.create_timeout_ms = n;
+    }
+    if let Some(n) = raw.recycle_timeout_ms {
+        if n == 0 {
+            return Err(ConfigError::validation("pg.recycle_timeout_ms must be > 0"));
+        }
+        out.recycle_timeout_ms = n;
+    }
+    if let Some(m) = raw.recycling_method.as_deref() {
+        out.recycling_method = match m {
+            "fast" => RecyclingMethod::Fast,
+            "verified" => RecyclingMethod::Verified,
+            "clean" => RecyclingMethod::Clean,
+            other => {
+                return Err(ConfigError::validation(format!(
+                    "pg.recycling_method `{other}` is not one of fast | verified | clean"
+                )));
+            }
+        };
+    }
+    if let Some(rraw) = raw.retry.as_ref() {
+        if let Some(n) = rraw.max_attempts {
+            if n == 0 {
+                return Err(ConfigError::validation(
+                    "pg.retry.max_attempts must be > 0 (use 1 to disable retries)",
+                ));
+            }
+            out.retry.max_attempts = n;
+        }
+        if let Some(n) = rraw.initial_backoff_ms {
+            out.retry.initial_backoff_ms = n;
+        }
+        if let Some(n) = rraw.max_backoff_ms {
+            out.retry.max_backoff_ms = n;
+        }
+        if let Some(n) = rraw.jitter_pct {
+            if n > 100 {
+                return Err(ConfigError::validation(
+                    "pg.retry.jitter_pct must be in 0..=100",
+                ));
+            }
+            out.retry.jitter_pct = n;
+        }
+        if out.retry.initial_backoff_ms > out.retry.max_backoff_ms {
+            return Err(ConfigError::validation(
+                "pg.retry.initial_backoff_ms must be <= max_backoff_ms",
+            ));
+        }
+    }
+    Ok(out)
+}
+
 fn merge_limits(base: Limits, raw: Option<&RawLimits>) -> Limits {
     let Some(raw) = raw else { return base };
     Limits {
