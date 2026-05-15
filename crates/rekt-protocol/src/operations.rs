@@ -142,6 +142,17 @@ pub struct QueryRequest {
     /// `Some(true)` are both ascending (DDB default).
     #[serde(default)]
     pub scan_index_forward: Option<bool>,
+    /// `ALL_ATTRIBUTES` (default), `COUNT`, or `SPECIFIC_ATTRIBUTES`
+    /// (implied when `ProjectionExpression` is set). Q6 accepts these
+    /// three; `ALL_PROJECTED_ATTRIBUTES` is GSI-only and rejected
+    /// until GSI work lands.
+    #[serde(default)]
+    pub select: Option<String>,
+    /// Comma-separated attribute paths to return in each item. v1
+    /// supports top-level paths only (nested paths land with Phase 8
+    /// in `PLAN-2`).
+    #[serde(default)]
+    pub projection_expression: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -194,6 +205,12 @@ pub struct ScanRequest {
     #[serde(default)]
     pub expression_attribute_values:
         Option<std::collections::BTreeMap<String, crate::AttributeValue>>,
+    /// See `QueryRequest::select`.
+    #[serde(default)]
+    pub select: Option<String>,
+    /// See `QueryRequest::projection_expression`.
+    #[serde(default)]
+    pub projection_expression: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

@@ -3070,3 +3070,94 @@ fn diff_query_descending_traversal() {
         delete_both_composite("device_events", "device_id", pk, "ts", &format!("{{\"N\":\"{ts}\"}}"));
     }
 }
+
+// ===== Q6: Select=COUNT + ProjectionExpression vs DDB-local ===============
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_select_count() {
+    ensure_device_events_table();
+    let pk = "diff-q-count";
+    for ts in 1..=3 {
+        let item = format!(
+            "{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"{ts}\"}},\"val\":{{\"N\":\"{ts}\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+    }
+
+    let eav = format!("{{\":pk\":{{\"S\":\"{pk}\"}}}}");
+    let args: Vec<&str> = vec![
+        "dynamodb","query","--table-name","device_events",
+        "--key-condition-expression","device_id = :pk",
+        "--expression-attribute-values", &eav,
+        "--select","COUNT",
+    ];
+    let q_ref = aws(REF, &args);
+    let q_ours = aws(OURS, &args);
+    assert_eq!(q_ref["Count"], q_ours["Count"]);
+    assert_eq!(q_ref["ScannedCount"], q_ours["ScannedCount"]);
+    // Items: DDB-local returns an empty array; rektifier matches.
+    let ref_items_empty = q_ref["Items"].as_array().is_none_or(|a| a.is_empty());
+    let ours_items_empty = q_ours["Items"].as_array().is_none_or(|a| a.is_empty());
+    assert!(
+        ref_items_empty && ours_items_empty,
+        "Select=COUNT should not return Items\nref: {q_ref}\nours: {q_ours}"
+    );
+
+    for ts in 1..=3 {
+        delete_both_composite("device_events", "device_id", pk, "ts", &format!("{{\"N\":\"{ts}\"}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_projection_prunes_attributes() {
+    ensure_device_events_table();
+    let pk = "diff-q-proj";
+    let item = format!(
+        "{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"1\"}},\"val\":{{\"S\":\"v\"}},\"label\":{{\"S\":\"L\"}}}}"
+    );
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+
+    let eav = format!("{{\":pk\":{{\"S\":\"{pk}\"}}}}");
+    let args: Vec<&str> = vec![
+        "dynamodb","query","--table-name","device_events",
+        "--key-condition-expression","device_id = :pk",
+        "--expression-attribute-values", &eav,
+        "--projection-expression","label, val",
+    ];
+    let q_ref = aws(REF, &args);
+    let q_ours = aws(OURS, &args);
+    assert_eq!(q_ref["Count"], q_ours["Count"]);
+    assert_eq!(q_ref["Items"], q_ours["Items"]);
+
+    delete_both_composite("device_events", "device_id", pk, "ts", "{\"N\":\"1\"}");
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_scan_select_count() {
+    ensure_users_table();
+    let prefix = "diff-scan-cnt-";
+    for n in 1..=3 {
+        let item = format!(
+            "{{\"id\":{{\"S\":\"{prefix}{n}\"}},\"label\":{{\"S\":\"v\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",&item]);
+    }
+
+    let q_ref = aws(REF, &["dynamodb","scan","--table-name","users","--select","COUNT"]);
+    let q_ours = aws(OURS, &["dynamodb","scan","--table-name","users","--select","COUNT"]);
+    assert_eq!(q_ref["Count"], q_ours["Count"]);
+    assert_eq!(q_ref["ScannedCount"], q_ours["ScannedCount"]);
+    let ref_empty = q_ref["Items"].as_array().is_none_or(|a| a.is_empty());
+    let ours_empty = q_ours["Items"].as_array().is_none_or(|a| a.is_empty());
+    assert!(ref_empty && ours_empty);
+
+    for n in 1..=3 {
+        delete_both("users", &format!("{{\"id\":{{\"S\":\"{prefix}{n}\"}}}}"));
+    }
+}

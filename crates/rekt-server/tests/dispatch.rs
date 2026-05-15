@@ -4255,3 +4255,196 @@ async fn query_descending_pagination_resumes_correctly() {
         .collect();
     assert_eq!(ts, vec!["4", "3"]);
 }
+
+// ===== Q6: Select=COUNT + ProjectionExpression ============================
+
+#[tokio::test]
+async fn query_select_count_omits_items() {
+    let app = app();
+    for ts in 1..=3 {
+        put_item(
+            &app,
+            "device_events",
+            json!({
+                "device_id":{"S":"q-cnt"},
+                "ts":{"N":ts.to_string()},
+                "val":{"N":ts.to_string()}
+            }),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName":"device_events",
+                "KeyConditionExpression":"device_id = :pk",
+                "ExpressionAttributeValues":{":pk":{"S":"q-cnt"}},
+                "Select":"COUNT"
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["Count"], 3);
+    assert_eq!(body["ScannedCount"], 3);
+    let items = body["Items"].as_array().expect("Items field present");
+    assert!(items.is_empty(), "Select=COUNT must omit Items entries");
+}
+
+#[tokio::test]
+async fn query_projection_prunes_attributes() {
+    let app = app();
+    put_item(
+        &app,
+        "users",
+        json!({
+            "id":{"S":"q-proj-1"},
+            "label":{"S":"alice"},
+            "tier":{"S":"admin"},
+            "version":{"N":"42"}
+        }),
+    )
+    .await;
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName":"users",
+                "KeyConditionExpression":"id = :pk",
+                "ExpressionAttributeValues":{":pk":{"S":"q-proj-1"}},
+                "ProjectionExpression":"label, tier"
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let item = &body["Items"][0];
+    // `label` + `tier` kept; `id` + `version` pruned.
+    assert!(item.get("label").is_some());
+    assert!(item.get("tier").is_some());
+    assert!(item.get("id").is_none(), "projected items should drop id");
+    assert!(item.get("version").is_none());
+}
+
+#[tokio::test]
+async fn query_projection_with_alias_substitutes() {
+    let app = app();
+    put_item(
+        &app,
+        "users",
+        json!({
+            "id":{"S":"q-pa-1"},
+            "name":{"S":"alice"},
+            "label":{"S":"L"}
+        }),
+    )
+    .await;
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName":"users",
+                "KeyConditionExpression":"id = :pk",
+                "ExpressionAttributeValues":{":pk":{"S":"q-pa-1"}},
+                "ExpressionAttributeNames":{"#n":"name"},
+                "ProjectionExpression":"#n"
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let item = &body["Items"][0];
+    assert_eq!(item["name"]["S"], "alice");
+    assert!(item.get("id").is_none());
+    assert!(item.get("label").is_none());
+}
+
+#[tokio::test]
+async fn query_select_count_with_projection_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName":"users",
+                "KeyConditionExpression":"id = :pk",
+                "ExpressionAttributeValues":{":pk":{"S":"q-cnt-proj"}},
+                "Select":"COUNT",
+                "ProjectionExpression":"label"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body
+        .get("__type")
+        .and_then(Value::as_str)
+        .unwrap()
+        .ends_with("#ValidationException"));
+}
+
+#[tokio::test]
+async fn scan_select_count_omits_items() {
+    let app = app();
+    for n in 1..=3 {
+        put_item(
+            &app,
+            "users",
+            json!({"id":{"S":format!("scan-cnt-{n}")},"label":{"S":"v"}}),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "Scan",
+            json!({"TableName":"users","Select":"COUNT"}),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert!(body["Count"].as_u64().unwrap() >= 3);
+    assert_eq!(
+        body["Items"].as_array().unwrap().len(),
+        0,
+        "Select=COUNT must omit Items entries"
+    );
+}
+
+#[tokio::test]
+async fn scan_projection_prunes_attributes() {
+    let app = app();
+    for n in 1..=2 {
+        put_item(
+            &app,
+            "users",
+            json!({
+                "id":{"S":format!("scan-proj-{n}")},
+                "label":{"S":format!("L{n}")},
+                "tier":{"S":"admin"}
+            }),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "Scan",
+            json!({
+                "TableName":"users",
+                "ProjectionExpression":"label"
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    // Every returned item must have ONLY `label` (other tests may have
+    // populated the table; just check our items are pruned correctly).
+    for item in body["Items"].as_array().unwrap() {
+        let keys: Vec<&str> = item.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        assert!(
+            keys.iter().all(|k| *k == "label"),
+            "projected scan items must contain only `label`, got {keys:?}"
+        );
+    }
+}

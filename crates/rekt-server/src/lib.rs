@@ -525,15 +525,11 @@ async fn handle_query(state: &AppState, body: &Bytes) -> Result<Response, ApiErr
         )
         .await?;
 
-    let items: Vec<Item> = outcome
-        .items
-        .into_iter()
-        .map(|v| {
-            serde_json::from_value::<Item>(v).map_err(|e| {
-                ApiError::Internal(format!("stored item is not valid DynamoDB-JSON: {e}"))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let items: Vec<Item> = items_to_response(
+        outcome.items,
+        plan.select_count_only,
+        plan.projection.as_ref(),
+    )?;
 
     let last_evaluated_key = outcome
         .last_evaluated_key
@@ -546,6 +542,47 @@ async fn handle_query(state: &AppState, body: &Bytes) -> Result<Response, ApiErr
         scanned_count: outcome.scanned_count,
         last_evaluated_key,
     }))
+}
+
+/// Apply Q6's count-only + projection post-filter to the backend's
+/// returned items. `count_only` drops every item (the wire response
+/// will carry `Count` / `ScannedCount` only). `projection` retains
+/// only the listed top-level attribute names per item.
+fn items_to_response(
+    rows: Vec<serde_json::Value>,
+    count_only: bool,
+    projection: Option<&std::collections::BTreeSet<String>>,
+) -> Result<Vec<Item>, ApiError> {
+    if count_only {
+        return Ok(Vec::new());
+    }
+    rows.into_iter()
+        .map(|v| {
+            let v = match projection {
+                None => v,
+                Some(keep) => prune_to_projection(v, keep),
+            };
+            serde_json::from_value::<Item>(v).map_err(|e| {
+                ApiError::Internal(format!("stored item is not valid DynamoDB-JSON: {e}"))
+            })
+        })
+        .collect()
+}
+
+fn prune_to_projection(
+    v: serde_json::Value,
+    keep: &std::collections::BTreeSet<String>,
+) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(map) => {
+            let pruned: serde_json::Map<String, serde_json::Value> = map
+                .into_iter()
+                .filter(|(k, _)| keep.contains(k))
+                .collect();
+            serde_json::Value::Object(pruned)
+        }
+        other => other,
+    }
 }
 
 #[tracing::instrument(
@@ -586,15 +623,11 @@ async fn handle_scan(state: &AppState, body: &Bytes) -> Result<Response, ApiErro
         .scan_raw(&schema.shape(), filter_fn, plan.limit, esk_pair)
         .await?;
 
-    let items: Vec<Item> = outcome
-        .items
-        .into_iter()
-        .map(|v| {
-            serde_json::from_value::<Item>(v).map_err(|e| {
-                ApiError::Internal(format!("stored item is not valid DynamoDB-JSON: {e}"))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let items: Vec<Item> = items_to_response(
+        outcome.items,
+        plan.select_count_only,
+        plan.projection.as_ref(),
+    )?;
 
     let last_evaluated_key = outcome
         .last_evaluated_key

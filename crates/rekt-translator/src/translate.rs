@@ -10,6 +10,7 @@ use crate::error::{map_substitute_for_condition, TranslateError};
 use crate::key_condition::extract_key_condition;
 use crate::keys::{extract_key, reject_extra_key_attrs, KeyRole};
 use crate::paging::{decode_esk, decode_scan_esk, validate_limit};
+use crate::projection::resolve_select_and_projection;
 use crate::plan::{
     ConditionPlan, DeleteItemPlan, GetItemPlan, PutItemPlan, QueryPlan, ReturnValuesMode,
     ScanPlan, UpdateItemPlan,
@@ -257,6 +258,12 @@ pub fn translate_query(
     // false → DESC sort + flipped ESK comparison.
     let forward = req.scan_index_forward.unwrap_or(true);
 
+    let (select_count_only, projection) = resolve_select_and_projection(
+        req.select.as_deref(),
+        req.projection_expression.as_deref(),
+        names,
+    )?;
+
     Ok(QueryPlan {
         pk: bounds.pk,
         sk_condition: bounds.sk_condition,
@@ -264,6 +271,8 @@ pub fn translate_query(
         esk_sk,
         filter,
         forward,
+        select_count_only,
+        projection,
     })
 }
 
@@ -311,11 +320,19 @@ pub fn translate_scan(
         schema,
     )?;
 
+    let (select_count_only, projection) = resolve_select_and_projection(
+        req.select.as_deref(),
+        req.projection_expression.as_deref(),
+        names,
+    )?;
+
     Ok(ScanPlan {
         limit,
         esk_pk,
         esk_sk,
         filter,
+        select_count_only,
+        projection,
     })
 }
 

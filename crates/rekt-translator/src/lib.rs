@@ -32,6 +32,7 @@ mod keys;
 pub mod materialize;
 mod paging;
 pub mod plan;
+mod projection;
 pub mod schema;
 pub mod translate;
 
@@ -1529,6 +1530,8 @@ mod tests {
             exclusive_start_key: None,
             filter_expression: None,
             scan_index_forward: None,
+            select: None,
+            projection_expression: None,
         }
     }
 
@@ -2268,5 +2271,207 @@ mod tests {
         req.scan_index_forward = Some(false);
         let plan = translate_query(&req, &schema_composite_s_n()).unwrap();
         assert!(!plan.forward);
+    }
+
+    // ============================================================
+    // Q6 — Select + ProjectionExpression
+    // ============================================================
+
+    #[test]
+    fn query_select_count_carries() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        req.select = Some("COUNT".into());
+        let plan = translate_query(&req, &schema_hash_s()).unwrap();
+        assert!(plan.select_count_only);
+        assert!(plan.projection.is_none());
+    }
+
+    #[test]
+    fn query_select_all_attributes_is_noop() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        req.select = Some("ALL_ATTRIBUTES".into());
+        let plan = translate_query(&req, &schema_hash_s()).unwrap();
+        assert!(!plan.select_count_only);
+        assert!(plan.projection.is_none());
+    }
+
+    #[test]
+    fn query_select_all_projected_attributes_rejected() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        req.select = Some("ALL_PROJECTED_ATTRIBUTES".into());
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(err, TranslateError::InvalidSelectMode { .. }));
+    }
+
+    #[test]
+    fn query_select_bogus_rejected() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        req.select = Some("BOGUS".into());
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::UnsupportedSelect { ref got } if got == "BOGUS"
+        ));
+    }
+
+    #[test]
+    fn query_projection_parses_into_plan() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        req.projection_expression = Some("label, flag".into());
+        let plan = translate_query(&req, &schema_hash_s()).unwrap();
+        let proj = plan.projection.expect("projection set");
+        assert!(proj.contains("label"));
+        assert!(proj.contains("flag"));
+        assert_eq!(proj.len(), 2);
+    }
+
+    #[test]
+    fn query_projection_alias_substitutes() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[("#n", "name")],
+        );
+        req.projection_expression = Some("#n, label".into());
+        let plan = translate_query(&req, &schema_hash_s()).unwrap();
+        let proj = plan.projection.expect("projection set");
+        // `#n` resolves to the reserved word "name" — aliases bypass
+        // the reserved-word check just like in Update/Condition exprs.
+        assert!(proj.contains("name"));
+        assert!(proj.contains("label"));
+    }
+
+    #[test]
+    fn query_projection_bare_reserved_word_rejected() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        req.projection_expression = Some("name, label".into());
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::ReservedWordInProjectionExpression { ref word } if word == "name"
+        ));
+    }
+
+    #[test]
+    fn query_projection_nested_path_rejected() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        req.projection_expression = Some("meta.score".into());
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::ProjectionNestedPathUnsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn query_projection_indexed_path_rejected() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        req.projection_expression = Some("entries[0]".into());
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::ProjectionNestedPathUnsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn query_projection_unknown_alias_rejected() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        req.projection_expression = Some("#missing".into());
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::UnknownPlaceholder(ref p) if p == "#missing"
+        ));
+    }
+
+    #[test]
+    fn query_select_count_with_projection_rejected() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        req.select = Some("COUNT".into());
+        req.projection_expression = Some("label".into());
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(err, TranslateError::InvalidSelectMode { .. }));
+    }
+
+    #[test]
+    fn query_select_specific_attributes_requires_projection() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        req.select = Some("SPECIFIC_ATTRIBUTES".into());
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(err, TranslateError::InvalidSelectMode { .. }));
+    }
+
+    #[test]
+    fn scan_select_count_carries() {
+        let mut req = scan_req("users");
+        req.select = Some("COUNT".into());
+        let plan = translate_scan(&req, &schema_hash_s()).unwrap();
+        assert!(plan.select_count_only);
+    }
+
+    #[test]
+    fn scan_projection_parses_into_plan() {
+        let mut req = scan_req("users");
+        req.projection_expression = Some("label, flag, tier".into());
+        let plan = translate_scan(&req, &schema_hash_s()).unwrap();
+        let proj = plan.projection.expect("projection set");
+        assert_eq!(proj.len(), 3);
     }
 }

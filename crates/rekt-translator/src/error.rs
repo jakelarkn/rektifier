@@ -204,6 +204,39 @@ pub enum TranslateError {
     /// See `PLAN-4` D4/D5.
     #[error("Scan feature not supported: {what}")]
     ScanFeatureNotSupported { what: &'static str },
+
+    // ----- Q6 — Select + ProjectionExpression -----
+    /// `Select` value isn't one of `ALL_ATTRIBUTES`, `COUNT`,
+    /// `SPECIFIC_ATTRIBUTES`, or `ALL_PROJECTED_ATTRIBUTES`.
+    #[error("Unsupported Select value: `{got}` (expected ALL_ATTRIBUTES | COUNT | SPECIFIC_ATTRIBUTES)")]
+    UnsupportedSelect { got: String },
+
+    /// Combination of `Select` + `ProjectionExpression` is invalid
+    /// (e.g. `Select=COUNT` with `ProjectionExpression` set,
+    /// `Select=SPECIFIC_ATTRIBUTES` without `ProjectionExpression`,
+    /// `Select=ALL_PROJECTED_ATTRIBUTES` without `IndexName`).
+    #[error("Invalid Select mode: {reason}")]
+    InvalidSelectMode { reason: &'static str },
+
+    /// `ProjectionExpression` couldn't be parsed (empty path, etc.).
+    #[error("Invalid ProjectionExpression: {reason}")]
+    InvalidProjectionExpression { reason: String },
+
+    /// `ProjectionExpression` used a nested or indexed path; v1
+    /// supports top-level paths only. Phase 8 in `PLAN-2` lifts.
+    #[error(
+        "nested paths in ProjectionExpression are not yet supported (got `{path}`) — Phase 8 will lift this restriction"
+    )]
+    ProjectionNestedPathUnsupported { path: String },
+
+    /// Bare attribute name in `ProjectionExpression` matched a DDB
+    /// reserved word; caller must use `ExpressionAttributeNames` to
+    /// alias it. Matches the wire shape of the other reserved-word
+    /// rejections.
+    #[error(
+        "Invalid ProjectionExpression: Attribute name is a reserved keyword; reserved keyword: {word}"
+    )]
+    ReservedWordInProjectionExpression { word: String },
 }
 
 impl From<ParseError> for TranslateError {

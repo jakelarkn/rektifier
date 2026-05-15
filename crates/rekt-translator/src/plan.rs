@@ -126,13 +126,17 @@ pub fn touched_paths(expr: &UpdateExpression) -> std::collections::BTreeSet<Stri
 /// `COMPATIBILITY_NOTES.md`). `esk_pk` + `esk_sk` together form the
 /// keyset cursor — both come from the previous response's LEK.
 /// `filter` is the parsed FilterExpression (per-row Rust eval, same
-/// pattern as Query — PLAN-4 D2).
+/// pattern as Query — PLAN-4 D2). `select_count_only` (Q6) drops the
+/// `Items` field from the response. `projection` (Q6) restricts each
+/// returned item to a subset of top-level attribute names.
 #[derive(Debug, Clone, Default)]
 pub struct ScanPlan {
     pub limit: Option<u32>,
     pub esk_pk: Option<KeyValue>,
     pub esk_sk: Option<KeyValue>,
     pub filter: Option<ConditionPlan>,
+    pub select_count_only: bool,
+    pub projection: Option<std::collections::BTreeSet<String>>,
 }
 
 /// Query plan: bounded read of one partition.
@@ -155,6 +159,11 @@ pub struct QueryPlan {
     pub esk_sk: Option<KeyValue>,
     pub filter: Option<ConditionPlan>,
     pub forward: bool,
+    /// `Select=COUNT`: dispatcher drops items from the response.
+    pub select_count_only: bool,
+    /// `ProjectionExpression`: dispatcher prunes each item's
+    /// attributes to this set (top-level names only in v1).
+    pub projection: Option<std::collections::BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone)]
