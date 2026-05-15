@@ -3161,3 +3161,668 @@ fn diff_scan_select_count() {
         delete_both("users", &format!("{{\"id\":{{\"S\":\"{prefix}{n}\"}}}}"));
     }
 }
+
+// ===== Integration test gap-closure (audit follow-up) =======================
+//
+// This block addresses the high-severity gaps surfaced by the
+// integration-test audit (see PLAN-5-integration-testing.md). The
+// audit-residual / low-severity gaps are tracked in that plan doc;
+// the items here are the must-have parity coverage for v1.
+
+// ----- Binary-key Query/Scan ------------------------------------------------
+
+fn ensure_binsorted_table_q5() {
+    ensure_binsorted_table();
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_scan_blobs_b_pk_round_trip() {
+    ensure_blobs_table();
+    // Three binary keys; insert distinct base64 values.
+    let keys = ["AAEC", "AAED", "AAEE"];
+    for k in keys {
+        let item = format!(
+            "{{\"binmark\":{{\"B\":\"{k}\"}},\"val\":{{\"S\":\"v\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","blobs","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","blobs","--item",&item]);
+    }
+
+    let q_ref = aws(REF, &["dynamodb","scan","--table-name","blobs"]);
+    let q_ours = aws(OURS, &["dynamodb","scan","--table-name","blobs"]);
+    let mut ref_items = q_ref["Items"].as_array().unwrap().clone();
+    let mut our_items = q_ours["Items"].as_array().unwrap().clone();
+    // Sort by binmark (base64 string), since DDB Scan order is undefined.
+    sort_items_by_keys(&mut ref_items, "binmark", None);
+    sort_items_by_keys(&mut our_items, "binmark", None);
+    assert_eq!(ref_items, our_items, "Scan on blobs diverged");
+
+    for k in keys {
+        delete_both("blobs", &format!("{{\"binmark\":{{\"B\":\"{k}\"}}}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_blobs_b_pk_round_trip() {
+    ensure_blobs_table();
+    let k = "AAFF";
+    let item = format!(
+        "{{\"binmark\":{{\"B\":\"{k}\"}},\"label\":{{\"S\":\"alpha\"}}}}"
+    );
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","blobs","--item",&item]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","blobs","--item",&item]);
+
+    // KCE: binmark = :pk (B-PK equality).
+    let eav = format!("{{\":pk\":{{\"B\":\"{k}\"}}}}");
+    let args: Vec<&str> = vec![
+        "dynamodb","query","--table-name","blobs",
+        "--key-condition-expression","binmark = :pk",
+        "--expression-attribute-values", &eav,
+    ];
+    let q_ref = aws(REF, &args);
+    let q_ours = aws(OURS, &args);
+    assert_eq!(q_ref["Count"], q_ours["Count"]);
+    assert_eq!(q_ref["Items"], q_ours["Items"], "Query on blobs B-PK diverged");
+
+    delete_both("blobs", &format!("{{\"binmark\":{{\"B\":\"{k}\"}}}}"));
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_binsorted_sb_composite() {
+    ensure_binsorted_table_q5();
+    let pk = "diff-binsorted";
+    let bins = ["AAA=", "AAE=", "AAI="];
+    for b in bins {
+        let item = format!(
+            "{{\"id\":{{\"S\":\"{pk}\"}},\"binmark\":{{\"B\":\"{b}\"}},\"val\":{{\"S\":\"v\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","binsorted","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","binsorted","--item",&item]);
+    }
+
+    // Pure pk-only KCE on composite S+B. Both endpoints should return
+    // all three rows in B-asc order.
+    let eav = format!("{{\":pk\":{{\"S\":\"{pk}\"}}}}");
+    let args: Vec<&str> = vec![
+        "dynamodb","query","--table-name","binsorted",
+        "--key-condition-expression","id = :pk",
+        "--expression-attribute-values", &eav,
+    ];
+    let q_ref = aws(REF, &args);
+    let q_ours = aws(OURS, &args);
+    assert_eq!(q_ref["Count"], q_ours["Count"]);
+    assert_eq!(q_ref["Items"], q_ours["Items"], "Query on binsorted diverged");
+
+    for b in bins {
+        delete_both_composite("binsorted", "id", pk, "binmark", &format!("{{\"B\":\"{b}\"}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_binsorted_begins_with_b_sk_both_reject() {
+    // PLAN-4 D8: begins_with on B-typed SK is deferred. Confirm both
+    // endpoints reject — we want the rejection to be observable, even
+    // if the error wording differs.
+    ensure_binsorted_table_q5();
+    let eav = "{\":pk\":{\"S\":\"diff-binsorted-bw\"},\":pfx\":{\"B\":\"AA==\"}}";
+    let stderr_ref = aws_expecting_failure(
+        REF,
+        &[
+            "dynamodb","query","--table-name","binsorted",
+            "--key-condition-expression","id = :pk AND begins_with(binmark, :pfx)",
+            "--expression-attribute-values", eav,
+        ],
+    );
+    let stderr_ours = aws_expecting_failure(
+        OURS,
+        &[
+            "dynamodb","query","--table-name","binsorted",
+            "--key-condition-expression","id = :pk AND begins_with(binmark, :pfx)",
+            "--expression-attribute-values", eav,
+        ],
+    );
+    // DDB-local's wording varies; we just want each endpoint to fail
+    // somewhere in the validation pipeline.
+    assert!(
+        stderr_ref.contains("ValidationException") || stderr_ref.contains("Invalid"),
+        "DDB-local didn't reject begins_with on B-SK: {stderr_ref}"
+    );
+    assert!(
+        stderr_ours.contains("ValidationException")
+            || stderr_ours.contains("begins_with"),
+        "rektifier didn't reject begins_with on B-SK: {stderr_ours}"
+    );
+}
+
+// ----- N-PK Query/Scan + ordering ------------------------------------------
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_counters_n_pk() {
+    ensure_counters_table();
+    for n in [10, 1, 20, 2] {
+        let item = format!(
+            "{{\"id\":{{\"N\":\"{n}\"}},\"val\":{{\"N\":\"{n}\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","counters","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","counters","--item",&item]);
+    }
+    // Query each one individually (hash-only — Query just returns the
+    // single row for that pk).
+    for n in [1, 2, 10, 20] {
+        let eav = format!("{{\":pk\":{{\"N\":\"{n}\"}}}}");
+        let args: Vec<&str> = vec![
+            "dynamodb","query","--table-name","counters",
+            "--key-condition-expression","id = :pk",
+            "--expression-attribute-values", &eav,
+        ];
+        let q_ref = aws(REF, &args);
+        let q_ours = aws(OURS, &args);
+        assert_eq!(q_ref["Count"], q_ours["Count"], "N-PK Query Count diverged for {n}");
+        assert_eq!(q_ref["Items"], q_ours["Items"], "N-PK Query Items diverged for {n}");
+    }
+
+    for n in [1, 2, 10, 20] {
+        delete_both("counters", &format!("{{\"id\":{{\"N\":\"{n}\"}}}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_scan_counters_n_pk_ordering() {
+    ensure_counters_table();
+    // Insert in a non-monotonic order to flush out any lex-vs-numeric
+    // ordering bug. PG numeric and DDB N both sort numerically, so
+    // `1, 2, 10, 20` (not `1, 10, 2, 20`).
+    for n in [10, 1, 20, 2] {
+        let item = format!(
+            "{{\"id\":{{\"N\":\"{n}\"}},\"val\":{{\"N\":\"{n}\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","counters","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","counters","--item",&item]);
+    }
+    let q_ref = aws(REF, &["dynamodb","scan","--table-name","counters"]);
+    let q_ours = aws(OURS, &["dynamodb","scan","--table-name","counters"]);
+    assert_eq!(q_ref["Count"], q_ours["Count"]);
+    // Compare item sets (Scan order is undefined per DDB).
+    let mut ref_items = q_ref["Items"].as_array().unwrap().clone();
+    let mut our_items = q_ours["Items"].as_array().unwrap().clone();
+    sort_items_by_keys(&mut ref_items, "id", None);
+    sort_items_by_keys(&mut our_items, "id", None);
+    assert_eq!(ref_items, our_items);
+
+    for n in [1, 2, 10, 20] {
+        delete_both("counters", &format!("{{\"id\":{{\"N\":\"{n}\"}}}}"));
+    }
+}
+
+// ----- Type round-trip across all 10 AttributeValue variants ---------------
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_type_coverage_all_av_variants() {
+    ensure_device_events_table();
+    let pk = "diff-q-typecov";
+    let item = format!(
+        "{{\
+            \"device_id\":{{\"S\":\"{pk}\"}},\
+            \"ts\":{{\"N\":\"1\"}},\
+            \"s_attr\":{{\"S\":\"hello\"}},\
+            \"n_attr\":{{\"N\":\"3.14\"}},\
+            \"b_attr\":{{\"B\":\"AAEC\"}},\
+            \"bool_attr\":{{\"BOOL\":true}},\
+            \"null_attr\":{{\"NULL\":true}},\
+            \"l_attr\":{{\"L\":[{{\"S\":\"a\"}},{{\"N\":\"1\"}}]}},\
+            \"m_attr\":{{\"M\":{{\"k\":{{\"S\":\"v\"}}}}}},\
+            \"ss_attr\":{{\"SS\":[\"a\",\"b\"]}},\
+            \"ns_attr\":{{\"NS\":[\"1\",\"2\"]}},\
+            \"bs_attr\":{{\"BS\":[\"AA==\",\"AQ==\"]}}\
+        }}"
+    );
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+
+    let eav = format!("{{\":pk\":{{\"S\":\"{pk}\"}}}}");
+    let mut q_ref = aws(REF, &[
+        "dynamodb","query","--table-name","device_events",
+        "--key-condition-expression","device_id = :pk",
+        "--expression-attribute-values", &eav,
+    ]);
+    let mut q_ours = aws(OURS, &[
+        "dynamodb","query","--table-name","device_events",
+        "--key-condition-expression","device_id = :pk",
+        "--expression-attribute-values", &eav,
+    ]);
+    sort_sets(&mut q_ref);
+    sort_sets(&mut q_ours);
+    assert_eq!(q_ref["Items"], q_ours["Items"], "Type round-trip via Query diverged");
+
+    delete_both_composite("device_events", "device_id", pk, "ts", "{\"N\":\"1\"}");
+}
+
+// ----- FilterExpression operator breadth -----------------------------------
+//
+// One diff test per major operator family. The translator-side
+// reservation rules already cover negative paths; these tests confirm
+// each operator produces the same item set against DDB-local and
+// rektifier.
+
+fn seed_filter_corpus(pk: &str) {
+    ensure_device_events_table();
+    // 5 rows with varied attributes covering filter operator surface.
+    let rows = [
+        // (ts, flag_str, score_n, label_s)
+        ("1", "on",  "5",  "alpha"),
+        ("2", "off", "15", "beta"),
+        ("3", "on",  "25", "gamma"),
+        ("4", "off", "35", "delta"),
+        ("5", "on",  "45", "epsilon"),
+    ];
+    for (ts, flag, score, label) in rows {
+        let item = format!(
+            "{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"{ts}\"}},\
+              \"flag\":{{\"S\":\"{flag}\"}},\"score\":{{\"N\":\"{score}\"}},\
+              \"label\":{{\"S\":\"{label}\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+    }
+}
+
+fn drop_filter_corpus(pk: &str) {
+    for ts in 1..=5 {
+        delete_both_composite("device_events", "device_id", pk, "ts", &format!("{{\"N\":\"{ts}\"}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_filter_comparison_ops() {
+    let pk = "diff-q-filt-cmp";
+    seed_filter_corpus(pk);
+    // Try four comparison operators against `score`.
+    let cases = [
+        ("score < :v",  "{\"N\":\"30\"}"),  // 5, 15, 25
+        ("score <= :v", "{\"N\":\"25\"}"),  // 5, 15, 25
+        ("score > :v",  "{\"N\":\"25\"}"),  // 35, 45
+        ("score = :v",  "{\"N\":\"15\"}"),  // 15
+    ];
+    for (expr, val) in cases {
+        let eav = format!("{{\":pk\":{{\"S\":\"{pk}\"}},\":v\":{val}}}");
+        let args: Vec<&str> = vec![
+            "dynamodb","query","--table-name","device_events",
+            "--key-condition-expression","device_id = :pk",
+            "--filter-expression", expr,
+            "--expression-attribute-values", &eav,
+        ];
+        let q_ref = aws(REF, &args);
+        let q_ours = aws(OURS, &args);
+        assert_eq!(q_ref["Count"], q_ours["Count"], "diverged for {expr}");
+        assert_eq!(q_ref["Items"], q_ours["Items"], "items diverged for {expr}");
+    }
+    drop_filter_corpus(pk);
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_filter_and_or_not() {
+    let pk = "diff-q-filt-bool";
+    seed_filter_corpus(pk);
+    let cases = [
+        // AND
+        "flag = :on AND score > :hi",
+        // OR
+        "flag = :on OR score > :hi",
+        // NOT
+        "NOT (flag = :on)",
+        // Nested
+        "(flag = :on AND score > :lo) OR label = :tgt",
+    ];
+    let eav = format!(
+        "{{\":pk\":{{\"S\":\"{pk}\"}},\":on\":{{\"S\":\"on\"}},\
+          \":hi\":{{\"N\":\"20\"}},\":lo\":{{\"N\":\"10\"}},\
+          \":tgt\":{{\"S\":\"delta\"}}}}"
+    );
+    for expr in cases {
+        let args: Vec<&str> = vec![
+            "dynamodb","query","--table-name","device_events",
+            "--key-condition-expression","device_id = :pk",
+            "--filter-expression", expr,
+            "--expression-attribute-values", &eav,
+        ];
+        let q_ref = aws(REF, &args);
+        let q_ours = aws(OURS, &args);
+        assert_eq!(q_ref["Count"], q_ours["Count"], "diverged for {expr}");
+        assert_eq!(q_ref["Items"], q_ours["Items"], "items diverged for {expr}");
+    }
+    drop_filter_corpus(pk);
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_filter_between_and_in() {
+    let pk = "diff-q-filt-rangeset";
+    seed_filter_corpus(pk);
+    let eav = format!(
+        "{{\":pk\":{{\"S\":\"{pk}\"}},\":lo\":{{\"N\":\"10\"}},\
+          \":hi\":{{\"N\":\"30\"}},\":a\":{{\"S\":\"alpha\"}},\
+          \":g\":{{\"S\":\"gamma\"}},\":e\":{{\"S\":\"epsilon\"}}}}"
+    );
+    for expr in [
+        "score BETWEEN :lo AND :hi",
+        "label IN (:a, :g, :e)",
+    ] {
+        let args: Vec<&str> = vec![
+            "dynamodb","query","--table-name","device_events",
+            "--key-condition-expression","device_id = :pk",
+            "--filter-expression", expr,
+            "--expression-attribute-values", &eav,
+        ];
+        let q_ref = aws(REF, &args);
+        let q_ours = aws(OURS, &args);
+        assert_eq!(q_ref["Count"], q_ours["Count"], "diverged for {expr}");
+        assert_eq!(q_ref["Items"], q_ours["Items"], "items diverged for {expr}");
+    }
+    drop_filter_corpus(pk);
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_filter_begins_with_contains_attr_type() {
+    let pk = "diff-q-filt-fn";
+    seed_filter_corpus(pk);
+    let eav = format!(
+        "{{\":pk\":{{\"S\":\"{pk}\"}},\":pfx\":{{\"S\":\"al\"}},\
+          \":sub\":{{\"S\":\"et\"}},\":ty\":{{\"S\":\"S\"}}}}"
+    );
+    for expr in [
+        "begins_with(label, :pfx)",
+        "contains(label, :sub)",
+        "attribute_type(label, :ty)",
+    ] {
+        let args: Vec<&str> = vec![
+            "dynamodb","query","--table-name","device_events",
+            "--key-condition-expression","device_id = :pk",
+            "--filter-expression", expr,
+            "--expression-attribute-values", &eav,
+        ];
+        let q_ref = aws(REF, &args);
+        let q_ours = aws(OURS, &args);
+        assert_eq!(q_ref["Count"], q_ours["Count"], "diverged for {expr}");
+        assert_eq!(q_ref["Items"], q_ours["Items"], "items diverged for {expr}");
+    }
+    drop_filter_corpus(pk);
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_filter_attribute_not_exists() {
+    let pk = "diff-q-filt-nex";
+    // 3 rows; some have `extra` set, some don't.
+    for (ts, has_extra) in [("1", true), ("2", false), ("3", true)] {
+        let extra = if has_extra { ",\"extra\":{\"S\":\"x\"}" } else { "" };
+        let item = format!(
+            "{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"{ts}\"}},\"label\":{{\"S\":\"L\"}}{extra}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+    }
+    let eav = format!("{{\":pk\":{{\"S\":\"{pk}\"}}}}");
+    let args: Vec<&str> = vec![
+        "dynamodb","query","--table-name","device_events",
+        "--key-condition-expression","device_id = :pk",
+        "--filter-expression","attribute_not_exists(extra)",
+        "--expression-attribute-values", &eav,
+    ];
+    let q_ref = aws(REF, &args);
+    let q_ours = aws(OURS, &args);
+    assert_eq!(q_ref["Count"], q_ours["Count"]);
+    assert_eq!(q_ref["Items"], q_ours["Items"]);
+
+    for ts in ["1","2","3"] {
+        delete_both_composite("device_events", "device_id", pk, "ts", &format!("{{\"N\":\"{ts}\"}}"));
+    }
+}
+
+// ----- Error / rejection parity --------------------------------------------
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_invalid_limit_zero_both_reject() {
+    let stderr_ref = aws_expecting_failure(REF, &[
+        "dynamodb","query","--table-name","users",
+        "--key-condition-expression","id = :pk",
+        "--expression-attribute-values","{\":pk\":{\"S\":\"x\"}}",
+        "--limit","0",
+    ]);
+    let stderr_ours = aws_expecting_failure(OURS, &[
+        "dynamodb","query","--table-name","users",
+        "--key-condition-expression","id = :pk",
+        "--expression-attribute-values","{\":pk\":{\"S\":\"x\"}}",
+        "--limit","0",
+    ]);
+    assert!(
+        stderr_ref.contains("ValidationException") || stderr_ref.contains("Limit"),
+        "DDB-local didn't reject Limit=0: {stderr_ref}"
+    );
+    assert!(
+        stderr_ours.contains("ValidationException") || stderr_ours.contains("Limit"),
+        "rektifier didn't reject Limit=0: {stderr_ours}"
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_invalid_select_both_reject() {
+    let stderr_ref = aws_expecting_failure(REF, &[
+        "dynamodb","query","--table-name","users",
+        "--key-condition-expression","id = :pk",
+        "--expression-attribute-values","{\":pk\":{\"S\":\"x\"}}",
+        "--select","BOGUS",
+    ]);
+    let stderr_ours = aws_expecting_failure(OURS, &[
+        "dynamodb","query","--table-name","users",
+        "--key-condition-expression","id = :pk",
+        "--expression-attribute-values","{\":pk\":{\"S\":\"x\"}}",
+        "--select","BOGUS",
+    ]);
+    // The AWS CLI itself may reject BOGUS at the client side; both
+    // endpoints (CLI or server) should produce a non-zero exit.
+    assert!(!stderr_ref.is_empty(), "DDB-local accepted invalid Select");
+    assert!(!stderr_ours.is_empty(), "rektifier accepted invalid Select");
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_count_with_projection_both_reject() {
+    // DDB rejects Select=COUNT combined with ProjectionExpression as
+    // a ValidationException. Rektifier matches per Q6 validation.
+    let stderr_ref = aws_expecting_failure(REF, &[
+        "dynamodb","query","--table-name","users",
+        "--key-condition-expression","id = :pk",
+        "--expression-attribute-values","{\":pk\":{\"S\":\"x\"}}",
+        "--select","COUNT",
+        "--projection-expression","label",
+    ]);
+    let stderr_ours = aws_expecting_failure(OURS, &[
+        "dynamodb","query","--table-name","users",
+        "--key-condition-expression","id = :pk",
+        "--expression-attribute-values","{\":pk\":{\"S\":\"x\"}}",
+        "--select","COUNT",
+        "--projection-expression","label",
+    ]);
+    assert!(
+        stderr_ref.contains("ValidationException"),
+        "DDB-local: {stderr_ref}"
+    );
+    assert!(
+        stderr_ours.contains("ValidationException"),
+        "rektifier: {stderr_ours}"
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_malformed_esk_wrong_type_both_reject() {
+    // Composite events table — provide an ESK with the wrong SK type.
+    ensure_device_events_table();
+    let bad_esk = "{\"device_id\":{\"S\":\"d\"},\"ts\":{\"S\":\"not-a-num\"}}";
+    let stderr_ref = aws_expecting_failure(REF, &[
+        "dynamodb","query","--table-name","device_events",
+        "--key-condition-expression","device_id = :pk",
+        "--expression-attribute-values","{\":pk\":{\"S\":\"d\"}}",
+        "--exclusive-start-key", bad_esk,
+    ]);
+    let stderr_ours = aws_expecting_failure(OURS, &[
+        "dynamodb","query","--table-name","device_events",
+        "--key-condition-expression","device_id = :pk",
+        "--expression-attribute-values","{\":pk\":{\"S\":\"d\"}}",
+        "--exclusive-start-key", bad_esk,
+    ]);
+    assert!(!stderr_ref.is_empty(), "DDB-local accepted bad ESK");
+    assert!(!stderr_ours.is_empty(), "rektifier accepted bad ESK");
+}
+
+// ----- Projection + filter combination -------------------------------------
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_projection_with_filter() {
+    let pk = "diff-q-proj-filt";
+    seed_filter_corpus(pk);
+    // Filter sees full item (so `score > 20` works), projection
+    // returns only label.
+    let eav = format!(
+        "{{\":pk\":{{\"S\":\"{pk}\"}},\":n\":{{\"N\":\"20\"}}}}"
+    );
+    let args: Vec<&str> = vec![
+        "dynamodb","query","--table-name","device_events",
+        "--key-condition-expression","device_id = :pk",
+        "--filter-expression","score > :n",
+        "--projection-expression","label",
+        "--expression-attribute-values", &eav,
+    ];
+    let q_ref = aws(REF, &args);
+    let q_ours = aws(OURS, &args);
+    assert_eq!(q_ref["Count"], q_ours["Count"]);
+    assert_eq!(q_ref["ScannedCount"], q_ours["ScannedCount"]);
+    assert_eq!(q_ref["Items"], q_ours["Items"]);
+    // Sanity: every item must have exactly the `label` field.
+    for item in q_ours["Items"].as_array().unwrap() {
+        let keys: Vec<&str> = item.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["label"], "projected item leaked extra attrs: {keys:?}");
+    }
+    drop_filter_corpus(pk);
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_projection_with_reserved_word_alias() {
+    let pk = "diff-q-proj-resv";
+    let item = format!(
+        "{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"1\"}},\
+          \"name\":{{\"S\":\"alice\"}},\"label\":{{\"S\":\"L\"}}}}"
+    );
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+
+    let eav = format!("{{\":pk\":{{\"S\":\"{pk}\"}}}}");
+    let args: Vec<&str> = vec![
+        "dynamodb","query","--table-name","device_events",
+        "--key-condition-expression","device_id = :pk",
+        "--expression-attribute-names","{\"#n\":\"name\"}",
+        "--expression-attribute-values", &eav,
+        "--projection-expression","#n",
+    ];
+    let q_ref = aws(REF, &args);
+    let q_ours = aws(OURS, &args);
+    assert_eq!(q_ref["Items"], q_ours["Items"]);
+
+    delete_both_composite("device_events", "device_id", pk, "ts", "{\"N\":\"1\"}");
+}
+
+// ----- Select=COUNT + filter (Count vs ScannedCount parity) ----------------
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_select_count_with_filter() {
+    let pk = "diff-q-cnt-filt";
+    seed_filter_corpus(pk);
+    let eav = format!(
+        "{{\":pk\":{{\"S\":\"{pk}\"}},\":on\":{{\"S\":\"on\"}}}}"
+    );
+    let args: Vec<&str> = vec![
+        "dynamodb","query","--table-name","device_events",
+        "--key-condition-expression","device_id = :pk",
+        "--filter-expression","flag = :on",
+        "--expression-attribute-values", &eav,
+        "--select","COUNT",
+    ];
+    let q_ref = aws(REF, &args);
+    let q_ours = aws(OURS, &args);
+    // Both should report Count=3 (on rows), ScannedCount=5 (all rows).
+    assert_eq!(q_ref["Count"], q_ours["Count"]);
+    assert_eq!(q_ref["ScannedCount"], q_ours["ScannedCount"]);
+    drop_filter_corpus(pk);
+}
+
+// ----- messages (S+S) — Scan + non-begins_with KCE operators ---------------
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_messages_sk_equality() {
+    ensure_messages_table();
+    let pk = "diff-msgs-eq";
+    for ts in ["2026-01-01","2026-01-02","2026-01-03"] {
+        let item = format!(
+            "{{\"thread\":{{\"S\":\"{pk}\"}},\"ts\":{{\"S\":\"{ts}\"}},\"body\":{{\"S\":\"b\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","messages","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","messages","--item",&item]);
+    }
+    let eav = format!(
+        "{{\":pk\":{{\"S\":\"{pk}\"}},\":ts\":{{\"S\":\"2026-01-02\"}}}}"
+    );
+    let args: Vec<&str> = vec![
+        "dynamodb","query","--table-name","messages",
+        "--key-condition-expression","thread = :pk AND ts = :ts",
+        "--expression-attribute-values", &eav,
+    ];
+    let q_ref = aws(REF, &args);
+    let q_ours = aws(OURS, &args);
+    assert_eq!(q_ref["Items"], q_ours["Items"]);
+
+    for ts in ["2026-01-01","2026-01-02","2026-01-03"] {
+        delete_both_composite("messages", "thread", pk, "ts", &format!("{{\"S\":\"{ts}\"}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_scan_messages_round_trip() {
+    ensure_messages_table();
+    let pk = "diff-msgs-scan";
+    for ts in ["a","b","c"] {
+        let item = format!(
+            "{{\"thread\":{{\"S\":\"{pk}\"}},\"ts\":{{\"S\":\"{ts}\"}},\"body\":{{\"S\":\"x\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","messages","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","messages","--item",&item]);
+    }
+    let q_ref = aws(REF, &["dynamodb","scan","--table-name","messages"]);
+    let q_ours = aws(OURS, &["dynamodb","scan","--table-name","messages"]);
+    assert_eq!(q_ref["Count"], q_ours["Count"]);
+    let mut ref_items = q_ref["Items"].as_array().unwrap().clone();
+    let mut our_items = q_ours["Items"].as_array().unwrap().clone();
+    sort_items_by_keys(&mut ref_items, "thread", Some("ts"));
+    sort_items_by_keys(&mut our_items, "thread", Some("ts"));
+    assert_eq!(ref_items, our_items);
+
+    for ts in ["a","b","c"] {
+        delete_both_composite("messages", "thread", pk, "ts", &format!("{{\"S\":\"{ts}\"}}"));
+    }
+}

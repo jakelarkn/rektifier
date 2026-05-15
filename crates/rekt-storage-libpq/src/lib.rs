@@ -3178,4 +3178,270 @@ mod tests {
             .await
             .unwrap();
     }
+
+    // ============================================================
+    // Integration coverage: Query/Scan on B-PK, N-PK, S+B composite
+    // ============================================================
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn scan_returns_all_rows_b_pk() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_scan_b;
+                 CREATE TABLE rekt_t_scan_b (
+                   data    jsonb NOT NULL,
+                   binmark bytea GENERATED ALWAYS AS (decode(data#>>'{binmark,B}', 'base64')) STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_scan_b",
+            pk_col: "binmark",
+            pk_type: KeyType::B,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        for k in ["AAEC", "AAED", "AAEE"] {
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({"binmark":{"B":k},"label":{"S":"v"}}),
+            )
+            .await;
+        }
+        let out = backend.scan_raw(&shape, None, None, None).await.unwrap();
+        assert_eq!(out.count, 3);
+        // Ordered by binmark bytes ascending → "AAEC" < "AAED" < "AAEE".
+        let ks: Vec<&str> = out
+            .items
+            .iter()
+            .map(|i| i["binmark"]["B"].as_str().unwrap())
+            .collect();
+        assert_eq!(ks, vec!["AAEC", "AAED", "AAEE"]);
+
+        client
+            .batch_execute("DROP TABLE rekt_t_scan_b;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn query_b_pk_equality() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_q_b;
+                 CREATE TABLE rekt_t_q_b (
+                   data    jsonb NOT NULL,
+                   binmark bytea GENERATED ALWAYS AS (decode(data#>>'{binmark,B}', 'base64')) STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_q_b",
+            pk_col: "binmark",
+            pk_type: KeyType::B,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        pg_put(
+            &backend,
+            &shape,
+            &serde_json::json!({"binmark":{"B":"AAFF"},"label":{"S":"alpha"}}),
+        )
+        .await;
+        // Decode base64 to bytes for the KeyValue::B used by query_raw.
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode("AAFF")
+            .unwrap();
+        let pk = KeyValue::B(Bytes::from(bytes));
+        let out = backend
+            .query_raw(&shape, &pk, None, None, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(out.count, 1);
+        assert_eq!(out.items[0]["label"]["S"], "alpha");
+
+        client
+            .batch_execute("DROP TABLE rekt_t_q_b;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn query_n_pk_equality() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_q_n;
+                 CREATE TABLE rekt_t_q_n (
+                   data jsonb   NOT NULL,
+                   id   numeric GENERATED ALWAYS AS ((data#>>'{id,N}')::numeric) STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_q_n",
+            pk_col: "id",
+            pk_type: KeyType::N,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        for n in ["10", "1", "20", "2"] {
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({"id":{"N":n},"val":{"N":n}}),
+            )
+            .await;
+        }
+        // Query each one — hash-only returns 0 or 1 rows.
+        for n in ["1", "2", "10", "20"] {
+            let out = backend
+                .query_raw(
+                    &shape,
+                    &KeyValue::N(n.to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert_eq!(out.count, 1, "N-PK Query missed id={n}");
+        }
+
+        client
+            .batch_execute("DROP TABLE rekt_t_q_n;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn scan_n_pk_ordering_is_numeric() {
+        // Regression test: PG numeric ORDER BY is numeric, not lexical.
+        // Insert "1","2","10","20" and assert ascending order is
+        // 1, 2, 10, 20 (NOT 1, 10, 2, 20).
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_scan_n_ord;
+                 CREATE TABLE rekt_t_scan_n_ord (
+                   data jsonb   NOT NULL,
+                   id   numeric GENERATED ALWAYS AS ((data#>>'{id,N}')::numeric) STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_scan_n_ord",
+            pk_col: "id",
+            pk_type: KeyType::N,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        for n in ["10", "1", "20", "2"] {
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({"id":{"N":n},"val":{"N":n}}),
+            )
+            .await;
+        }
+        let out = backend.scan_raw(&shape, None, None, None).await.unwrap();
+        let ids: Vec<&str> = out
+            .items
+            .iter()
+            .map(|i| i["id"]["N"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["1", "2", "10", "20"],
+            "N-PK Scan ordering must be numeric (not lexical)"
+        );
+
+        client
+            .batch_execute("DROP TABLE rekt_t_scan_n_ord;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn query_sb_composite_pk_only() {
+        // S+B composite (id S, binmark B). Pure pk-only KCE returns
+        // all rows in the partition ordered by B ascending.
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_q_sb;
+                 CREATE TABLE rekt_t_q_sb (
+                   data    jsonb NOT NULL,
+                   id      text  GENERATED ALWAYS AS (data#>>'{id,S}') STORED,
+                   binmark bytea GENERATED ALWAYS AS (decode(data#>>'{binmark,B}', 'base64')) STORED,
+                   PRIMARY KEY (id, binmark)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_q_sb",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: Some("binmark"),
+            sk_type: Some(KeyType::B),
+            jsonb_col: "data",
+        };
+        for b in ["AAA=", "AAE=", "AAI="] {
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({"id":{"S":"t1"},"binmark":{"B":b},"val":{"S":"v"}}),
+            )
+            .await;
+        }
+        let out = backend
+            .query_raw(
+                &shape,
+                &KeyValue::S("t1".into()),
+                None,
+                None,
+                None,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.count, 3);
+        let bs: Vec<&str> = out
+            .items
+            .iter()
+            .map(|i| i["binmark"]["B"].as_str().unwrap())
+            .collect();
+        assert_eq!(bs, vec!["AAA=", "AAE=", "AAI="]);
+
+        client
+            .batch_execute("DROP TABLE rekt_t_q_sb;")
+            .await
+            .unwrap();
+    }
 }
