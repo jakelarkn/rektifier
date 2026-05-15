@@ -319,3 +319,58 @@ pub struct BatchGetItemResponse {
     /// well-shaped value to interrogate.
     pub unprocessed_keys: std::collections::HashMap<String, KeysAndAttributes>,
 }
+
+// ===== TransactGetItems (PLAN-8 T1/T2) =======================================
+
+/// One read inside a `TransactGetItems` request. The DDB wire shape is
+/// externally-tagged (`{"Get": {...}}`); rektifier mirrors PLAN-6's
+/// `WriteRequest` idiom — an Option-fielded struct with
+/// `deny_unknown_fields`, and the translator demands exactly the `Get`
+/// field set (`MalformedTransactItem` otherwise).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+pub struct TransactGetItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub get: Option<Get>,
+}
+
+/// Per-item read spec. `TableName` + `Key` are required; the others
+/// are accepted per DDB's schema and used by the translator's
+/// projection machinery (T2).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+pub struct Get {
+    pub table_name: String,
+    pub key: Item,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_expression: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression_attribute_names: Option<std::collections::BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct TransactGetItemsRequest {
+    pub transact_items: Vec<TransactGetItem>,
+    /// Accepted-and-dropped (metering not implemented).
+    #[serde(default)]
+    pub return_consumed_capacity: Option<String>,
+}
+
+/// Per-item response. `Item` is present iff the underlying row exists.
+/// DDB emits `{}` for misses (the slot is present, the `Item` field is
+/// absent) — captured by `skip_serializing_if = Option::is_none`.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct TransactGetItemResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item: Option<Item>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct TransactGetItemsResponse {
+    /// Position-preserving array of per-item responses. Index lines up
+    /// with `TransactGetItemsRequest::transact_items` (D8 in PLAN-8).
+    pub responses: Vec<TransactGetItemResponse>,
+}

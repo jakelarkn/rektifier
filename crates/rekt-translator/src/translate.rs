@@ -14,7 +14,7 @@ use crate::projection::resolve_select_and_projection;
 use crate::plan::{
     BatchGetItemPlan, BatchGetPerTable, BatchWriteItemPlan, BatchWritePerTable, ConditionPlan,
     DeleteItemPlan, GetItemPlan, PutItemPlan, QueryPlan, ReturnValuesMode, ScanPlan,
-    UpdateItemPlan,
+    TransactGetItemsPlan, TransactGetPlanItem, UpdateItemPlan,
 };
 use crate::schema::TableSchema;
 use rekt_expressions::{
@@ -22,7 +22,7 @@ use rekt_expressions::{
 };
 use rekt_protocol::{
     AttributeValue, BatchGetItemRequest, BatchWriteItemRequest, DeleteItemRequest, GetItemRequest,
-    PutItemRequest, QueryRequest, ScanRequest, UpdateItemRequest,
+    PutItemRequest, QueryRequest, ScanRequest, TransactGetItemsRequest, UpdateItemRequest,
 };
 use rekt_storage::{KeyValue, WriteOp};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -485,6 +485,70 @@ pub fn translate_batch_write_item(
     }
 
     Ok(BatchWriteItemPlan { per_table })
+}
+
+/// TransactGetItems — atomic-snapshot multi-key read across one or more
+/// tables. Position-preserving plan (D8 in PLAN-8): the returned
+/// `items[i]` corresponds to the request's `transact_items[i]`. Each
+/// item carries its own `TableName` + `Key`; duplicate `(table, key)`
+/// pairs across items are rejected (D6).
+///
+/// T1 ignores `ProjectionExpression`; T2 wires it through.
+#[tracing::instrument(level = "debug", skip_all, name = "translate.transact_get_items")]
+pub fn translate_transact_get_items(
+    req: &TransactGetItemsRequest,
+    schemas: &HashMap<String, TableSchema>,
+    max_items: u32,
+) -> Result<TransactGetItemsPlan, TranslateError> {
+    if req.transact_items.is_empty() {
+        return Err(TranslateError::EmptyTransactRequest);
+    }
+    let total = req.transact_items.len();
+    if total > max_items as usize {
+        return Err(TranslateError::TooManyTransactItems {
+            got: total as u32,
+            max: max_items,
+        });
+    }
+
+    let mut items: Vec<TransactGetPlanItem> = Vec::with_capacity(total);
+    // Same-target dedupe across the whole request (cross-table is fine —
+    // dedupe key includes table name). D6.
+    let mut seen: HashSet<(String, KeyValue, Option<KeyValue>)> = HashSet::with_capacity(total);
+
+    for ti in &req.transact_items {
+        let get = ti.get.as_ref().ok_or(TranslateError::MalformedTransactItem {
+            expected: "Get",
+        })?;
+        let schema = schemas
+            .get(&get.table_name)
+            .ok_or_else(|| TranslateError::ResourceNotFoundForTransact {
+                table: get.table_name.clone(),
+            })?;
+        let (pk, sk) = extract_key_pair(&get.key, schema)?;
+        reject_extra_key_attrs(&get.key, schema)?;
+        let target = (get.table_name.clone(), pk.clone(), sk.clone());
+        if !seen.insert(target) {
+            return Err(TranslateError::DuplicateTransactTarget);
+        }
+
+        // T2: ProjectionExpression. Reuse the Query/Scan helper so a
+        // future nested-path lift propagates here too. v1 = top-level
+        // names only.
+        let empty_names: BTreeMap<String, String> = BTreeMap::new();
+        let names = get.expression_attribute_names.as_ref().unwrap_or(&empty_names);
+        let projection =
+            crate::projection::parse_projection(get.projection_expression.as_deref(), names)?;
+
+        items.push(TransactGetPlanItem {
+            table_name: get.table_name.clone(),
+            pk,
+            sk,
+            projection,
+        });
+    }
+
+    Ok(TransactGetItemsPlan { items })
 }
 
 /// Shared `ReturnValues` resolver for PutItem and DeleteItem. DDB accepts

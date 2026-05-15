@@ -10,7 +10,7 @@ use rekt_sigv4::{PermissiveVerifier, Verifier};
 use rekt_storage::{
     Backend, BackendError, BatchGetOutcome, BatchWriteOutcome, ConditionEvalFn, FilterEvalFn,
     GeneralUpdateFn, KeyType, KeyValue, QueryOutcome, ScanOutcome, SkCondition, TableShape,
-    UpdateDecision, UpdateOutcome, WriteOp,
+    TransactGetOp, TransactGetOutcome, UpdateDecision, UpdateOutcome, WriteOp,
 };
 use rekt_translator::{evaluate_condition, TableSchema};
 use serde_json::{json, Value};
@@ -549,6 +549,23 @@ impl Backend for MockBackend {
         Ok(BatchWriteOutcome::default())
     }
 
+    async fn transact_get_raw(
+        &self,
+        items: &[TransactGetOp<'_>],
+    ) -> Result<TransactGetOutcome, BackendError> {
+        // Atomic-snapshot semantics: hold the mutex for the whole call
+        // so the in-memory store can't change between per-item reads.
+        let store = self.store.lock().unwrap();
+        let mut out: Vec<Option<serde_json::Value>> = Vec::with_capacity(items.len());
+        for op in items {
+            let pk_s = kv_to_string(&op.pk);
+            let sk_s = op.sk.as_ref().map(kv_to_string).unwrap_or_default();
+            let key = (op.shape.table.to_string(), pk_s, sk_s);
+            out.push(store.get(&key).cloned());
+        }
+        Ok(TransactGetOutcome { items: out })
+    }
+
     async fn update_insert_only_raw(
         &self,
         shape: &TableShape<'_>,
@@ -778,11 +795,11 @@ async fn unknown_table_is_resource_not_found() {
 #[tokio::test]
 async fn unsupported_op_is_unknown_operation() {
     let app = app();
-    // `TransactGetItems` is not yet implemented (see PLAN-2 "Batch +
-    // transactional ops"). Once it lands, swap this for whatever is
-    // still unsupported at the time.
+    // `TransactWriteItems` is not yet implemented (lands in PLAN-8
+    // T3+). Once it lands, swap this for whatever is still
+    // unsupported at the time.
     let resp = app
-        .oneshot(ddb_request("TransactGetItems", json!({})))
+        .oneshot(ddb_request("TransactWriteItems", json!({})))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -6004,4 +6021,307 @@ async fn fast_handler_under_timeout_passes() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ===== TransactGetItems (T1) ================================================
+
+/// Helper: seed a row directly into the mock store.
+async fn seed_put(app: axum::Router, table: &str, item: Value) {
+    let resp = app
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({ "TableName": table, "Item": item }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn transact_get_single_table_happy_path() {
+    let app = app();
+    seed_put(
+        app.clone(),
+        "users",
+        json!({"id":{"S":"u1"},"label":{"S":"alice"}}),
+    )
+    .await;
+    seed_put(
+        app.clone(),
+        "users",
+        json!({"id":{"S":"u2"},"label":{"S":"bob"}}),
+    )
+    .await;
+
+    let body = json!({
+        "TransactItems": [
+            {"Get": {"TableName":"users","Key":{"id":{"S":"u1"}}}},
+            {"Get": {"TableName":"users","Key":{"id":{"S":"u2"}}}},
+        ]
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactGetItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let got = body_json(resp).await;
+    assert_eq!(
+        got,
+        json!({
+            "Responses": [
+                {"Item": {"id":{"S":"u1"},"label":{"S":"alice"}}},
+                {"Item": {"id":{"S":"u2"},"label":{"S":"bob"}}},
+            ]
+        })
+    );
+}
+
+#[tokio::test]
+async fn transact_get_missing_item_returns_empty_slot() {
+    let app = app();
+    seed_put(
+        app.clone(),
+        "users",
+        json!({"id":{"S":"present"},"label":{"S":"yo"}}),
+    )
+    .await;
+    let body = json!({
+        "TransactItems": [
+            {"Get": {"TableName":"users","Key":{"id":{"S":"present"}}}},
+            {"Get": {"TableName":"users","Key":{"id":{"S":"missing"}}}},
+        ]
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactGetItems", body))
+        .await
+        .unwrap();
+    let got = body_json(resp).await;
+    // D8: position-preserving; D10/T1: missing slot is `{}` (Item field absent).
+    let responses = got.get("Responses").and_then(Value::as_array).unwrap();
+    assert_eq!(responses.len(), 2);
+    assert!(responses[0].get("Item").is_some());
+    assert!(responses[1].get("Item").is_none());
+    assert_eq!(responses[1], json!({}));
+}
+
+#[tokio::test]
+async fn transact_get_position_preserves_request_order() {
+    // Even with seeded reverse-order keys, the response must come back in
+    // the request's order. D8.
+    let app = app();
+    for n in ["b", "a", "c"] {
+        seed_put(
+            app.clone(),
+            "users",
+            json!({"id":{"S":n},"order":{"S":n}}),
+        )
+        .await;
+    }
+    let body = json!({
+        "TransactItems": [
+            {"Get": {"TableName":"users","Key":{"id":{"S":"c"}}}},
+            {"Get": {"TableName":"users","Key":{"id":{"S":"a"}}}},
+            {"Get": {"TableName":"users","Key":{"id":{"S":"b"}}}},
+        ]
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactGetItems", body))
+        .await
+        .unwrap();
+    let got = body_json(resp).await;
+    let responses = got.get("Responses").and_then(Value::as_array).unwrap();
+    assert_eq!(
+        responses[0]["Item"]["id"]["S"].as_str().unwrap(),
+        "c"
+    );
+    assert_eq!(
+        responses[1]["Item"]["id"]["S"].as_str().unwrap(),
+        "a"
+    );
+    assert_eq!(
+        responses[2]["Item"]["id"]["S"].as_str().unwrap(),
+        "b"
+    );
+}
+
+#[tokio::test]
+async fn transact_get_composite_table_round_trip() {
+    let app = app();
+    seed_put(
+        app.clone(),
+        "device_events",
+        json!({
+            "device_id":{"S":"d1"},
+            "ts":{"N":"42"},
+            "label":{"S":"event42"}
+        }),
+    )
+    .await;
+    let body = json!({
+        "TransactItems": [{
+            "Get": {
+                "TableName":"device_events",
+                "Key":{"device_id":{"S":"d1"},"ts":{"N":"42"}}
+            }
+        }]
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactGetItems", body))
+        .await
+        .unwrap();
+    let got = body_json(resp).await;
+    assert_eq!(
+        got["Responses"][0]["Item"]["label"]["S"]
+            .as_str()
+            .unwrap(),
+        "event42"
+    );
+}
+
+#[tokio::test]
+async fn transact_get_empty_request_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "TransactGetItems",
+            json!({"TransactItems": []}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ValidationException"));
+}
+
+#[tokio::test]
+async fn transact_get_missing_table_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "TransactGetItems",
+            json!({"TransactItems": [
+                {"Get": {"TableName":"nope","Key":{"id":{"S":"x"}}}}
+            ]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ResourceNotFoundException"));
+}
+
+#[tokio::test]
+async fn transact_get_duplicate_target_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "TransactGetItems",
+            json!({"TransactItems": [
+                {"Get": {"TableName":"users","Key":{"id":{"S":"a"}}}},
+                {"Get": {"TableName":"users","Key":{"id":{"S":"a"}}}},
+            ]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ValidationException"));
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("multiple operations"));
+}
+
+#[tokio::test]
+async fn transact_get_malformed_item_missing_get_rejected() {
+    let app = app();
+    // TransactItem with no inner key at all.
+    let resp = app
+        .oneshot(ddb_request(
+            "TransactGetItems",
+            json!({"TransactItems": [{}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ValidationException"));
+}
+
+#[tokio::test]
+async fn transact_get_unknown_field_inside_get_rejected() {
+    // serde deny_unknown_fields on Get.
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "TransactGetItems",
+            json!({"TransactItems": [
+                {"Get": {"TableName":"users","Key":{"id":{"S":"a"}},
+                         "Bogus":"x"}}
+            ]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    // serde rejects unknown field with SerializationException.
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#SerializationException"));
+}
+
+#[tokio::test]
+async fn transact_get_extra_key_attr_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "TransactGetItems",
+            json!({"TransactItems": [
+                {"Get": {"TableName":"users","Key":{
+                    "id":{"S":"a"},
+                    "extra":{"S":"nope"}
+                }}}
+            ]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ValidationException"));
+}
+
+#[tokio::test]
+async fn transact_get_wrong_key_type_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "TransactGetItems",
+            json!({"TransactItems": [
+                {"Get": {"TableName":"users","Key":{"id":{"N":"42"}}}}
+            ]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ValidationException"));
 }

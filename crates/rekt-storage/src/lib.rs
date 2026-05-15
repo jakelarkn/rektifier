@@ -417,6 +417,42 @@ pub trait Backend: Send + Sync + 'static {
         shape: &TableShape<'_>,
         keys: &[(KeyValue, Option<KeyValue>)],
     ) -> Result<BatchGetOutcome, BackendError>;
+
+    /// TransactGetItems — atomic-snapshot multi-key SELECT across one
+    /// or more tables. Opens a single PG transaction at
+    /// `REPEATABLE READ READ ONLY` so every per-item read sees the same
+    /// snapshot of the database, then issues one SELECT per item.
+    ///
+    /// `items` is position-ordered; the returned
+    /// [`TransactGetOutcome::items`] is the same length and indexed by
+    /// the same positions (D8 in PLAN-8). Missing rows surface as
+    /// `None` at their slot.
+    ///
+    /// Cross-table is supported: each `TransactGetOp` carries its own
+    /// `TableShape`, so the backend dispatches per item.
+    async fn transact_get_raw(
+        &self,
+        items: &[TransactGetOp<'_>],
+    ) -> Result<TransactGetOutcome, BackendError>;
+}
+
+/// One read inside a `TransactGetItems` request. Carries the table
+/// shape (caller-owned, lent for the duration of the call) plus the
+/// typed key tuple. The translator validates key shape before
+/// constructing this; storage just binds parameters.
+#[derive(Debug, Clone)]
+pub struct TransactGetOp<'a> {
+    pub shape: TableShape<'a>,
+    pub pk: KeyValue,
+    pub sk: Option<KeyValue>,
+}
+
+/// Result of a `transact_get_raw` call. `items.len() == input.len()`;
+/// each slot is `Some(row)` on hit, `None` on miss. Position-
+/// preserving — unlike `BatchGetOutcome` which is set-shaped.
+#[derive(Debug, Clone, Default)]
+pub struct TransactGetOutcome {
+    pub items: Vec<Option<serde_json::Value>>,
 }
 
 /// A single write request inside a per-table BatchWriteItem batch.

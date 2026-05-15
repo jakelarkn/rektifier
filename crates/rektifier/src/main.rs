@@ -156,6 +156,8 @@ fn rek_batch_limits(config: &Config) -> rekt_server::BatchLimits {
     rekt_server::BatchLimits {
         batch_get_max_keys: config.batch_limits.batch_get_max_keys,
         batch_write_max_requests: config.batch_limits.batch_write_max_requests,
+        transact_get_max_items: config.batch_limits.transact_get_max_items,
+        transact_write_max_items: config.batch_limits.transact_write_max_items,
     }
 }
 

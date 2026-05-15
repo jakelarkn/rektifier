@@ -49,6 +49,8 @@ const DDB_DEFAULT_NESTING_DEPTH: u32 = 32;
 // (see `COMPATIBILITY_NOTES.md`).
 const DDB_DEFAULT_BATCH_GET_MAX_KEYS: u32 = 100;
 const DDB_DEFAULT_BATCH_WRITE_MAX_REQUESTS: u32 = 25;
+const DDB_DEFAULT_TRANSACT_GET_MAX_ITEMS: u32 = 100;
+const DDB_DEFAULT_TRANSACT_WRITE_MAX_ITEMS: u32 = 100;
 
 /// Default per-request hard timeout. The DDB CLI client times out at
 /// 60s; we set a 30s budget so a hung backend produces a 408 well
@@ -169,6 +171,8 @@ impl PgRetryConfig {
 pub struct BatchLimits {
     pub batch_get_max_keys: u32,
     pub batch_write_max_requests: u32,
+    pub transact_get_max_items: u32,
+    pub transact_write_max_items: u32,
 }
 
 impl BatchLimits {
@@ -176,6 +180,8 @@ impl BatchLimits {
         Self {
             batch_get_max_keys: DDB_DEFAULT_BATCH_GET_MAX_KEYS,
             batch_write_max_requests: DDB_DEFAULT_BATCH_WRITE_MAX_REQUESTS,
+            transact_get_max_items: DDB_DEFAULT_TRANSACT_GET_MAX_ITEMS,
+            transact_write_max_items: DDB_DEFAULT_TRANSACT_WRITE_MAX_ITEMS,
         }
     }
 }
@@ -298,6 +304,10 @@ struct RawBatchLimits {
     batch_get_max_keys: Option<u32>,
     #[serde(default)]
     batch_write_max_requests: Option<u32>,
+    #[serde(default)]
+    transact_get_max_items: Option<u32>,
+    #[serde(default)]
+    transact_write_max_items: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -506,6 +516,22 @@ impl RawConfig {
                         ));
                     }
                     bl.batch_write_max_requests = n;
+                }
+                if let Some(n) = raw.transact_get_max_items {
+                    if n == 0 {
+                        return Err(ConfigError::validation(
+                            "batch_limits.transact_get_max_items must be > 0",
+                        ));
+                    }
+                    bl.transact_get_max_items = n;
+                }
+                if let Some(n) = raw.transact_write_max_items {
+                    if n == 0 {
+                        return Err(ConfigError::validation(
+                            "batch_limits.transact_write_max_items must be > 0",
+                        ));
+                    }
+                    bl.transact_write_max_items = n;
                 }
                 bl
             }

@@ -300,6 +300,36 @@ pub enum TranslateError {
         "A WriteRequest must contain exactly one of PutRequest or DeleteRequest"
     )]
     MalformedWriteRequest,
+
+    // ----- TransactGetItems / TransactWriteItems (PLAN-8) -----
+    /// `TransactItems` was absent or `[]`. DDB rejects.
+    #[error("TransactItems cannot be empty")]
+    EmptyTransactRequest,
+
+    /// `TransactItems` exceeded the configured cap (DDB default 100).
+    /// Operator-tunable via `[batch_limits].transact_get_max_items` /
+    /// `transact_write_max_items`.
+    #[error("Member must have length less than or equal to {max}: {got}")]
+    TooManyTransactItems { got: u32, max: u32 },
+
+    /// A `TransactGetItem` / `TransactWriteItem` didn't carry exactly
+    /// one of the allowed inner fields (Get / Put / Update / Delete /
+    /// ConditionCheck). DDB rejects with a ValidationException.
+    #[error("TransactItem must contain exactly one of {expected}")]
+    MalformedTransactItem { expected: &'static str },
+
+    /// Two TransactItems addressed the same (TableName, Key) pair.
+    /// DDB rejects regardless of op type — D6 in PLAN-8.
+    #[error(
+        "Transaction request cannot include multiple operations on one item"
+    )]
+    DuplicateTransactTarget,
+
+    /// Translate-time error: TransactGetItems / TransactWriteItems
+    /// named a table not in the config. Maps to
+    /// `ResourceNotFoundException` at the wire boundary.
+    #[error("Table not found: {table}")]
+    ResourceNotFoundForTransact { table: String },
 }
 
 impl From<ParseError> for TranslateError {

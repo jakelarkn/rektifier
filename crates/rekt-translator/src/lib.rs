@@ -48,13 +48,14 @@ pub use materialize::{
 pub use plan::{
     touched_paths, BatchGetItemPlan, BatchGetPerTable, BatchWriteItemPlan, BatchWritePerTable,
     ConditionPlan, ConditionRouting, DeleteItemPlan, GetItemPlan, PutItemPlan, QueryPlan,
-    ReturnValuesMode, ScanPlan, SimpleSqlUpdatePrimitives, SimpleUpdatePrimitives, UpdateItemPlan,
+    ReturnValuesMode, ScanPlan, SimpleSqlUpdatePrimitives, SimpleUpdatePrimitives,
+    TransactGetItemsPlan, TransactGetPlanItem, UpdateItemPlan,
 };
 pub use schema::TableSchema;
 pub use translate::{
     translate_batch_get_item, translate_batch_write_item, translate_delete_item,
     translate_get_item, translate_put_item, translate_query, translate_scan,
-    translate_update_item,
+    translate_transact_get_items, translate_update_item,
 };
 #[cfg(test)]
 mod tests {
@@ -2947,5 +2948,159 @@ mod tests {
             err,
             TranslateError::TooManyWritesInBatch { got: 6, max: 5 }
         ));
+    }
+
+    // ===== TransactGetItems (T1) =============================================
+
+    fn tg_get(table: &str, key: Item) -> rekt_protocol::TransactGetItem {
+        rekt_protocol::TransactGetItem {
+            get: Some(rekt_protocol::TransactGet {
+                table_name: table.into(),
+                key,
+                projection_expression: None,
+                expression_attribute_names: None,
+            }),
+        }
+    }
+
+    fn tg_req(items: Vec<rekt_protocol::TransactGetItem>) -> rekt_protocol::TransactGetItemsRequest {
+        rekt_protocol::TransactGetItemsRequest {
+            transact_items: items,
+            return_consumed_capacity: None,
+        }
+    }
+
+    #[test]
+    fn transact_get_hash_table_ok() {
+        let req = tg_req(vec![
+            tg_get("users", item_of(&[("id", AttributeValue::S("a".into()))])),
+            tg_get("users", item_of(&[("id", AttributeValue::S("b".into()))])),
+        ]);
+        let plan = translate_transact_get_items(&req, &schemas_map(), 100).unwrap();
+        assert_eq!(plan.items.len(), 2);
+        assert_eq!(plan.items[0].table_name, "users");
+        assert_eq!(plan.items[0].pk, KeyValue::S("a".into()));
+        assert!(plan.items[0].sk.is_none());
+        assert_eq!(plan.items[1].pk, KeyValue::S("b".into()));
+    }
+
+    #[test]
+    fn transact_get_composite_table_extracts_sk() {
+        let req = tg_req(vec![tg_get(
+            "events",
+            item_of(&[
+                ("device_id", AttributeValue::S("d".into())),
+                ("ts", AttributeValue::N("42".into())),
+            ]),
+        )]);
+        let plan = translate_transact_get_items(&req, &schemas_map(), 100).unwrap();
+        assert_eq!(plan.items[0].sk, Some(KeyValue::N("42".into())));
+    }
+
+    #[test]
+    fn transact_get_empty_request_rejected() {
+        let req = tg_req(vec![]);
+        let err = translate_transact_get_items(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::EmptyTransactRequest));
+    }
+
+    #[test]
+    fn transact_get_too_many_items_rejected() {
+        let items: Vec<_> = (0..6)
+            .map(|n| tg_get("users", item_of(&[("id", AttributeValue::S(format!("u{n}")))])))
+            .collect();
+        let req = tg_req(items);
+        let err = translate_transact_get_items(&req, &schemas_map(), 5).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::TooManyTransactItems { got: 6, max: 5 }
+        ));
+    }
+
+    #[test]
+    fn transact_get_unknown_table_rejected() {
+        let req = tg_req(vec![tg_get(
+            "nope",
+            item_of(&[("id", AttributeValue::S("x".into()))]),
+        )]);
+        let err = translate_transact_get_items(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::ResourceNotFoundForTransact { .. }));
+    }
+
+    #[test]
+    fn transact_get_malformed_item_no_get_set_rejected() {
+        let req = tg_req(vec![rekt_protocol::TransactGetItem { get: None }]);
+        let err = translate_transact_get_items(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::MalformedTransactItem { .. }));
+    }
+
+    #[test]
+    fn transact_get_duplicate_target_within_table_rejected() {
+        let same = || item_of(&[("id", AttributeValue::S("x".into()))]);
+        let req = tg_req(vec![tg_get("users", same()), tg_get("users", same())]);
+        let err = translate_transact_get_items(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::DuplicateTransactTarget));
+    }
+
+    #[test]
+    fn transact_get_same_key_across_tables_allowed() {
+        // D6: dedupe key includes table name. Same pk in different tables OK.
+        let req = tg_req(vec![
+            tg_get("users", item_of(&[("id", AttributeValue::S("k".into()))])),
+            tg_get(
+                "blobs",
+                item_of(&[("hash", AttributeValue::B(bytes::Bytes::from_static(b"k")))]),
+            ),
+        ]);
+        let plan = translate_transact_get_items(&req, &schemas_map(), 100).unwrap();
+        assert_eq!(plan.items.len(), 2);
+    }
+
+    #[test]
+    fn transact_get_extra_key_attr_rejected() {
+        let req = tg_req(vec![tg_get(
+            "users",
+            item_of(&[
+                ("id", AttributeValue::S("a".into())),
+                ("extra", AttributeValue::S("nope".into())),
+            ]),
+        )]);
+        let err = translate_transact_get_items(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::ExtraKeyAttribute { .. }));
+    }
+
+    #[test]
+    fn transact_get_wrong_pk_type_rejected() {
+        let req = tg_req(vec![tg_get(
+            "users",
+            item_of(&[("id", AttributeValue::N("42".into()))]),
+        )]);
+        let err = translate_transact_get_items(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::PartitionKeyTypeMismatch { .. }));
+    }
+
+    #[test]
+    fn transact_get_position_order_preserved() {
+        // D8: response order tracks request order. Plan must preserve it.
+        let req = tg_req(vec![
+            tg_get("users", item_of(&[("id", AttributeValue::S("third".into()))])),
+            tg_get("users", item_of(&[("id", AttributeValue::S("first".into()))])),
+            tg_get("users", item_of(&[("id", AttributeValue::S("second".into()))])),
+        ]);
+        let plan = translate_transact_get_items(&req, &schemas_map(), 100).unwrap();
+        assert_eq!(plan.items[0].pk, KeyValue::S("third".into()));
+        assert_eq!(plan.items[1].pk, KeyValue::S("first".into()));
+        assert_eq!(plan.items[2].pk, KeyValue::S("second".into()));
+    }
+
+    #[test]
+    fn transact_get_projection_parses_into_plan() {
+        let mut item = tg_get("users", item_of(&[("id", AttributeValue::S("a".into()))]));
+        item.get.as_mut().unwrap().projection_expression = Some("id, label".into());
+        let req = tg_req(vec![item]);
+        let plan = translate_transact_get_items(&req, &schemas_map(), 100).unwrap();
+        let proj = plan.items[0].projection.as_ref().expect("projection set");
+        assert!(proj.contains("id"));
+        assert!(proj.contains("label"));
     }
 }

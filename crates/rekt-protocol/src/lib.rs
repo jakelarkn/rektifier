@@ -12,6 +12,8 @@ pub use attribute_value::{AttributeValue, Item};
 pub use operations::{
     BatchGetItemRequest, BatchGetItemResponse, BatchWriteItemRequest, BatchWriteItemResponse,
     DeleteItemRequest, DeleteItemResponse, DeleteRequest, GetItemRequest, GetItemResponse,
-    KeysAndAttributes, PutItemRequest, PutItemResponse, PutRequest, QueryRequest, QueryResponse,
-    ScanRequest, ScanResponse, UpdateItemRequest, UpdateItemResponse, WriteRequest,
+    Get as TransactGet, KeysAndAttributes, PutItemRequest, PutItemResponse, PutRequest,
+    QueryRequest, QueryResponse, ScanRequest, ScanResponse, TransactGetItem,
+    TransactGetItemResponse, TransactGetItemsRequest, TransactGetItemsResponse, UpdateItemRequest,
+    UpdateItemResponse, WriteRequest,
 };

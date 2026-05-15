@@ -29,17 +29,19 @@ use bytes::Bytes;
 use rekt_protocol::{
     BatchGetItemRequest, BatchGetItemResponse, BatchWriteItemRequest, BatchWriteItemResponse,
     DeleteItemRequest, DeleteItemResponse, GetItemRequest, GetItemResponse, Item, PutItemRequest,
-    PutItemResponse, QueryRequest, QueryResponse, ScanRequest, ScanResponse, UpdateItemRequest,
+    PutItemResponse, QueryRequest, QueryResponse, ScanRequest, ScanResponse,
+    TransactGetItemResponse, TransactGetItemsRequest, TransactGetItemsResponse, UpdateItemRequest,
     UpdateItemResponse, WriteRequest,
 };
 use rekt_sigv4::{SigV4Error, Verifier};
-use rekt_storage::{Backend, BackendError, UpdateDecision, UpdateOutcome};
+use rekt_storage::{Backend, BackendError, TransactGetOp, UpdateDecision, UpdateOutcome};
 use rekt_translator::{
     apply_update_expression, encode_lek, evaluate_condition, materialize_insert_only_update,
     materialize_simple_sql_update, materialize_simple_update, touched_paths,
     translate_batch_get_item, translate_batch_write_item, translate_delete_item,
     translate_get_item, translate_put_item, translate_query, translate_scan,
-    translate_update_item, ConditionRouting, ReturnValuesMode, TableSchema, TranslateError,
+    translate_transact_get_items, translate_update_item, ConditionRouting, ReturnValuesMode,
+    TableSchema, TranslateError,
 };
 use std::any::Any;
 use std::collections::HashMap;
@@ -85,6 +87,8 @@ pub struct AppState {
 pub struct BatchLimits {
     pub batch_get_max_keys: u32,
     pub batch_write_max_requests: u32,
+    pub transact_get_max_items: u32,
+    pub transact_write_max_items: u32,
 }
 
 impl Default for BatchLimits {
@@ -95,6 +99,8 @@ impl Default for BatchLimits {
         Self {
             batch_get_max_keys: 100,
             batch_write_max_requests: 25,
+            transact_get_max_items: 100,
+            transact_write_max_items: 100,
         }
     }
 }
@@ -234,6 +240,9 @@ impl From<TranslateError> for ApiError {
             // ResourceNotFoundException wire-shape DDB uses for the
             // single-row ops' equivalent error.
             TranslateError::ResourceNotFoundForBatch { table } => {
+                ApiError::ResourceNotFound(format!("Table not found: {table}"))
+            }
+            TranslateError::ResourceNotFoundForTransact { table } => {
                 ApiError::ResourceNotFound(format!("Table not found: {table}"))
             }
             other => ApiError::Validation(other.to_string()),
@@ -386,6 +395,7 @@ async fn dispatch(State(state): State<AppState>, req: Request) -> Result<Respons
         "Scan" => handle_scan(&state, &body).await,
         "BatchGetItem" => handle_batch_get_item(&state, &body).await,
         "BatchWriteItem" => handle_batch_write_item(&state, &body).await,
+        "TransactGetItems" => handle_transact_get_items(&state, &body).await,
         _ => Err(ApiError::UnknownOperation(format!(
             "operation `{op}` not implemented"
         ))),
@@ -906,6 +916,82 @@ async fn handle_batch_write_item(state: &AppState, body: &Bytes) -> Result<Respo
         // Always `{}` in v1 — D11 in PLAN-6.
         unprocessed_items: HashMap::<String, Vec<WriteRequest>>::new(),
     }))
+}
+
+#[tracing::instrument(
+    level = "debug",
+    skip_all,
+    name = "server.transact_get_items",
+    fields(items = tracing::field::Empty)
+)]
+async fn handle_transact_get_items(
+    state: &AppState,
+    body: &Bytes,
+) -> Result<Response, ApiError> {
+    let req: TransactGetItemsRequest = parse_request(body, "TransactGetItems")?;
+
+    let plan = translate_transact_get_items(
+        &req,
+        state.schemas.as_ref(),
+        state.batch_limits.transact_get_max_items,
+    )?;
+
+    tracing::Span::current().record("items", plan.items.len());
+
+    // Build the storage-layer op list. Each item carries its own
+    // TableShape borrowed from the schemas map; the slice lives for
+    // the duration of the call so the borrow is fine.
+    let shapes: Vec<rekt_storage::TableShape<'_>> = plan
+        .items
+        .iter()
+        .map(|p| {
+            state
+                .schemas
+                .get(&p.table_name)
+                .map(|s| s.shape())
+                .ok_or_else(|| {
+                    // Translator already validated this; defensive only.
+                    ApiError::ResourceNotFound(format!("Table not found: {}", p.table_name))
+                })
+        })
+        .collect::<Result<_, _>>()?;
+
+    let ops: Vec<TransactGetOp<'_>> = plan
+        .items
+        .iter()
+        .zip(shapes.into_iter())
+        .map(|(p, shape)| TransactGetOp {
+            shape,
+            pk: p.pk.clone(),
+            sk: p.sk.clone(),
+        })
+        .collect();
+
+    let outcome = state.backend.transact_get_raw(&ops).await?;
+
+    // Position-preserving response (D8). Each slot is `{"Item": ...}`
+    // on hit or `{}` on miss. Projection (T2) prunes per-item before
+    // shaping into the wire `Item`.
+    let mut responses: Vec<TransactGetItemResponse> = Vec::with_capacity(outcome.items.len());
+    for (slot, plan_item) in outcome.items.into_iter().zip(plan.items.iter()) {
+        let item = match slot {
+            None => None,
+            Some(v) => {
+                let pruned = match plan_item.projection.as_ref() {
+                    None => v,
+                    Some(keep) => prune_to_projection(v, keep),
+                };
+                Some(serde_json::from_value::<Item>(pruned).map_err(|e| {
+                    ApiError::Internal(format!(
+                        "TransactGetItems: stored item is not valid DynamoDB-JSON: {e}"
+                    ))
+                })?)
+            }
+        };
+        responses.push(TransactGetItemResponse { item });
+    }
+
+    Ok(json_ok(&TransactGetItemsResponse { responses }))
 }
 
 /// Shape the UpdateItem response according to `ReturnValues`. Supports

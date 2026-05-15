@@ -266,3 +266,22 @@ pub struct SimpleSqlUpdatePrimitives {
     pub sets: Vec<(String, serde_json::Value)>,
     pub removes: Vec<String>,
 }
+
+/// TransactGetItems plan. Position-preserving (D8 in PLAN-8).
+#[derive(Debug, Clone, Default)]
+pub struct TransactGetItemsPlan {
+    pub items: Vec<TransactGetPlanItem>,
+}
+
+/// One per-item entry in a TransactGetItemsPlan. The dispatcher uses
+/// `table_name` to look up the `TableSchema` again (the translator
+/// already validated it exists), then hands the (shape, pk, sk) into
+/// `transact_get_raw`. `projection` is the parsed
+/// `ProjectionExpression` (T2; v1 = top-level names only).
+#[derive(Debug, Clone)]
+pub struct TransactGetPlanItem {
+    pub table_name: String,
+    pub pk: KeyValue,
+    pub sk: Option<KeyValue>,
+    pub projection: Option<std::collections::BTreeSet<String>>,
+}

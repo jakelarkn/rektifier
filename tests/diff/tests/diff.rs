@@ -4669,3 +4669,114 @@ fn diff_batch_write_unknown_table_in_multi_table_doesnt_write_anything() {
 
     delete_both("users", "{\"id\":{\"S\":\"bw-d-sentinel\"}}");
 }
+
+// ===== TransactGetItems (T1) =================================================
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_transact_get_single_table_happy_path() {
+    ensure_users_table();
+    let ids = ["tg-a", "tg-b", "tg-c"];
+    for id in ids {
+        let item = format!(
+            "{{\"id\":{{\"S\":\"{id}\"}},\"label\":{{\"S\":\"L-{id}\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",&item]);
+    }
+    let items = "[\
+        {\"Get\":{\"TableName\":\"users\",\"Key\":{\"id\":{\"S\":\"tg-a\"}}}},\
+        {\"Get\":{\"TableName\":\"users\",\"Key\":{\"id\":{\"S\":\"tg-b\"}}}},\
+        {\"Get\":{\"TableName\":\"users\",\"Key\":{\"id\":{\"S\":\"tg-c\"}}}}\
+    ]";
+    let r_ref = aws(REF, &["dynamodb","transact-get-items","--transact-items",items]);
+    let r_ours = aws(OURS, &["dynamodb","transact-get-items","--transact-items",items]);
+    // D8: TransactGetItems is position-preserving. Compare exact array.
+    let ref_responses = r_ref["Responses"].as_array().unwrap();
+    let our_responses = r_ours["Responses"].as_array().unwrap();
+    assert_eq!(ref_responses.len(), 3);
+    assert_eq!(our_responses.len(), 3);
+    for (i, id) in ids.iter().enumerate() {
+        assert_eq!(
+            ref_responses[i]["Item"]["id"]["S"].as_str(),
+            Some(*id),
+            "ref slot {i}"
+        );
+        assert_eq!(
+            our_responses[i]["Item"]["id"]["S"].as_str(),
+            Some(*id),
+            "ours slot {i}"
+        );
+    }
+
+    for id in ids {
+        delete_both("users", &format!("{{\"id\":{{\"S\":\"{id}\"}}}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_transact_get_missing_slots_emit_empty_object() {
+    ensure_users_table();
+    let item = "{\"id\":{\"S\":\"tg-hit\"},\"label\":{\"S\":\"present\"}}";
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",item]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",item]);
+
+    let items = "[\
+        {\"Get\":{\"TableName\":\"users\",\"Key\":{\"id\":{\"S\":\"tg-hit\"}}}},\
+        {\"Get\":{\"TableName\":\"users\",\"Key\":{\"id\":{\"S\":\"tg-not-here\"}}}}\
+    ]";
+    let r_ref = aws(REF, &["dynamodb","transact-get-items","--transact-items",items]);
+    let r_ours = aws(OURS, &["dynamodb","transact-get-items","--transact-items",items]);
+
+    // Slot 0 hits, slot 1 is the miss. Both endpoints must emit a
+    // present-but-itemless object for the miss (D8).
+    assert!(r_ref["Responses"][0].get("Item").is_some());
+    assert!(r_ours["Responses"][0].get("Item").is_some());
+    assert!(r_ref["Responses"][1].get("Item").is_none(), "ref: {}", r_ref);
+    assert!(r_ours["Responses"][1].get("Item").is_none(), "ours: {}", r_ours);
+
+    delete_both("users", "{\"id\":{\"S\":\"tg-hit\"}}");
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_transact_get_composite_table_round_trip() {
+    ensure_device_events_table();
+    for ts in [1, 2, 3] {
+        let item = format!(
+            "{{\"device_id\":{{\"S\":\"tg-d\"}},\"ts\":{{\"N\":\"{ts}\"}},\"label\":{{\"S\":\"E-{ts}\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+    }
+    let items = "[\
+        {\"Get\":{\"TableName\":\"device_events\",\"Key\":{\"device_id\":{\"S\":\"tg-d\"},\"ts\":{\"N\":\"3\"}}}},\
+        {\"Get\":{\"TableName\":\"device_events\",\"Key\":{\"device_id\":{\"S\":\"tg-d\"},\"ts\":{\"N\":\"1\"}}}},\
+        {\"Get\":{\"TableName\":\"device_events\",\"Key\":{\"device_id\":{\"S\":\"tg-d\"},\"ts\":{\"N\":\"2\"}}}}\
+    ]";
+    let r_ref = aws(REF, &["dynamodb","transact-get-items","--transact-items",items]);
+    let r_ours = aws(OURS, &["dynamodb","transact-get-items","--transact-items",items]);
+
+    // Position-preserved (D8): the response order tracks the request,
+    // regardless of natural sort.
+    for (i, expected_ts) in ["3", "1", "2"].iter().enumerate() {
+        assert_eq!(
+            r_ref["Responses"][i]["Item"]["ts"]["N"].as_str(),
+            Some(*expected_ts),
+            "ref slot {i}"
+        );
+        assert_eq!(
+            r_ours["Responses"][i]["Item"]["ts"]["N"].as_str(),
+            Some(*expected_ts),
+            "ours slot {i}"
+        );
+    }
+
+    for ts in [1, 2, 3] {
+        let key = format!(
+            "{{\"device_id\":{{\"S\":\"tg-d\"}},\"ts\":{{\"N\":\"{ts}\"}}}}"
+        );
+        delete_both("device_events", &key);
+    }
+}
