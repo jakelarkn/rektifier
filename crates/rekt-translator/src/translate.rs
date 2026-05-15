@@ -242,11 +242,23 @@ pub fn translate_query(
         Some(esk) => decode_esk(esk, schema, &bounds.pk)?,
     };
 
+    // FilterExpression: same parse/substitute/classify pipeline as
+    // Put/Delete/Update conditions. The classifier still runs (so
+    // future SQL push-down can branch on routing) but Q3 evaluates
+    // every filter shape in Rust — see PLAN-4 D2.
+    let filter = translate_condition(
+        req.filter_expression.as_deref(),
+        names,
+        values,
+        schema,
+    )?;
+
     Ok(QueryPlan {
         pk: bounds.pk,
         sk_condition: bounds.sk_condition,
         limit,
         esk_sk,
+        filter,
     })
 }
 

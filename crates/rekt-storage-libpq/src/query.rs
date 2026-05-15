@@ -24,7 +24,9 @@
 use crate::types::{cast_for_keytype, map_pg_err, pg_type_for_keytype, quote_ident, Bound};
 use crate::PgBackend;
 use bytes::Bytes;
-use rekt_storage::{BackendError, KeyType, KeyValue, QueryOutcome, SkCondition, TableShape};
+use rekt_storage::{
+    BackendError, FilterEvalFn, KeyType, KeyValue, QueryOutcome, SkCondition, TableShape,
+};
 use tokio_postgres::types::{Json, ToSql, Type};
 use tracing::Instrument;
 
@@ -43,6 +45,7 @@ pub(crate) async fn query_raw(
     sk_condition: Option<&SkCondition>,
     limit: Option<u32>,
     exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
+    filter: Option<FilterEvalFn<'_>>,
 ) -> Result<QueryOutcome, BackendError> {
     if sk_condition.is_some() && shape.sk_col.is_none() {
         return Err(BackendError::UnexpectedSortKey {
@@ -217,26 +220,44 @@ pub(crate) async fn query_raw(
         .await
         .map_err(|e| map_pg_err(shape.table, e))?;
 
-    // ---- Decode + apply L+1 sentinel ----
-    let mut items: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+    // ---- Decode + apply L+1 sentinel + per-row filter ----
+    //
+    // Two-pass strategy: decode all returned rows first (so we can
+    // identify the L-th row for LEK *before* filter drops it), then
+    // apply the filter to produce the post-filter `items` list.
+    //
+    // DDB semantics: Limit caps the number of *scanned* rows (pre-
+    // filter); FilterExpression then drops rows post-scan. LEK is
+    // set whenever the scan stopped due to Limit (i.e. we got L+1
+    // rows back), regardless of how many rows passed the filter —
+    // even Count=0 + LEK is a valid response that tells the client
+    // "no matches in this page, keep paging."
+    let mut scanned_rows: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
     for row in &rows {
         let Json(v): Json<serde_json::Value> = row.get(0);
-        items.push(v);
+        scanned_rows.push(v);
     }
-    let has_more = items.len() as i64 == lim_plus_one;
+    let has_more = scanned_rows.len() as i64 == lim_plus_one;
+    if has_more {
+        // Drop the sentinel before LEK lookup so the L-th row is `last`.
+        scanned_rows.truncate(lim_input as usize);
+    }
     let last_evaluated_key = if has_more {
-        // Drop the sentinel; the L-th row's key becomes the LEK.
-        items.truncate(lim_input as usize);
-        items
+        scanned_rows
             .last()
             .and_then(|row| lek_from_row(row, shape))
     } else {
         None
     };
-    let scanned = items.len() as u32;
+    let scanned_count = scanned_rows.len() as u32;
+    let items: Vec<serde_json::Value> = match filter {
+        None => scanned_rows,
+        Some(f) => scanned_rows.into_iter().filter(|row| f(row)).collect(),
+    };
+    let count = items.len() as u32;
     Ok(QueryOutcome {
-        count: scanned,
-        scanned_count: scanned,
+        count,
+        scanned_count,
         items,
         last_evaluated_key,
     })

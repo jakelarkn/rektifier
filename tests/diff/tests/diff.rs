@@ -2728,3 +2728,110 @@ fn diff_query_last_page_no_lek() {
         delete_both_composite("device_events", "device_id", pk, "ts", &format!("{{\"N\":\"{ts}\"}}"));
     }
 }
+
+// ===== Query Q3: FilterExpression vs DDB-local =============================
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_filter_drops_some_rows() {
+    ensure_device_events_table();
+    let pk = "diff-q-filt-some";
+    for ts in 1..=5 {
+        let flag = if ts % 2 == 1 { "on" } else { "off" };
+        let item = format!(
+            "{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"{ts}\"}},\"flag\":{{\"S\":\"{flag}\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+    }
+
+    let eav = format!("{{\":pk\":{{\"S\":\"{pk}\"}},\":want\":{{\"S\":\"on\"}}}}");
+    let args: Vec<&str> = vec![
+        "dynamodb","query",
+        "--table-name","device_events",
+        "--key-condition-expression","device_id = :pk",
+        "--filter-expression","flag = :want",
+        "--expression-attribute-values", &eav,
+    ];
+    let q_ref = aws(REF, &args);
+    let q_ours = aws(OURS, &args);
+    assert_eq!(q_ref["Count"], q_ours["Count"]);
+    assert_eq!(q_ref["ScannedCount"], q_ours["ScannedCount"]);
+    assert_eq!(q_ref["Items"], q_ours["Items"]);
+
+    for ts in 1..=5 {
+        delete_both_composite("device_events", "device_id", pk, "ts", &format!("{{\"N\":\"{ts}\"}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_filter_with_limit_lek_when_count_zero() {
+    ensure_device_events_table();
+    let pk = "diff-q-filt-lim";
+    for ts in 1..=5 {
+        let item = format!(
+            "{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"{ts}\"}},\"flag\":{{\"S\":\"off\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+    }
+
+    let eav = format!(
+        "{{\":pk\":{{\"S\":\"{pk}\"}},\":want\":{{\"S\":\"NO_MATCH\"}}}}"
+    );
+    let args: Vec<&str> = vec![
+        "dynamodb","query",
+        "--table-name","device_events",
+        "--key-condition-expression","device_id = :pk",
+        "--filter-expression","flag = :want",
+        "--expression-attribute-values",&eav,
+        "--limit","2",
+    ];
+    let q_ref = aws(REF, &args);
+    let q_ours = aws(OURS, &args);
+    assert_eq!(q_ref["Count"], q_ours["Count"], "Count diverged\nref: {q_ref}\nours: {q_ours}");
+    assert_eq!(q_ref["ScannedCount"], q_ours["ScannedCount"], "ScannedCount diverged");
+    assert_eq!(
+        q_ref["LastEvaluatedKey"], q_ours["LastEvaluatedKey"],
+        "LEK diverged when filter dropped everything\nref: {q_ref}\nours: {q_ours}"
+    );
+
+    for ts in 1..=5 {
+        delete_both_composite("device_events", "device_id", pk, "ts", &format!("{{\"N\":\"{ts}\"}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_filter_attribute_exists() {
+    ensure_device_events_table();
+    let pk = "diff-q-filt-ae";
+    // ts=1 has `score`; ts=2 doesn't.
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","device_events","--item",
+        &format!("{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"1\"}},\"score\":{{\"N\":\"5\"}}}}")]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","device_events","--item",
+        &format!("{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"1\"}},\"score\":{{\"N\":\"5\"}}}}")]);
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","device_events","--item",
+        &format!("{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"2\"}}}}")]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","device_events","--item",
+        &format!("{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"2\"}}}}")]);
+
+    let eav = format!("{{\":pk\":{{\"S\":\"{pk}\"}}}}");
+    let args: Vec<&str> = vec![
+        "dynamodb","query",
+        "--table-name","device_events",
+        "--key-condition-expression","device_id = :pk",
+        "--filter-expression","attribute_exists(score)",
+        "--expression-attribute-values", &eav,
+    ];
+    let q_ref = aws(REF, &args);
+    let q_ours = aws(OURS, &args);
+    assert_eq!(q_ref["Count"], q_ours["Count"]);
+    assert_eq!(q_ref["ScannedCount"], q_ours["ScannedCount"]);
+    assert_eq!(q_ref["Items"], q_ours["Items"]);
+
+    for ts in ["1","2"] {
+        delete_both_composite("device_events", "device_id", pk, "ts", &format!("{{\"N\":\"{ts}\"}}"));
+    }
+}

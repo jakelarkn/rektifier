@@ -129,6 +129,13 @@ pub struct QueryRequest {
     /// strictly after this key.
     #[serde(default)]
     pub exclusive_start_key: Option<Item>,
+    /// Optional post-key filter (DDB's full v1 ConditionExpression
+    /// grammar over non-key attrs). Applied per row in Rust after PG
+    /// returns the partition slice — `Count` tracks post-filter
+    /// items; `ScannedCount` tracks pre-filter items (which may
+    /// differ).
+    #[serde(default)]
+    pub filter_expression: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

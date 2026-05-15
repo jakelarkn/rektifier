@@ -332,6 +332,7 @@ pub trait Backend: Send + Sync + 'static {
         sk_condition: Option<&SkCondition>,
         limit: Option<u32>,
         exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
+        filter: Option<FilterEvalFn<'_>>,
     ) -> Result<QueryOutcome, BackendError>;
 }
 
@@ -394,6 +395,16 @@ pub type GeneralUpdateFn<'a> = Box<
 /// the expression evaluator.
 pub type ConditionEvalFn<'a> =
     Box<dyn Fn(Option<&serde_json::Value>) -> bool + Send + Sync + 'a>;
+
+/// Caller-supplied row filter for Query / Scan `FilterExpression`.
+/// Runs against each row already fetched from PG; returns `true` to
+/// include the row in the response, `false` to drop it. Unlike
+/// [`ConditionEvalFn`], the row is always present (never `None`) —
+/// Query/Scan only ever see real rows. Tracked separately to keep
+/// `scanned_count` (pre-filter, derived from PG read) distinct from
+/// `count` (post-filter).
+pub type FilterEvalFn<'a> =
+    Box<dyn Fn(&serde_json::Value) -> bool + Send + Sync + 'a>;
 
 /// What the slow path should do given the row state.
 #[derive(Debug, Clone)]

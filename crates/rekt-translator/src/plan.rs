@@ -127,14 +127,18 @@ pub fn touched_paths(expr: &UpdateExpression) -> std::collections::BTreeSet<Stri
 /// key predicate. `limit` is the caller's per-call cap (Q2). `esk_sk`
 /// is the sort-key half of the `ExclusiveStartKey` cursor; the PK half
 /// is `pk` (translator-enforced equality with the query PK) so we only
-/// carry the SK component through to storage. Q3 adds `filter`, Q5
-/// adds `forward`.
+/// carry the SK component through to storage. `filter` (Q3) is the
+/// parsed FilterExpression evaluated per-row in Rust by the dispatcher;
+/// `ConditionPlan.routing` is populated but not consulted in Q3 since
+/// all shapes evaluate in Rust (D2 in PLAN-4 — SQL push-down deferred).
+/// Q5 adds `forward`.
 #[derive(Debug, Clone)]
 pub struct QueryPlan {
     pub pk: KeyValue,
     pub sk_condition: Option<SkCondition>,
     pub limit: Option<u32>,
     pub esk_sk: Option<KeyValue>,
+    pub filter: Option<ConditionPlan>,
 }
 
 #[derive(Debug, Clone)]

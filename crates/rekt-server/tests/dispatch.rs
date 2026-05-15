@@ -8,8 +8,8 @@ use rekt_expressions::Condition;
 use rekt_server::{router, AppState};
 use rekt_sigv4::{PermissiveVerifier, Verifier};
 use rekt_storage::{
-    Backend, BackendError, ConditionEvalFn, GeneralUpdateFn, KeyType, KeyValue, QueryOutcome,
-    SkCondition, TableShape, UpdateDecision, UpdateOutcome,
+    Backend, BackendError, ConditionEvalFn, FilterEvalFn, GeneralUpdateFn, KeyType, KeyValue,
+    QueryOutcome, SkCondition, TableShape, UpdateDecision, UpdateOutcome,
 };
 use rekt_translator::{evaluate_condition, TableSchema};
 use serde_json::{json, Value};
@@ -300,6 +300,7 @@ impl Backend for MockBackend {
         sk_condition: Option<&SkCondition>,
         limit: Option<u32>,
         exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
+        filter: Option<FilterEvalFn<'_>>,
     ) -> Result<QueryOutcome, BackendError> {
         let pk_value = kv_to_string(pk);
 
@@ -341,6 +342,10 @@ impl Backend for MockBackend {
             hits.truncate(lim);
         }
 
+        // LEK is derived from the last *scanned* row (the one that
+        // capped at Limit), not the last filter-passing row. Compute
+        // it before applying the filter so the cursor advances even
+        // when the filter drops everything in the current page.
         let last_evaluated_key = if has_more {
             hits.last().map(|(sk_str, _)| {
                 let sk_kv = shape.sk_type.map(|t| match t {
@@ -355,12 +360,20 @@ impl Backend for MockBackend {
             None
         };
 
-        let items: Vec<serde_json::Value> = hits.into_iter().map(|(_, v)| v).collect();
-        let n = items.len() as u32;
+        let scanned_count = hits.len() as u32;
+        let items: Vec<serde_json::Value> = match filter {
+            None => hits.into_iter().map(|(_, v)| v).collect(),
+            Some(f) => hits
+                .into_iter()
+                .map(|(_, v)| v)
+                .filter(|row| f(row))
+                .collect(),
+        };
+        let count = items.len() as u32;
         Ok(QueryOutcome {
             items,
-            count: n,
-            scanned_count: n,
+            count,
+            scanned_count,
             last_evaluated_key,
         })
     }
@@ -3424,4 +3437,277 @@ async fn query_invalid_esk_pk_mismatch_rejected() {
         .and_then(Value::as_str)
         .unwrap()
         .ends_with("#ValidationException"));
+}
+
+// ===== Query Q3: FilterExpression (Rust eval per row) =====================
+//
+// Filter is applied AFTER the SK key predicate + Limit truncation.
+// `Count` reflects post-filter; `ScannedCount` reflects pre-filter.
+// LEK is set whenever the scan capped at Limit, regardless of how many
+// rows passed the filter — even Count=0 with LEK is valid.
+
+#[tokio::test]
+async fn query_filter_drops_some_rows() {
+    let app = app();
+    // 5 rows; flag alternates "on"/"off".
+    for ts in 1..=5 {
+        let flag = if ts % 2 == 1 { "on" } else { "off" };
+        put_item(
+            &app,
+            "device_events",
+            json!({
+                "device_id":{"S":"q-filt-1"},
+                "ts":{"N":ts.to_string()},
+                "flag":{"S":flag}
+            }),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName":"device_events",
+                "KeyConditionExpression":"device_id = :pk",
+                "FilterExpression":"flag = :want",
+                "ExpressionAttributeValues":{
+                    ":pk":{"S":"q-filt-1"},
+                    ":want":{"S":"on"}
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    // 5 scanned, 3 kept (ts 1, 3, 5).
+    assert_eq!(body["ScannedCount"], 5);
+    assert_eq!(body["Count"], 3);
+    let ts: Vec<&str> = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["ts"]["N"].as_str().unwrap())
+        .collect();
+    assert_eq!(ts, vec!["1", "3", "5"]);
+}
+
+#[tokio::test]
+async fn query_filter_drops_all_rows_no_lek_when_partition_exhausted() {
+    let app = app();
+    for ts in 1..=3 {
+        put_item(
+            &app,
+            "device_events",
+            json!({
+                "device_id":{"S":"q-filt-empty"},
+                "ts":{"N":ts.to_string()},
+                "flag":{"S":"off"}
+            }),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName":"device_events",
+                "KeyConditionExpression":"device_id = :pk",
+                "FilterExpression":"flag = :want",
+                "ExpressionAttributeValues":{
+                    ":pk":{"S":"q-filt-empty"},
+                    ":want":{"S":"on"}
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["ScannedCount"], 3);
+    assert_eq!(body["Count"], 0);
+    // Partition fully scanned, filter dropped all → no LEK.
+    assert!(body.get("LastEvaluatedKey").is_none());
+}
+
+#[tokio::test]
+async fn query_filter_with_limit_sets_lek_even_when_count_zero() {
+    let app = app();
+    // 5 rows; none match. Limit=2 caps scan at 2 → LEK present even
+    // though Count=0 (client should re-page).
+    for ts in 1..=5 {
+        put_item(
+            &app,
+            "device_events",
+            json!({
+                "device_id":{"S":"q-filt-lim"},
+                "ts":{"N":ts.to_string()},
+                "flag":{"S":"off"}
+            }),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName":"device_events",
+                "KeyConditionExpression":"device_id = :pk",
+                "FilterExpression":"flag = :want",
+                "ExpressionAttributeValues":{
+                    ":pk":{"S":"q-filt-lim"},
+                    ":want":{"S":"NO_MATCH"}
+                },
+                "Limit": 2
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["ScannedCount"], 2);
+    assert_eq!(body["Count"], 0);
+    assert_eq!(
+        body["LastEvaluatedKey"],
+        json!({"device_id":{"S":"q-filt-lim"},"ts":{"N":"2"}})
+    );
+}
+
+#[tokio::test]
+async fn query_filter_attribute_exists() {
+    let app = app();
+    put_item(
+        &app,
+        "device_events",
+        json!({
+            "device_id":{"S":"q-filt-ae"},
+            "ts":{"N":"1"},
+            "score":{"N":"5"}
+        }),
+    )
+    .await;
+    put_item(
+        &app,
+        "device_events",
+        json!({
+            "device_id":{"S":"q-filt-ae"},
+            "ts":{"N":"2"}
+            // no score attribute
+        }),
+    )
+    .await;
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName":"device_events",
+                "KeyConditionExpression":"device_id = :pk",
+                "FilterExpression":"attribute_exists(score)",
+                "ExpressionAttributeValues":{":pk":{"S":"q-filt-ae"}}
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["Count"], 1);
+    assert_eq!(body["Items"][0]["ts"]["N"], "1");
+}
+
+#[tokio::test]
+async fn query_filter_boolean_and_with_between() {
+    let app = app();
+    for (ts, score) in [(1, 5), (2, 15), (3, 25), (4, 35)] {
+        put_item(
+            &app,
+            "device_events",
+            json!({
+                "device_id":{"S":"q-filt-bool"},
+                "ts":{"N":ts.to_string()},
+                "score":{"N":score.to_string()},
+                "flag":{"S":"on"}
+            }),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName":"device_events",
+                "KeyConditionExpression":"device_id = :pk",
+                "FilterExpression":"flag = :want AND score BETWEEN :lo AND :hi",
+                "ExpressionAttributeValues":{
+                    ":pk":{"S":"q-filt-bool"},
+                    ":want":{"S":"on"},
+                    ":lo":{"N":"10"},
+                    ":hi":{"N":"30"}
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    // score in [10, 30]: rows ts=2 (score=15) and ts=3 (score=25).
+    assert_eq!(body["Count"], 2);
+    let ts: Vec<&str> = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["ts"]["N"].as_str().unwrap())
+        .collect();
+    assert_eq!(ts, vec!["2", "3"]);
+}
+
+#[tokio::test]
+async fn query_filter_with_pagination_continues_through_filter_misses() {
+    let app = app();
+    // 10 rows; only ts=7 matches. Page with L=3; expect 3 pages of
+    // empty Items with LEKs, then the page containing ts=7.
+    for ts in 1..=10 {
+        let flag = if ts == 7 { "MATCH" } else { "no" };
+        put_item(
+            &app,
+            "device_events",
+            json!({
+                "device_id":{"S":"q-filt-page"},
+                "ts":{"N":ts.to_string()},
+                "flag":{"S":flag}
+            }),
+        )
+        .await;
+    }
+
+    let mut esk: Option<Value> = None;
+    let mut found: Vec<String> = vec![];
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        if pages > 10 {
+            panic!("paging didn't terminate");
+        }
+        let mut body_in = json!({
+            "TableName":"device_events",
+            "KeyConditionExpression":"device_id = :pk",
+            "FilterExpression":"flag = :want",
+            "ExpressionAttributeValues":{
+                ":pk":{"S":"q-filt-page"},
+                ":want":{"S":"MATCH"}
+            },
+            "Limit": 3
+        });
+        if let Some(e) = &esk {
+            body_in["ExclusiveStartKey"] = e.clone();
+        }
+        let resp = app
+            .clone()
+            .oneshot(ddb_request("Query", body_in))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        for item in body["Items"].as_array().unwrap() {
+            found.push(item["ts"]["N"].as_str().unwrap().to_string());
+        }
+        match body.get("LastEvaluatedKey") {
+            Some(lek) if !lek.is_null() => esk = Some(lek.clone()),
+            _ => break,
+        }
+    }
+    assert_eq!(found, vec!["7"]);
 }

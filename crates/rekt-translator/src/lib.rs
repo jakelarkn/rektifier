@@ -1527,6 +1527,7 @@ mod tests {
             consistent_read: None,
             limit: None,
             exclusive_start_key: None,
+            filter_expression: None,
         }
     }
 
@@ -1952,5 +1953,140 @@ mod tests {
         req.exclusive_start_key = Some(lek);
         let plan = translate_query(&req, &schema_composite_s_n()).unwrap();
         assert_eq!(plan.esk_sk, Some(KeyValue::N("2000".into())));
+    }
+
+    // ============================================================
+    // translate_query Q3 — FilterExpression
+    // ============================================================
+
+    #[test]
+    fn query_filter_parses_into_plan() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[
+                (":pk", AttributeValue::S("u1".into())),
+                (":want", AttributeValue::S("active".into())),
+            ],
+            &[],
+        );
+        req.filter_expression = Some("flag = :want".into());
+        let plan = translate_query(&req, &schema_hash_s()).unwrap();
+        let fp = plan.filter.expect("filter present");
+        assert!(matches!(fp.condition, Condition::Compare { .. }));
+    }
+
+    #[test]
+    fn query_filter_absent_leaves_none() {
+        let req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        let plan = translate_query(&req, &schema_hash_s()).unwrap();
+        assert!(plan.filter.is_none());
+    }
+
+    #[test]
+    fn query_filter_blank_treated_as_absent() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        req.filter_expression = Some("".into());
+        let plan = translate_query(&req, &schema_hash_s()).unwrap();
+        assert!(plan.filter.is_none());
+    }
+
+    #[test]
+    fn query_filter_nested_path_rejected() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[
+                (":pk", AttributeValue::S("u1".into())),
+                (":v", AttributeValue::S("x".into())),
+            ],
+            &[],
+        );
+        req.filter_expression = Some("meta.score = :v".into());
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::UnsupportedConditionNestedPath { .. }
+        ));
+    }
+
+    #[test]
+    fn query_filter_parse_error_surfaces() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        req.filter_expression = Some("flag =".into());
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::InvalidConditionExpression(_)
+        ));
+    }
+
+    #[test]
+    fn query_filter_unknown_placeholder_rejected() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        req.filter_expression = Some("flag = :missing".into());
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::UnknownPlaceholder(ref p) if p == ":missing"
+        ));
+    }
+
+    #[test]
+    fn query_filter_aliased_reserved_word_accepted() {
+        // FilterExpression goes through the same reserved-word check as
+        // ConditionExpression on Put/Delete/Update — aliased names
+        // bypass it.
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[
+                (":pk", AttributeValue::S("u1".into())),
+                (":v", AttributeValue::S("alice".into())),
+            ],
+            &[("#n", "name")],
+        );
+        req.filter_expression = Some("#n = :v".into());
+        let plan = translate_query(&req, &schema_hash_s()).unwrap();
+        assert!(plan.filter.is_some());
+    }
+
+    #[test]
+    fn query_filter_reserved_bare_word_rejected() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[
+                (":pk", AttributeValue::S("u1".into())),
+                (":v", AttributeValue::S("alice".into())),
+            ],
+            &[],
+        );
+        req.filter_expression = Some("name = :v".into());
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::ReservedWordInConditionExpression { ref word } if word == "name"
+        ));
     }
 }

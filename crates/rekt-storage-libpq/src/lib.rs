@@ -39,8 +39,8 @@ use async_trait::async_trait;
 use deadpool_postgres::{Manager, Pool};
 use rekt_expressions::Condition;
 use rekt_storage::{
-    Backend, BackendError, ConditionEvalFn, GeneralUpdateFn, KeyValue, QueryOutcome, SkCondition,
-    TableShape, UpdateOutcome,
+    Backend, BackendError, ConditionEvalFn, FilterEvalFn, GeneralUpdateFn, KeyValue, QueryOutcome,
+    SkCondition, TableShape, UpdateOutcome,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -189,6 +189,7 @@ impl Backend for PgBackend {
         sk_condition: Option<&SkCondition>,
         limit: Option<u32>,
         exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
+        filter: Option<FilterEvalFn<'_>>,
     ) -> Result<QueryOutcome, BackendError> {
         query::query_raw(
             self,
@@ -197,6 +198,7 @@ impl Backend for PgBackend {
             sk_condition,
             limit,
             exclusive_start_key,
+            filter,
         )
         .await
     }
@@ -2093,7 +2095,7 @@ mod tests {
         }
 
         let out = backend
-            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, None, None)
+            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, None, None, None)
             .await
             .unwrap();
         assert_eq!(out.count, 3);
@@ -2155,6 +2157,7 @@ mod tests {
                 Some(&SkCondition::Eq(KeyValue::N("300".into()))),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2167,6 +2170,7 @@ mod tests {
                 &shape,
                 &pk,
                 Some(&SkCondition::Lt(KeyValue::N("300".into()))),
+                None,
                 None,
                 None,
             )
@@ -2185,6 +2189,7 @@ mod tests {
                 &shape,
                 &pk,
                 Some(&SkCondition::Ge(KeyValue::N("300".into()))),
+                None,
                 None,
                 None,
             )
@@ -2206,6 +2211,7 @@ mod tests {
                     KeyValue::N("200".into()),
                     KeyValue::N("400".into()),
                 )),
+                None,
                 None,
                 None,
             )
@@ -2264,6 +2270,7 @@ mod tests {
                 Some(&SkCondition::BeginsWithS("2026-01".into())),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2281,6 +2288,7 @@ mod tests {
                 &shape,
                 &KeyValue::S("t-1".into()),
                 Some(&SkCondition::BeginsWithS("%".into())),
+                None,
                 None,
                 None,
             )
@@ -2332,7 +2340,7 @@ mod tests {
             .await;
         }
         let out = backend
-            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, Some(3), None)
+            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, Some(3), None, None)
             .await
             .unwrap();
         assert_eq!(out.count, 3);
@@ -2391,7 +2399,7 @@ mod tests {
             .await;
         }
         let out = backend
-            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, Some(2), None)
+            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, Some(2), None, None)
             .await
             .unwrap();
         assert_eq!(out.count, 2);
@@ -2407,7 +2415,7 @@ mod tests {
 
         // Last page: no LEK.
         let out = backend
-            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, Some(10), None)
+            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, Some(10), None, None)
             .await
             .unwrap();
         assert_eq!(out.count, 5);
@@ -2468,7 +2476,7 @@ mod tests {
                 .as_ref()
                 .map(|(p, s)| (p, s.as_ref()));
             let out = backend
-                .query_raw(&shape, &pk, None, Some(3), esk_ref)
+                .query_raw(&shape, &pk, None, Some(3), esk_ref, None)
                 .await
                 .unwrap();
             for item in &out.items {
@@ -2537,6 +2545,7 @@ mod tests {
                 Some(&SkCondition::BeginsWithS("2026-01".into())),
                 Some(2),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2555,6 +2564,7 @@ mod tests {
                 Some(&SkCondition::BeginsWithS("2026-01".into())),
                 Some(2),
                 Some(esk),
+                None,
             )
             .await
             .unwrap();
@@ -2568,6 +2578,215 @@ mod tests {
 
         client
             .batch_execute("DROP TABLE rekt_t_q_esk_bw;")
+            .await
+            .unwrap();
+    }
+
+    // ============================================================
+    // Q3 — FilterExpression (per-row Rust eval against real PG)
+    // ============================================================
+
+    /// Build a FilterEvalFn from a hand-written predicate so the PG
+    /// integration test doesn't have to depend on rekt-translator's
+    /// parser. The dispatcher uses `evaluate_condition` against the
+    /// parsed AST in production; this just exercises the storage
+    /// layer's filter contract.
+    fn flag_eq_filter(want: &'static str) -> rekt_storage::FilterEvalFn<'static> {
+        Box::new(move |row| {
+            row.get("flag")
+                .and_then(|v| v.get("S"))
+                .and_then(|v| v.as_str())
+                == Some(want)
+        })
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn query_filter_drops_some_rows() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_q_filt;
+                 CREATE TABLE rekt_t_q_filt (
+                   doc       jsonb NOT NULL,
+                   device_id text    GENERATED ALWAYS AS (doc#>>'{device_id,S}')     STORED,
+                   ts        numeric GENERATED ALWAYS AS ((doc#>>'{ts,N}')::numeric) STORED,
+                   PRIMARY KEY (device_id, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_q_filt",
+            pk_col: "device_id",
+            pk_type: KeyType::S,
+            sk_col: Some("ts"),
+            sk_type: Some(KeyType::N),
+            jsonb_col: "doc",
+        };
+        for ts in 1..=5 {
+            let flag = if ts % 2 == 1 { "on" } else { "off" };
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({
+                    "device_id":{"S":"dev-1"},
+                    "ts":{"N": ts.to_string()},
+                    "flag":{"S": flag}
+                }),
+            )
+            .await;
+        }
+        let out = backend
+            .query_raw(
+                &shape,
+                &KeyValue::S("dev-1".into()),
+                None,
+                None,
+                None,
+                Some(flag_eq_filter("on")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.scanned_count, 5);
+        assert_eq!(out.count, 3);
+        let ts: Vec<&str> = out
+            .items
+            .iter()
+            .map(|i| i["ts"]["N"].as_str().unwrap())
+            .collect();
+        assert_eq!(ts, vec!["1", "3", "5"]);
+        assert!(out.last_evaluated_key.is_none());
+
+        client
+            .batch_execute("DROP TABLE rekt_t_q_filt;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn query_filter_with_limit_sets_lek_even_when_count_zero() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_q_filt_lim;
+                 CREATE TABLE rekt_t_q_filt_lim (
+                   doc       jsonb NOT NULL,
+                   device_id text    GENERATED ALWAYS AS (doc#>>'{device_id,S}')     STORED,
+                   ts        numeric GENERATED ALWAYS AS ((doc#>>'{ts,N}')::numeric) STORED,
+                   PRIMARY KEY (device_id, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_q_filt_lim",
+            pk_col: "device_id",
+            pk_type: KeyType::S,
+            sk_col: Some("ts"),
+            sk_type: Some(KeyType::N),
+            jsonb_col: "doc",
+        };
+        for ts in 1..=5 {
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({
+                    "device_id":{"S":"dev-1"},
+                    "ts":{"N": ts.to_string()},
+                    "flag":{"S":"off"}
+                }),
+            )
+            .await;
+        }
+        let out = backend
+            .query_raw(
+                &shape,
+                &KeyValue::S("dev-1".into()),
+                None,
+                Some(2),
+                None,
+                Some(flag_eq_filter("NO_MATCH")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.scanned_count, 2);
+        assert_eq!(out.count, 0);
+        let (_, lek_sk) = out.last_evaluated_key.expect("LEK present");
+        assert_eq!(lek_sk, Some(KeyValue::N("2".into())));
+
+        client
+            .batch_execute("DROP TABLE rekt_t_q_filt_lim;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn query_filter_with_sk_predicate_combines() {
+        // Sort-key predicate runs in SQL; filter runs in Rust over the
+        // resulting rows. Both must be honored.
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_q_filt_sk;
+                 CREATE TABLE rekt_t_q_filt_sk (
+                   doc       jsonb NOT NULL,
+                   device_id text    GENERATED ALWAYS AS (doc#>>'{device_id,S}')     STORED,
+                   ts        numeric GENERATED ALWAYS AS ((doc#>>'{ts,N}')::numeric) STORED,
+                   PRIMARY KEY (device_id, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_q_filt_sk",
+            pk_col: "device_id",
+            pk_type: KeyType::S,
+            sk_col: Some("ts"),
+            sk_type: Some(KeyType::N),
+            jsonb_col: "doc",
+        };
+        for ts in 1..=10 {
+            let flag = if ts % 2 == 0 { "on" } else { "off" };
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({
+                    "device_id":{"S":"dev-1"},
+                    "ts":{"N": ts.to_string()},
+                    "flag":{"S": flag}
+                }),
+            )
+            .await;
+        }
+        // ts >= 5 → 5..=10 (scanned); flag = "on" → ts 6, 8, 10.
+        let out = backend
+            .query_raw(
+                &shape,
+                &KeyValue::S("dev-1".into()),
+                Some(&SkCondition::Ge(KeyValue::N("5".into()))),
+                None,
+                None,
+                Some(flag_eq_filter("on")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.scanned_count, 6);
+        assert_eq!(out.count, 3);
+        let ts: Vec<&str> = out
+            .items
+            .iter()
+            .map(|i| i["ts"]["N"].as_str().unwrap())
+            .collect();
+        assert_eq!(ts, vec!["6", "8", "10"]);
+
+        client
+            .batch_execute("DROP TABLE rekt_t_q_filt_sk;")
             .await
             .unwrap();
     }

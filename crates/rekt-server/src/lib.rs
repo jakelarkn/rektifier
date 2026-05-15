@@ -498,6 +498,17 @@ async fn handle_query(state: &AppState, body: &Bytes) -> Result<Response, ApiErr
                 .as_ref()
                 .map(|_| (&plan.pk, None::<&rekt_storage::KeyValue>))
         });
+    // FilterExpression: wrap evaluate_condition into a `Fn(&Value)`
+    // closure (Query rows are never None; the underlying eval accepts
+    // Option<&Value>, so we lift each row into Some). Same pattern as
+    // the conditional Put/Delete closures.
+    let filter_fn: Option<rekt_storage::FilterEvalFn<'_>> =
+        plan.filter.as_ref().map(|cp| {
+            let cond = cp.condition.clone();
+            let f: rekt_storage::FilterEvalFn<'_> =
+                Box::new(move |row| evaluate_condition(Some(row), &cond));
+            f
+        });
     let outcome = state
         .backend
         .query_raw(
@@ -506,6 +517,7 @@ async fn handle_query(state: &AppState, body: &Bytes) -> Result<Response, ApiErr
             plan.sk_condition.as_ref(),
             plan.limit,
             esk_pair,
+            filter_fn,
         )
         .await?;
 
