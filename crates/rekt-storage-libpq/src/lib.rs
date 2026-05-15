@@ -31,6 +31,7 @@
 mod condition_sql;
 mod put_delete;
 mod query;
+mod scan;
 mod shape;
 mod types;
 mod update;
@@ -40,7 +41,7 @@ use deadpool_postgres::{Manager, Pool};
 use rekt_expressions::Condition;
 use rekt_storage::{
     Backend, BackendError, ConditionEvalFn, FilterEvalFn, GeneralUpdateFn, KeyValue, QueryOutcome,
-    SkCondition, TableShape, UpdateOutcome,
+    ScanOutcome, SkCondition, TableShape, UpdateOutcome,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -201,6 +202,13 @@ impl Backend for PgBackend {
             filter,
         )
         .await
+    }
+
+    async fn scan_raw(
+        &self,
+        shape: &TableShape<'_>,
+    ) -> Result<ScanOutcome, BackendError> {
+        scan::scan_raw(self, shape).await
     }
 }
 #[cfg(test)]
@@ -2787,6 +2795,159 @@ mod tests {
 
         client
             .batch_execute("DROP TABLE rekt_t_q_filt_sk;")
+            .await
+            .unwrap();
+    }
+
+    // ============================================================
+    // Q4 — scan_raw against real PG
+    // ============================================================
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn scan_returns_all_rows_hash_only() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_scan_h;
+                 CREATE TABLE rekt_t_scan_h (
+                   data jsonb NOT NULL,
+                   id   text  GENERATED ALWAYS AS (data#>>'{id,S}') STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_scan_h",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        for n in 1..=4 {
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({"id":{"S":format!("u{n}")},"label":{"S":format!("v{n}")}}),
+            )
+            .await;
+        }
+        let out = backend.scan_raw(&shape).await.unwrap();
+        assert_eq!(out.count, 4);
+        assert_eq!(out.scanned_count, 4);
+        assert!(out.last_evaluated_key.is_none());
+        // Ordered by pk_col ascending.
+        let ids: Vec<&str> = out
+            .items
+            .iter()
+            .map(|i| i["id"]["S"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["u1", "u2", "u3", "u4"]);
+
+        client
+            .batch_execute("DROP TABLE rekt_t_scan_h;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn scan_returns_all_rows_composite() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_scan_c;
+                 CREATE TABLE rekt_t_scan_c (
+                   doc       jsonb NOT NULL,
+                   device_id text    GENERATED ALWAYS AS (doc#>>'{device_id,S}')     STORED,
+                   ts        numeric GENERATED ALWAYS AS ((doc#>>'{ts,N}')::numeric) STORED,
+                   PRIMARY KEY (device_id, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_scan_c",
+            pk_col: "device_id",
+            pk_type: KeyType::S,
+            sk_col: Some("ts"),
+            sk_type: Some(KeyType::N),
+            jsonb_col: "doc",
+        };
+        for (dev, ts) in [("d2", "10"), ("d1", "20"), ("d1", "10"), ("d2", "5")] {
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({
+                    "device_id":{"S":dev},
+                    "ts":{"N":ts},
+                    "val":{"S":"x"}
+                }),
+            )
+            .await;
+        }
+        let out = backend.scan_raw(&shape).await.unwrap();
+        assert_eq!(out.count, 4);
+        // PG ORDER BY (device_id, ts) ascending.
+        let keys: Vec<(String, String)> = out
+            .items
+            .iter()
+            .map(|i| {
+                (
+                    i["device_id"]["S"].as_str().unwrap().to_string(),
+                    i["ts"]["N"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("d1".into(), "10".into()),
+                ("d1".into(), "20".into()),
+                ("d2".into(), "5".into()),
+                ("d2".into(), "10".into()),
+            ]
+        );
+
+        client
+            .batch_execute("DROP TABLE rekt_t_scan_c;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn scan_empty_table_returns_no_items() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_scan_empty;
+                 CREATE TABLE rekt_t_scan_empty (
+                   data jsonb NOT NULL,
+                   id   text  GENERATED ALWAYS AS (data#>>'{id,S}') STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_scan_empty",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        let out = backend.scan_raw(&shape).await.unwrap();
+        assert_eq!(out.count, 0);
+        assert_eq!(out.scanned_count, 0);
+        assert!(out.items.is_empty());
+
+        client
+            .batch_execute("DROP TABLE rekt_t_scan_empty;")
             .await
             .unwrap();
     }

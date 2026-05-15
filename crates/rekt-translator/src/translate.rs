@@ -12,14 +12,14 @@ use crate::keys::{extract_key, reject_extra_key_attrs, KeyRole};
 use crate::paging::{decode_esk, validate_limit};
 use crate::plan::{
     ConditionPlan, DeleteItemPlan, GetItemPlan, PutItemPlan, QueryPlan, ReturnValuesMode,
-    UpdateItemPlan,
+    ScanPlan, UpdateItemPlan,
 };
 use crate::schema::TableSchema;
 use rekt_expressions::{
     parse_condition_expression, parse_update_expression, substitute_condition, substitute_update,
 };
 use rekt_protocol::{
-    AttributeValue, DeleteItemRequest, GetItemRequest, PutItemRequest, QueryRequest,
+    AttributeValue, DeleteItemRequest, GetItemRequest, PutItemRequest, QueryRequest, ScanRequest,
     UpdateItemRequest,
 };
 use std::collections::BTreeMap;
@@ -260,6 +260,27 @@ pub fn translate_query(
         esk_sk,
         filter,
     })
+}
+
+#[tracing::instrument(level = "debug", skip_all, name = "translate.scan", fields(table = %schema.name))]
+pub fn translate_scan(
+    req: &ScanRequest,
+    schema: &TableSchema,
+) -> Result<ScanPlan, TranslateError> {
+    // Q4 doesn't consult the schema; Q5 will (filter validation, etc).
+    let _ = schema;
+    // Q4 rejects every advanced feature; Q5/Q7 lift them in order.
+    if req.index_name.is_some() {
+        return Err(TranslateError::ScanFeatureNotSupported {
+            what: "IndexName (GSI/LSI scan)",
+        });
+    }
+    if req.segment.is_some() || req.total_segments.is_some() {
+        return Err(TranslateError::ScanFeatureNotSupported {
+            what: "Segment / TotalSegments (parallel scan)",
+        });
+    }
+    Ok(ScanPlan {})
 }
 
 /// Shared `ReturnValues` resolver for PutItem and DeleteItem. DDB accepts

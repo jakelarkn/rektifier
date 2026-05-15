@@ -334,6 +334,32 @@ pub trait Backend: Send + Sync + 'static {
         exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
         filter: Option<FilterEvalFn<'_>>,
     ) -> Result<QueryOutcome, BackendError>;
+
+    /// Scan — unbounded read over the whole table.
+    ///
+    /// Emits `SELECT <jsonb_col> FROM <table> ORDER BY <pk_col>
+    /// [, <sk_col>] LIMIT $L`. Q4's signature is minimal — Q5 adds
+    /// `filter`, `limit`, `exclusive_start_key`. The dispatcher
+    /// applies a soft cap of 1000 items pending Q5.
+    ///
+    /// Returns every row in `items`. `count` and `scanned_count` are
+    /// equal until Q5 adds FilterExpression. `last_evaluated_key`
+    /// always `None` in Q4.
+    async fn scan_raw(
+        &self,
+        shape: &TableShape<'_>,
+    ) -> Result<ScanOutcome, BackendError>;
+}
+
+/// Result of a `scan_raw` call. Structurally identical to
+/// [`QueryOutcome`] for now; kept separate so the two can evolve
+/// independently as Q5/Q7 lift their respective feature sets.
+#[derive(Debug, Clone, Default)]
+pub struct ScanOutcome {
+    pub items: Vec<serde_json::Value>,
+    pub count: u32,
+    pub scanned_count: u32,
+    pub last_evaluated_key: Option<(KeyValue, Option<KeyValue>)>,
 }
 
 /// Sort-key predicate the translator hands to `query_raw`. PK is always

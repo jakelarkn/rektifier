@@ -2835,3 +2835,124 @@ fn diff_query_filter_attribute_exists() {
         delete_both_composite("device_events", "device_id", pk, "ts", &format!("{{\"N\":\"{ts}\"}}"));
     }
 }
+
+// ===== Scan Q4 vs DDB-local ================================================
+//
+// DDB Scan order is officially undefined; rektifier returns rows in
+// (pk, sk) ascending order for keyset stability. These tests compare
+// returned Items as a *set* (after sorting by pk[,sk]) so a divergence
+// in row order doesn't fail the parity check.
+
+fn sort_items_by_keys(items: &mut [Value], pk_attr: &str, sk_attr: Option<&str>) {
+    items.sort_by(|a, b| {
+        let pa = extract_keyish(a, pk_attr);
+        let pb = extract_keyish(b, pk_attr);
+        let pk_cmp = pa.cmp(&pb);
+        if pk_cmp != std::cmp::Ordering::Equal {
+            return pk_cmp;
+        }
+        match sk_attr {
+            Some(sk) => extract_keyish(a, sk).cmp(&extract_keyish(b, sk)),
+            None => std::cmp::Ordering::Equal,
+        }
+    });
+}
+
+fn extract_keyish(item: &Value, attr: &str) -> String {
+    // Stringify the wrapped key value so sort works across S/N (we
+    // don't have B keys in these scan fixtures).
+    item.get(attr)
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.iter().next())
+        .and_then(|(_, v)| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_scan_users_round_trip() {
+    ensure_users_table();
+    let prefix = "diff-scan-u-";
+    for n in 1..=3 {
+        let item = format!(
+            "{{\"id\":{{\"S\":\"{prefix}{n}\"}},\"label\":{{\"S\":\"v{n}\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",&item]);
+    }
+
+    let q_ref = aws(REF, &["dynamodb","scan","--table-name","users"]);
+    let q_ours = aws(OURS, &["dynamodb","scan","--table-name","users"]);
+
+    // Counts must match exactly (both endpoints see the same items).
+    assert_eq!(q_ref["Count"], q_ours["Count"]);
+    assert_eq!(q_ref["ScannedCount"], q_ours["ScannedCount"]);
+
+    // Item sets must match. Sort both by pk to make the comparison
+    // deterministic regardless of which order DDB-local returned.
+    let mut ref_items = q_ref["Items"].as_array().unwrap().clone();
+    let mut our_items = q_ours["Items"].as_array().unwrap().clone();
+    sort_items_by_keys(&mut ref_items, "id", None);
+    sort_items_by_keys(&mut our_items, "id", None);
+    assert_eq!(
+        ref_items, our_items,
+        "Scan Items diverged after key-sort"
+    );
+
+    // Clean up.
+    for n in 1..=3 {
+        delete_both("users", &format!("{{\"id\":{{\"S\":\"{prefix}{n}\"}}}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_scan_composite_round_trip() {
+    ensure_device_events_table();
+    let pk = "diff-scan-c";
+    for ts in ["1","2","3"] {
+        let item = format!(
+            "{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"{ts}\"}},\"val\":{{\"N\":\"{ts}\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+    }
+
+    let q_ref = aws(REF, &["dynamodb","scan","--table-name","device_events"]);
+    let q_ours = aws(OURS, &["dynamodb","scan","--table-name","device_events"]);
+
+    assert_eq!(q_ref["Count"], q_ours["Count"]);
+    assert_eq!(q_ref["ScannedCount"], q_ours["ScannedCount"]);
+
+    let mut ref_items = q_ref["Items"].as_array().unwrap().clone();
+    let mut our_items = q_ours["Items"].as_array().unwrap().clone();
+    sort_items_by_keys(&mut ref_items, "device_id", Some("ts"));
+    sort_items_by_keys(&mut our_items, "device_id", Some("ts"));
+    assert_eq!(ref_items, our_items);
+
+    for ts in ["1","2","3"] {
+        delete_both_composite("device_events", "device_id", pk, "ts", &format!("{{\"N\":\"{ts}\"}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_scan_unknown_table_both_reject() {
+    let stderr_ref = aws_expecting_failure(
+        REF,
+        &["dynamodb","scan","--table-name","nope_no_such_table"],
+    );
+    let stderr_ours = aws_expecting_failure(
+        OURS,
+        &["dynamodb","scan","--table-name","nope_no_such_table"],
+    );
+    assert!(
+        stderr_ref.contains("ResourceNotFoundException") || stderr_ref.contains("not found"),
+        "DDB-local: {stderr_ref}"
+    );
+    assert!(
+        stderr_ours.contains("ResourceNotFoundException") || stderr_ours.contains("not found"),
+        "rektifier: {stderr_ours}"
+    );
+}

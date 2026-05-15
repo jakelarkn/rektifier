@@ -150,3 +150,35 @@ pub struct QueryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_evaluated_key: Option<Item>,
 }
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ScanRequest {
+    pub table_name: String,
+    /// Silently honored — see `COMPATIBILITY_NOTES.md`.
+    #[serde(default)]
+    pub consistent_read: Option<bool>,
+    /// GSI/LSI scan target. Rejected in Q4 (no GSI support yet) —
+    /// `PLAN-2` "Indexes" tracks the prereq work.
+    #[serde(default)]
+    pub index_name: Option<String>,
+    /// Parallel-scan partition index (`0..TotalSegments-1`). Rejected
+    /// in Q4; deferred per `PLAN-4` D4.
+    #[serde(default)]
+    pub segment: Option<u32>,
+    #[serde(default)]
+    pub total_segments: Option<u32>,
+    // Q5 adds: filter_expression, limit, exclusive_start_key,
+    // expression_attribute_names/values.
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ScanResponse {
+    pub items: Vec<Item>,
+    pub count: u32,
+    pub scanned_count: u32,
+    /// Present when Q5 lands pagination; always omitted in Q4.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_evaluated_key: Option<Item>,
+}

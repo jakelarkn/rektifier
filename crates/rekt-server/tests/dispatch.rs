@@ -9,7 +9,7 @@ use rekt_server::{router, AppState};
 use rekt_sigv4::{PermissiveVerifier, Verifier};
 use rekt_storage::{
     Backend, BackendError, ConditionEvalFn, FilterEvalFn, GeneralUpdateFn, KeyType, KeyValue,
-    QueryOutcome, SkCondition, TableShape, UpdateDecision, UpdateOutcome,
+    QueryOutcome, ScanOutcome, SkCondition, TableShape, UpdateDecision, UpdateOutcome,
 };
 use rekt_translator::{evaluate_condition, TableSchema};
 use serde_json::{json, Value};
@@ -378,6 +378,42 @@ impl Backend for MockBackend {
         })
     }
 
+    async fn scan_raw(
+        &self,
+        shape: &TableShape<'_>,
+    ) -> Result<ScanOutcome, BackendError> {
+        // Collect every row in this table from the mock store. Sort by
+        // pk then sk per the PgBackend ORDER BY, so dispatch tests can
+        // assert deterministic order even though DDB Scan order is
+        // officially undefined.
+        let store = self.store.lock().unwrap();
+        let mut hits: Vec<(String, String, serde_json::Value)> = store
+            .iter()
+            .filter(|((t, _, _), _)| t == shape.table)
+            .map(|((_, pk, sk), v)| (pk.clone(), sk.clone(), v.clone()))
+            .collect();
+        hits.sort_by(|a, b| {
+            // PK ordering uses the table's pk_type; same for sk.
+            let pk_cmp = compare_sk_strings(&a.0, &b.0, shape.pk_type);
+            if pk_cmp != std::cmp::Ordering::Equal {
+                return pk_cmp;
+            }
+            match shape.sk_type {
+                Some(t) => compare_sk_strings(&a.1, &b.1, t),
+                None => std::cmp::Ordering::Equal,
+            }
+        });
+        let items: Vec<serde_json::Value> =
+            hits.into_iter().map(|(_, _, v)| v).collect();
+        let n = items.len() as u32;
+        Ok(ScanOutcome {
+            items,
+            count: n,
+            scanned_count: n,
+            last_evaluated_key: None,
+        })
+    }
+
     async fn update_insert_only_raw(
         &self,
         shape: &TableShape<'_>,
@@ -565,7 +601,7 @@ async fn unknown_table_is_resource_not_found() {
 async fn unsupported_op_is_unknown_operation() {
     let app = app();
     let resp = app
-        .oneshot(ddb_request("Scan", json!({"TableName":"users"})))
+        .oneshot(ddb_request("BatchGetItem", json!({})))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -3710,4 +3746,195 @@ async fn query_filter_with_pagination_continues_through_filter_misses() {
         }
     }
     assert_eq!(found, vec!["7"]);
+}
+
+// ===== Scan Q4 ============================================================
+
+#[tokio::test]
+async fn scan_returns_all_items_hash_only() {
+    let app = app();
+    for n in 1..=3 {
+        put_item(
+            &app,
+            "users",
+            json!({"id":{"S":format!("scan-u-{n}")},"label":{"S":format!("v-{n}")}}),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request("Scan", json!({"TableName":"users"})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(body["Count"].as_u64().unwrap() >= 3);
+    assert_eq!(body["Count"], body["ScannedCount"]);
+    assert!(body.get("LastEvaluatedKey").is_none(),
+        "Q4 never sets LEK");
+
+    // Returned ids include all three we put.
+    let ids: Vec<String> = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"]["S"].as_str().unwrap().to_string())
+        .collect();
+    for n in 1..=3 {
+        let want = format!("scan-u-{n}");
+        assert!(ids.contains(&want), "missing {want} in {ids:?}");
+    }
+}
+
+#[tokio::test]
+async fn scan_returns_all_items_composite() {
+    let app = app();
+    for (dev, ts) in [("d1", "1"), ("d1", "2"), ("d2", "1")] {
+        put_item(
+            &app,
+            "device_events",
+            json!({
+                "device_id":{"S":format!("scan-{dev}")},
+                "ts":{"N":ts},
+                "val":{"N":ts}
+            }),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request("Scan", json!({"TableName":"device_events"})))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let items = body["Items"].as_array().unwrap();
+    assert!(items.len() >= 3);
+    assert_eq!(body["Count"], body["ScannedCount"]);
+}
+
+#[tokio::test]
+async fn scan_empty_table() {
+    let app = app();
+    // Fresh app — no data inserted.
+    let resp = app
+        .oneshot(ddb_request("Scan", json!({"TableName":"users"})))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["Count"], 0);
+    assert_eq!(body["ScannedCount"], 0);
+    assert_eq!(body["Items"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn scan_unknown_table_returns_resource_not_found() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request("Scan", json!({"TableName":"nope"})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body
+        .get("__type")
+        .and_then(Value::as_str)
+        .unwrap()
+        .ends_with("#ResourceNotFoundException"));
+}
+
+#[tokio::test]
+async fn scan_index_name_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "Scan",
+            json!({"TableName":"users","IndexName":"some_gsi"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body
+        .get("__type")
+        .and_then(Value::as_str)
+        .unwrap()
+        .ends_with("#ValidationException"));
+}
+
+#[tokio::test]
+async fn scan_parallel_segments_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "Scan",
+            json!({"TableName":"users","Segment":0,"TotalSegments":4}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn scan_consistent_read_silently_honored() {
+    let app = app();
+    put_item(
+        &app,
+        "users",
+        json!({"id":{"S":"scan-cr-1"},"label":{"S":"x"}}),
+    )
+    .await;
+    let resp = app
+        .oneshot(ddb_request(
+            "Scan",
+            json!({"TableName":"users","ConsistentRead":true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn scan_round_trips_every_attribute_variant() {
+    // Type-coverage smoke: insert one item with every AttributeValue
+    // variant, then Scan it back and assert the item shape survives.
+    let app = app();
+    let pk = "scan-type-cov";
+    put_item(
+        &app,
+        "users",
+        json!({
+            "id": {"S": pk},
+            "s_attr": {"S": "hello"},
+            "n_attr": {"N": "3.14"},
+            "b_attr": {"B": "AAEC"},
+            "bool_attr": {"BOOL": true},
+            "null_attr": {"NULL": true},
+            "l_attr": {"L":[{"S":"a"},{"N":"1"}]},
+            "m_attr": {"M":{"k":{"S":"v"}}},
+            "ss_attr": {"SS":["a","b"]},
+            "ns_attr": {"NS":["1","2"]},
+            "bs_attr": {"BS":["AA==","AQ=="]}
+        }),
+    )
+    .await;
+
+    let resp = app
+        .oneshot(ddb_request("Scan", json!({"TableName":"users"})))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let found = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"]["S"] == pk)
+        .expect("inserted row in Scan result");
+    assert_eq!(found["s_attr"]["S"], "hello");
+    assert_eq!(found["n_attr"]["N"], "3.14");
+    assert_eq!(found["b_attr"]["B"], "AAEC");
+    assert_eq!(found["bool_attr"]["BOOL"], true);
+    assert_eq!(found["null_attr"]["NULL"], true);
+    assert!(found["l_attr"]["L"].is_array());
+    assert_eq!(found["m_attr"]["M"]["k"]["S"], "v");
+    assert!(found["ss_attr"]["SS"].is_array());
+    assert!(found["ns_attr"]["NS"].is_array());
+    assert!(found["bs_attr"]["BS"].is_array());
 }

@@ -11,5 +11,6 @@ pub mod operations;
 pub use attribute_value::{AttributeValue, Item};
 pub use operations::{
     DeleteItemRequest, DeleteItemResponse, GetItemRequest, GetItemResponse, PutItemRequest,
-    PutItemResponse, QueryRequest, QueryResponse, UpdateItemRequest, UpdateItemResponse,
+    PutItemResponse, QueryRequest, QueryResponse, ScanRequest, ScanResponse, UpdateItemRequest,
+    UpdateItemResponse,
 };

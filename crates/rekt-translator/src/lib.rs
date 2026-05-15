@@ -46,13 +46,13 @@ pub use materialize::{
 };
 pub use plan::{
     touched_paths, ConditionPlan, ConditionRouting, DeleteItemPlan, GetItemPlan, PutItemPlan,
-    QueryPlan, ReturnValuesMode, SimpleSqlUpdatePrimitives, SimpleUpdatePrimitives,
+    QueryPlan, ReturnValuesMode, ScanPlan, SimpleSqlUpdatePrimitives, SimpleUpdatePrimitives,
     UpdateItemPlan,
 };
 pub use schema::TableSchema;
 pub use translate::{
     translate_delete_item, translate_get_item, translate_put_item, translate_query,
-    translate_update_item,
+    translate_scan, translate_update_item,
 };
 #[cfg(test)]
 mod tests {
@@ -2087,6 +2087,62 @@ mod tests {
         assert!(matches!(
             err,
             TranslateError::ReservedWordInConditionExpression { ref word } if word == "name"
+        ));
+    }
+
+    // ============================================================
+    // translate_scan (Q4)
+    // ============================================================
+
+    fn scan_req(table: &str) -> rekt_protocol::ScanRequest {
+        rekt_protocol::ScanRequest {
+            table_name: table.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn scan_basic_accepts() {
+        translate_scan(&scan_req("users"), &schema_hash_s()).unwrap();
+        translate_scan(&scan_req("events"), &schema_composite_s_n()).unwrap();
+    }
+
+    #[test]
+    fn scan_rejects_index_name() {
+        let mut req = scan_req("users");
+        req.index_name = Some("an_index".into());
+        let err = translate_scan(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::ScanFeatureNotSupported { what }
+                if what.contains("IndexName")
+        ));
+    }
+
+    #[test]
+    fn scan_rejects_segment() {
+        let mut req = scan_req("users");
+        req.segment = Some(0);
+        req.total_segments = Some(4);
+        let err = translate_scan(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::ScanFeatureNotSupported { what }
+                if what.contains("parallel scan")
+        ));
+    }
+
+    #[test]
+    fn scan_rejects_segment_alone() {
+        // Even with just Segment (no TotalSegments) we reject; DDB
+        // requires both, but rektifier rejects either as a clear
+        // unsupported-feature signal.
+        let mut req = scan_req("users");
+        req.segment = Some(0);
+        let err = translate_scan(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::ScanFeatureNotSupported { .. }
         ));
     }
 }

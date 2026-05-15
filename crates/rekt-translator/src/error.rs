@@ -197,6 +197,13 @@ pub enum TranslateError {
     /// queried partition.
     #[error("ExclusiveStartKey partition key `{attr}` does not match the Query's KeyConditionExpression PK")]
     ExclusiveStartKeyPkMismatch { attr: String },
+
+    // ----- Scan -----
+    /// Scan request used a feature rektifier doesn't yet implement
+    /// (`IndexName` → GSI; `Segment`/`TotalSegments` → parallel scan).
+    /// See `PLAN-4` D4/D5.
+    #[error("Scan feature not supported: {what}")]
+    ScanFeatureNotSupported { what: &'static str },
 }
 
 impl From<ParseError> for TranslateError {

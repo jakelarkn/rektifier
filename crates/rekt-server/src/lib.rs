@@ -28,7 +28,8 @@ use axum::Router;
 use bytes::Bytes;
 use rekt_protocol::{
     DeleteItemRequest, DeleteItemResponse, GetItemRequest, GetItemResponse, Item, PutItemRequest,
-    PutItemResponse, QueryRequest, QueryResponse, UpdateItemRequest, UpdateItemResponse,
+    PutItemResponse, QueryRequest, QueryResponse, ScanRequest, ScanResponse, UpdateItemRequest,
+    UpdateItemResponse,
 };
 use rekt_sigv4::{SigV4Error, Verifier};
 use rekt_storage::{Backend, BackendError, UpdateDecision, UpdateOutcome};
@@ -36,7 +37,8 @@ use rekt_translator::{
     apply_update_expression, encode_lek, evaluate_condition, materialize_insert_only_update,
     materialize_simple_sql_update, materialize_simple_update, touched_paths,
     translate_delete_item, translate_get_item, translate_put_item, translate_query,
-    translate_update_item, ConditionRouting, ReturnValuesMode, TableSchema, TranslateError,
+    translate_scan, translate_update_item, ConditionRouting, ReturnValuesMode, TableSchema,
+    TranslateError,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -225,6 +227,7 @@ async fn dispatch(State(state): State<AppState>, req: Request) -> Result<Respons
         "DeleteItem" => handle_delete_item(&state, &body).await,
         "UpdateItem" => handle_update_item(&state, &body).await,
         "Query" => handle_query(&state, &body).await,
+        "Scan" => handle_scan(&state, &body).await,
         _ => Err(ApiError::UnknownOperation(format!(
             "operation `{op}` not implemented"
         ))),
@@ -541,6 +544,48 @@ async fn handle_query(state: &AppState, body: &Bytes) -> Result<Response, ApiErr
         count: outcome.count,
         scanned_count: outcome.scanned_count,
         last_evaluated_key,
+    }))
+}
+
+#[tracing::instrument(
+    level = "debug",
+    skip_all,
+    name = "server.scan",
+    fields(table = tracing::field::Empty, consistent_read = tracing::field::Empty)
+)]
+async fn handle_scan(state: &AppState, body: &Bytes) -> Result<Response, ApiError> {
+    let req: ScanRequest = serde_json::from_slice(body)
+        .map_err(|e| ApiError::Serialization(format!("invalid Scan body: {e}")))?;
+    tracing::Span::current().record("table", req.table_name.as_str());
+    if let Some(cr) = req.consistent_read {
+        tracing::Span::current().record("consistent_read", cr);
+    }
+
+    let schema = state.schemas.get(&req.table_name).ok_or_else(|| {
+        ApiError::ResourceNotFound(format!("Table not found: {}", req.table_name))
+    })?;
+
+    // translate_scan validates that IndexName / Segment / TotalSegments
+    // aren't set; Q4's plan struct is empty.
+    let _plan = translate_scan(&req, schema)?;
+    let outcome = state.backend.scan_raw(&schema.shape()).await?;
+
+    let items: Vec<Item> = outcome
+        .items
+        .into_iter()
+        .map(|v| {
+            serde_json::from_value::<Item>(v).map_err(|e| {
+                ApiError::Internal(format!("stored item is not valid DynamoDB-JSON: {e}"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(json_ok(&ScanResponse {
+        items,
+        count: outcome.count,
+        scanned_count: outcome.scanned_count,
+        // Q4 never sets LEK; Q5 will.
+        last_evaluated_key: None,
     }))
 }
 

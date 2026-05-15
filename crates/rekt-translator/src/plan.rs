@@ -120,6 +120,12 @@ pub fn touched_paths(expr: &UpdateExpression) -> std::collections::BTreeSet<Stri
     paths
 }
 
+/// Scan plan: unbounded read over the whole table. Q4 is the
+/// skeleton with no knobs — the struct is intentionally empty so
+/// Q5 can grow it (filter, limit, esk) without breaking callers.
+#[derive(Debug, Clone, Default)]
+pub struct ScanPlan {}
+
 /// Query plan: bounded read of one partition.
 ///
 /// `pk` is the resolved partition-key value (KCE always pins exactly
