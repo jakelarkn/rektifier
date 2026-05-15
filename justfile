@@ -196,3 +196,12 @@ bench-query-scan: bench-build
     ./target/release/rekt-bench run --target direct-pg  --workload query-filtered --concurrency 16 --duration 10s --warmup 2s
     ./target/release/rekt-bench run --target rektifier  --workload query-filtered --concurrency 16 --duration 10s --warmup 2s
     ./target/release/rekt-bench run --target ddb-local  --workload query-filtered --concurrency 16 --duration 10s --warmup 2s
+
+# SDK smoketests: validate real DynamoDB SDK clients can connect to
+# rektifier. See smoketests/README.md for prerequisites. Requires
+# Maven and JDK 17 installed.
+smoke-java-v1:
+    cd smoketests/java-sdk-v1 && mvn -q compile exec:java
+
+smoke-java-v2:
+    cd smoketests/java-sdk-v2 && mvn -q compile exec:java
