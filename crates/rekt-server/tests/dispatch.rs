@@ -7408,3 +7408,187 @@ async fn transact_write_update_touches_key_rejected() {
         .unwrap()
         .contains("key attribute"));
 }
+
+// ===== TransactWriteItems T6 — Multi-table + CancellationReasons polish ======
+
+#[tokio::test]
+async fn transact_write_multi_table_happy_path() {
+    let app = app();
+    let body = json!({
+        "TransactItems": [
+            {"Put":{"TableName":"users","Item":{"id":{"S":"mt-u"},"label":{"S":"U"}}}},
+            {"Put":{"TableName":"device_events",
+                    "Item":{"device_id":{"S":"mt-d"},"ts":{"N":"1"},"label":{"S":"E"}}}}
+        ]
+    });
+    let resp = app
+        .clone()
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Both rows present.
+    let r1 = app
+        .clone()
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"mt-u"}}}),
+        ))
+        .await
+        .unwrap();
+    assert!(body_json(r1).await.get("Item").is_some());
+    let r2 = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({
+                "TableName":"device_events",
+                "Key":{"device_id":{"S":"mt-d"},"ts":{"N":"1"}}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(body_json(r2).await.get("Item").is_some());
+}
+
+#[tokio::test]
+async fn transact_write_multi_table_failure_rolls_back_across_tables() {
+    let app = app();
+    // Seed a guard row in `users` that exists.
+    put_item(&app, "users", json!({"id":{"S":"mt-x-guard"}})).await;
+    // Tx puts to device_events, then ConditionChecks against a missing
+    // row in users — that fails, so the device_events Put must roll back.
+    let body = json!({
+        "TransactItems": [
+            {"Put":{"TableName":"device_events",
+                    "Item":{"device_id":{"S":"mt-x-blocked"},"ts":{"N":"1"}}}},
+            {"ConditionCheck":{
+                "TableName":"users",
+                "Key":{"id":{"S":"mt-x-missing"}},
+                "ConditionExpression":"attribute_exists(id)"
+            }}
+        ]
+    });
+    let resp = app
+        .clone()
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    // CancellationReasons positionally indexed (D9).
+    assert_eq!(body["CancellationReasons"][0]["Code"], "None");
+    assert_eq!(body["CancellationReasons"][1]["Code"], "ConditionalCheckFailed");
+
+    // Atomicity across tables: device_events Put rolled back.
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({
+                "TableName":"device_events",
+                "Key":{"device_id":{"S":"mt-x-blocked"},"ts":{"N":"1"}}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(body_json(resp).await.get("Item").is_none());
+}
+
+#[tokio::test]
+async fn transact_write_same_key_across_tables_allowed() {
+    // D6 dedupe is keyed on (table, pk, sk) — same key in different
+    // tables is fine.
+    let app = app();
+    let body = json!({
+        "TransactItems": [
+            {"Put":{"TableName":"users","Item":{"id":{"S":"shared"}}}},
+            {"Put":{"TableName":"device_events",
+                    "Item":{"device_id":{"S":"shared"},"ts":{"N":"1"}}}}
+        ]
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Pin the full DDB-shape of TransactionCanceledException. The
+/// wire format is non-obvious: __type at the top, capital-M
+/// `Message` (not lowercase `message` as the standard ApiError
+/// uses), parallel `CancellationReasons` array. SDK retry code
+/// reads `CancellationReasons[i].Code` directly.
+#[tokio::test]
+async fn transact_write_cancellation_wire_shape() {
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"shape-row"}})).await;
+    let body = json!({
+        "TransactItems": [
+            {"Put":{"TableName":"users","Item":{"id":{"S":"shape-1"}}}},
+            {"Put":{"TableName":"users","Item":{"id":{"S":"shape-row"}},
+                    "ConditionExpression":"attribute_not_exists(id)"}},
+            {"Put":{"TableName":"users","Item":{"id":{"S":"shape-3"}}}}
+        ]
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#TransactionCanceledException"));
+    assert!(body["Message"]
+        .as_str()
+        .unwrap()
+        .starts_with("Transaction cancelled"));
+    let reasons = body["CancellationReasons"].as_array().unwrap();
+    assert_eq!(reasons.len(), 3);
+    assert_eq!(reasons[0]["Code"], "None");
+    assert_eq!(reasons[1]["Code"], "ConditionalCheckFailed");
+    assert_eq!(reasons[1]["Message"], "The conditional request failed");
+    assert_eq!(reasons[2]["Code"], "None");
+}
+
+#[tokio::test]
+async fn transact_write_too_many_items_rejected() {
+    let app = app();
+    let many: Vec<Value> = (0..101)
+        .map(|n| json!({
+            "Put":{"TableName":"users","Item":{"id":{"S":format!("toomany-{n}")}}}
+        }))
+        .collect();
+    let resp = app
+        .oneshot(ddb_request(
+            "TransactWriteItems",
+            json!({"TransactItems": many}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ValidationException"));
+}
+
+#[tokio::test]
+async fn transact_write_at_cap_succeeds() {
+    let app = app();
+    let many: Vec<Value> = (0..100)
+        .map(|n| json!({
+            "Put":{"TableName":"users","Item":{"id":{"S":format!("atcap-{n}")}}}
+        }))
+        .collect();
+    let resp = app
+        .oneshot(ddb_request(
+            "TransactWriteItems",
+            json!({"TransactItems": many}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

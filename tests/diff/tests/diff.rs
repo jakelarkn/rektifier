@@ -5028,3 +5028,74 @@ fn diff_transact_write_update_with_failing_condition_atomicity() {
 
     delete_both("users", key);
 }
+
+// ===== TransactWriteItems T6 — Multi-table + CancellationReasons polish =====
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_transact_write_multi_table_happy_path() {
+    ensure_users_table();
+    ensure_device_events_table();
+    let items = "[\
+        {\"Put\":{\"TableName\":\"users\",\"Item\":{\"id\":{\"S\":\"mt-d-u\"}}}},\
+        {\"Put\":{\"TableName\":\"device_events\",\"Item\":{\"device_id\":{\"S\":\"mt-d-d\"},\"ts\":{\"N\":\"42\"}}}}\
+    ]";
+    let _ = aws(REF, &["dynamodb","transact-write-items","--transact-items",items]);
+    let _ = aws(OURS, &["dynamodb","transact-write-items","--transact-items",items]);
+
+    let u_key = "{\"id\":{\"S\":\"mt-d-u\"}}";
+    let e_key = "{\"device_id\":{\"S\":\"mt-d-d\"},\"ts\":{\"N\":\"42\"}}";
+    let u_ref = aws(REF, &["dynamodb","get-item","--table-name","users","--key",u_key]);
+    let u_ours = aws(OURS, &["dynamodb","get-item","--table-name","users","--key",u_key]);
+    let e_ref = aws(REF, &["dynamodb","get-item","--table-name","device_events","--key",e_key]);
+    let e_ours = aws(OURS, &["dynamodb","get-item","--table-name","device_events","--key",e_key]);
+    assert_eq!(u_ref["Item"], u_ours["Item"]);
+    assert_eq!(e_ref["Item"], e_ours["Item"]);
+
+    delete_both("users", u_key);
+    delete_both("device_events", e_key);
+}
+
+/// Pin the wire shape of TransactionCanceledException. We compare the
+/// __type / Message / CancellationReasons[i].Code across both
+/// endpoints. The Code strings come from a closed set DDB
+/// documents; rektifier emits the same canonical values.
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_transact_write_cancellation_wire_shape() {
+    ensure_users_table();
+    // Seed a row that will fail attribute_not_exists.
+    let item = "{\"id\":{\"S\":\"mt-d-shape\"}}";
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",item]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",item]);
+
+    let items = "[\
+        {\"Put\":{\"TableName\":\"users\",\"Item\":{\"id\":{\"S\":\"mt-d-side\"}}}},\
+        {\"Put\":{\"TableName\":\"users\",\"Item\":{\"id\":{\"S\":\"mt-d-shape\"}},\
+                  \"ConditionExpression\":\"attribute_not_exists(id)\"}}\
+    ]";
+    let ref_err = aws_expecting_failure(REF, &["dynamodb","transact-write-items","--transact-items",items]);
+    let ours_err = aws_expecting_failure(OURS, &["dynamodb","transact-write-items","--transact-items",items]);
+
+    // Both endpoints reject with the canonical exception name and
+    // surface CancellationReasons with ConditionalCheckFailed at slot 1.
+    for (name, err) in [("ref", &ref_err), ("ours", &ours_err)] {
+        assert!(
+            err.contains("TransactionCanceled"),
+            "{name} didn't surface TransactionCanceled: {err}"
+        );
+        assert!(
+            err.contains("ConditionalCheckFailed"),
+            "{name} didn't name the failing reason: {err}"
+        );
+    }
+
+    // Atomicity: mt-d-side must NOT exist on either side.
+    let side_key = "{\"id\":{\"S\":\"mt-d-side\"}}";
+    let r_ref = aws(REF, &["dynamodb","get-item","--table-name","users","--key",side_key]);
+    let r_ours = aws(OURS, &["dynamodb","get-item","--table-name","users","--key",side_key]);
+    assert!(r_ref.get("Item").is_none());
+    assert!(r_ours.get("Item").is_none());
+
+    delete_both("users", "{\"id\":{\"S\":\"mt-d-shape\"}}");
+}
