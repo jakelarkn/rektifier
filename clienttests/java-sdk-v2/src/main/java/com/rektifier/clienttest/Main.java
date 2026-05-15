@@ -1,4 +1,4 @@
-package com.rektifier.smoke;
+package com.rektifier.clienttest;
 
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
@@ -13,10 +13,10 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Smoke test for AWS SDK for Java v2 against rektifier. Same shape as
- * the v1 smoketest in `smoketests/java-sdk-v1/` — the two together
- * confirm that both major Java SDK generations parse rektifier's wire
- * responses and error envelopes correctly.
+ * Client test for AWS SDK for Java v2 against rektifier. Same shape
+ * as the v1 client test in `clienttests/java-sdk-v1/` — the two
+ * together confirm that both major Java SDK generations parse
+ * rektifier's wire responses and error envelopes correctly.
  */
 public class Main {
     private static final String ENDPOINT =
@@ -25,7 +25,7 @@ public class Main {
         System.getenv().getOrDefault("REKTIFIER_REGION", "us-east-1");
 
     private static final String RUN_TAG =
-        "smoke-v2-" + System.currentTimeMillis();
+        "client-v2-" + System.currentTimeMillis();
     private static final String USER_PK = RUN_TAG + "-user";
     private static final String QUERY_PK = RUN_TAG + "-events";
 
@@ -40,7 +40,7 @@ public class Main {
                     AwsBasicCredentials.create("local", "local")))
                 .build()) {
 
-            System.out.println("=== rektifier-smoke-v2 ===");
+            System.out.println("=== rektifier-client-v2 ===");
             System.out.println("endpoint = " + ENDPOINT);
             System.out.println("region   = " + REGION);
             System.out.println();

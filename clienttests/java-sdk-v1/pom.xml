@@ -2,8 +2,8 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0">
   <modelVersion>4.0.0</modelVersion>
 
-  <groupId>com.rektifier.smoke</groupId>
-  <artifactId>rektifier-smoke-v2</artifactId>
+  <groupId>com.rektifier.clienttest</groupId>
+  <artifactId>rektifier-client-v1</artifactId>
   <version>0.0.1</version>
   <packaging>jar</packaging>
 
@@ -11,15 +11,15 @@
     <maven.compiler.source>17</maven.compiler.source>
     <maven.compiler.target>17</maven.compiler.target>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <!-- AWS SDK for Java v2. -->
-    <aws.sdk.v2.version>2.44.6</aws.sdk.v2.version>
+    <!-- AWS SDK for Java v1 — the original ("classic") SDK. -->
+    <aws.sdk.v1.version>1.12.788</aws.sdk.v1.version>
   </properties>
 
   <dependencies>
     <dependency>
-      <groupId>software.amazon.awssdk</groupId>
-      <artifactId>dynamodb</artifactId>
-      <version>${aws.sdk.v2.version}</version>
+      <groupId>com.amazonaws</groupId>
+      <artifactId>aws-java-sdk-dynamodb</artifactId>
+      <version>${aws.sdk.v1.version}</version>
     </dependency>
   </dependencies>
 
@@ -30,7 +30,7 @@
         <artifactId>exec-maven-plugin</artifactId>
         <version>3.5.0</version>
         <configuration>
-          <mainClass>com.rektifier.smoke.Main</mainClass>
+          <mainClass>com.rektifier.clienttest.Main</mainClass>
         </configuration>
       </plugin>
     </plugins>

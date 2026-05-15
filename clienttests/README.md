@@ -1,4 +1,4 @@
-# SDK smoketests
+# SDK client tests
 
 Standalone projects that exercise rektifier through real AWS SDK
 clients. These confirm rektifier's wire shape is interoperable with
@@ -33,29 +33,29 @@ just bootstrap-pg
 REKTIFIER_CONFIG=rektifier.toml.example cargo run --release --bin rektifier &
 
 # v1
-just smoke-java-v1
+just client-java-v1
 
 # v2
-just smoke-java-v2
+just client-java-v2
 ```
 
 Or directly:
 
 ```sh
-cd smoketests/java-sdk-v1
+cd clienttests/java-sdk-v1
 mvn -q compile exec:java
 ```
 
 Override the endpoint via env vars:
 
 ```sh
-REKTIFIER_URL=http://my-host:9000 just smoke-java-v1
+REKTIFIER_URL=http://my-host:9000 just client-java-v1
 ```
 
 ## Output
 
 ```
-=== rektifier-smoke-v2 ===
+=== rektifier-client-v2 ===
 endpoint = http://localhost:9000
 region   = us-east-1
 
@@ -78,3 +78,11 @@ Each `Main.java` has a `check("name", () -> ...)` harness. Add a
 new method that throws on failure (or calls `require(...)`) and
 register it with another `check(...)` call before `cleanup`.
 Keep cleanup updated so re-runs don't leak state.
+
+## Adding a new SDK
+
+Drop a new project under `clienttests/<lang>-sdk-<n>/` with whatever
+build tool that language uses (a `main` script for boto3, `go.mod`
++ `main.go` for Go, etc.). Mirror the check surface from the Java
+projects so the matrix stays comparable. Add a `just client-<lang>-<n>`
+recipe alongside the existing ones.

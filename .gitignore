@@ -1,5 +1,5 @@
 /target
-smoketests/*/target/
+clienttests/*/target/
 **/*.rs.bk
 .envrc.local
 .direnv/

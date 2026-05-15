@@ -1,4 +1,4 @@
-package com.rektifier.smoke;
+package com.rektifier.clienttest;
 
 import com.amazonaws.auth.AWSStaticCredentialsProvider;
 import com.amazonaws.auth.BasicAWSCredentials;
@@ -13,10 +13,10 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Smoke test for AWS SDK for Java v1 against rektifier. Confirms that
- * a real SDK client can connect to rektifier and round-trip every
- * end-to-end-supported op. Run after `just bootstrap-pg` and with
- * rektifier listening on :9000.
+ * Client test for AWS SDK for Java v1 against rektifier. Confirms
+ * that a real SDK client can connect to rektifier and round-trip
+ * every end-to-end-supported op. Run after `just bootstrap-pg` and
+ * with rektifier listening on :9000.
  *
  * Exits non-zero on any failure. Designed to be loud about which
  * specific op broke so divergences surface immediately.
@@ -29,7 +29,7 @@ public class Main {
 
     // Unique-per-run PK so re-runs don't trip over each other.
     private static final String RUN_TAG =
-        "smoke-v1-" + System.currentTimeMillis();
+        "client-v1-" + System.currentTimeMillis();
     private static final String USER_PK = RUN_TAG + "-user";
     private static final String QUERY_PK = RUN_TAG + "-events";
 
@@ -44,7 +44,7 @@ public class Main {
                 new BasicAWSCredentials("local", "local")))
             .build();
 
-        System.out.println("=== rektifier-smoke-v1 ===");
+        System.out.println("=== rektifier-client-v1 ===");
         System.out.println("endpoint = " + ENDPOINT);
         System.out.println("region   = " + REGION);
         System.out.println();
