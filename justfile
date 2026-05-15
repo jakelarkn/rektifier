@@ -154,3 +154,45 @@ bench-conditional: bench-build
     ./target/release/rekt-bench run --target direct-pg  --workload delete-all-old --concurrency 16 --duration 10s --warmup 2s --working-set 50000
     ./target/release/rekt-bench run --target rektifier  --workload delete-all-old --concurrency 16 --duration 10s --warmup 2s --working-set 50000
     ./target/release/rekt-bench run --target ddb-local  --workload delete-all-old --concurrency 16 --duration 10s --warmup 2s --working-set 50000
+
+# Bench: Query + Scan dispatch tree (PLAN-4 Q1-Q6). Scan workloads use
+# the `users` working set (sized in via --working-set). Query workloads
+# seed a 50-row composite partition under device_events on bench start.
+bench-query-scan: bench-build
+    ./target/release/rekt-bench setup-ddb-local
+    @echo "=========================================="
+    @echo "Scan (no limit) — full-table read"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target direct-pg  --workload scan-full --concurrency 16 --duration 10s --warmup 2s --working-set 1000
+    ./target/release/rekt-bench run --target rektifier  --workload scan-full --concurrency 16 --duration 10s --warmup 2s --working-set 1000
+    ./target/release/rekt-bench run --target ddb-local  --workload scan-full --concurrency 16 --duration 10s --warmup 2s --working-set 1000
+    @echo "=========================================="
+    @echo "Scan (limit=20) — single-page bounded scan"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target direct-pg  --workload scan-limit --concurrency 16 --duration 10s --warmup 2s --working-set 1000
+    ./target/release/rekt-bench run --target rektifier  --workload scan-limit --concurrency 16 --duration 10s --warmup 2s --working-set 1000
+    ./target/release/rekt-bench run --target ddb-local  --workload scan-limit --concurrency 16 --duration 10s --warmup 2s --working-set 1000
+    @echo "=========================================="
+    @echo "Scan (limit=50 + filter) — per-row Rust filter cost"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target direct-pg  --workload scan-filtered --concurrency 16 --duration 10s --warmup 2s --working-set 1000
+    ./target/release/rekt-bench run --target rektifier  --workload scan-filtered --concurrency 16 --duration 10s --warmup 2s --working-set 1000
+    ./target/release/rekt-bench run --target ddb-local  --workload scan-filtered --concurrency 16 --duration 10s --warmup 2s --working-set 1000
+    @echo "=========================================="
+    @echo "Query (pk-only, 50-row partition)"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target direct-pg  --workload query-pk-only --concurrency 16 --duration 10s --warmup 2s
+    ./target/release/rekt-bench run --target rektifier  --workload query-pk-only --concurrency 16 --duration 10s --warmup 2s
+    ./target/release/rekt-bench run --target ddb-local  --workload query-pk-only --concurrency 16 --duration 10s --warmup 2s
+    @echo "=========================================="
+    @echo "Query (sk range BETWEEN — 20 of 50 rows)"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target direct-pg  --workload query-sk-range --concurrency 16 --duration 10s --warmup 2s
+    ./target/release/rekt-bench run --target rektifier  --workload query-sk-range --concurrency 16 --duration 10s --warmup 2s
+    ./target/release/rekt-bench run --target ddb-local  --workload query-sk-range --concurrency 16 --duration 10s --warmup 2s
+    @echo "=========================================="
+    @echo "Query (pk + filter — Count vs ScannedCount divergence)"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target direct-pg  --workload query-filtered --concurrency 16 --duration 10s --warmup 2s
+    ./target/release/rekt-bench run --target rektifier  --workload query-filtered --concurrency 16 --duration 10s --warmup 2s
+    ./target/release/rekt-bench run --target ddb-local  --workload query-filtered --concurrency 16 --duration 10s --warmup 2s

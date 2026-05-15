@@ -164,6 +164,30 @@ enum Workload {
     /// the cost of the in-Rust condition evaluator on top of the
     /// slow-path RMW round-trip.
     UpdateTxCondBeginsWith,
+    /// `Scan` over the whole `users` table (working-set size in,
+    /// working-set size out). Measures the cost of full-table read
+    /// + JSON materialization per item.
+    ScanFull,
+    /// `Scan` with `Limit=20` over `users`. Measures the cost of a
+    /// bounded one-page scan (the common UX pattern). LEK is set
+    /// because the page fills exactly to Limit.
+    ScanLimit,
+    /// `Scan` with `Limit=50` + `FilterExpression: counter < :half`
+    /// (which on the seeded `users` working set is always true since
+    /// every row has `counter:0`). Measures the per-row Rust filter
+    /// cost in isolation. (Filter matches everything, so
+    /// `Count == ScannedCount == 50`.)
+    ScanFiltered,
+    /// `Query` against `device_events` (composite S+N) pk-only.
+    /// Returns all seeded SKs in the bench partition (50 rows).
+    QueryPkOnly,
+    /// `Query` against `device_events` with `ts BETWEEN :lo AND :hi`
+    /// — sort-key range hitting 20 of 50 seeded rows.
+    QuerySkRange,
+    /// `Query` pk-only + `FilterExpression: flag = :on`. Filter
+    /// always matches half the seeded rows. Measures filter +
+    /// Count/ScannedCount divergence under realistic load.
+    QueryFiltered,
 }
 
 impl Workload {
@@ -186,11 +210,36 @@ impl Workload {
             | Self::UpdateTxRmw
             | Self::UpdateTxAddNum
             | Self::UpdateTxAddSet
-            | Self::UpdateTxCondBeginsWith => true,
+            | Self::UpdateTxCondBeginsWith
+            // Scan workloads read the populated working set in `users`.
+            | Self::ScanFull
+            | Self::ScanLimit
+            | Self::ScanFiltered => true,
             Self::UpdateTxRmwHot => false, // seeds one hot key separately
+            // Query workloads seed a fresh composite partition; see
+            // `seed_query_partition` invoked from `run`.
+            Self::QueryPkOnly | Self::QuerySkRange | Self::QueryFiltered => false,
         }
     }
+
+    /// True if the workload needs a populated single-partition
+    /// composite-key table (`device_events`). Distinct from
+    /// `needs_working_set`, which seeds the hash-only `users` table.
+    fn needs_query_partition(self) -> bool {
+        matches!(
+            self,
+            Self::QueryPkOnly | Self::QuerySkRange | Self::QueryFiltered
+        )
+    }
 }
+
+/// Fixed partition key used by all Query workloads. The seeder
+/// populates `BENCH_QUERY_PARTITION_SIZE` rows under this PK in
+/// `device_events` so a Query call returns the whole partition (or
+/// a sk-bounded subset).
+const BENCH_QUERY_PK: &str = "q-bench-pk";
+const BENCH_QUERY_PARTITION_SIZE: usize = 50;
+const BENCH_QUERY_TABLE: &str = "device_events";
 
 fn parse_dur(s: &str) -> Result<Duration, String> {
     humantime::parse_duration(s).map_err(|e| e.to_string())
@@ -250,6 +299,32 @@ trait Target: Send + Sync {
         prefix: &str,
         marker: &str,
     ) -> Result<()>;
+
+    /// `Scan` over `users` with no filter or limit.
+    async fn scan_full(&self) -> Result<()>;
+
+    /// `Scan` over `users` with `Limit=20`.
+    async fn scan_limit(&self, limit: u32) -> Result<()>;
+
+    /// `Scan` over `users` with `Limit=50` + filter that matches
+    /// all seeded rows (`counter < :half`, where seeded counter=0).
+    async fn scan_filtered(&self, limit: u32) -> Result<()>;
+
+    /// `Query` against `device_events`: `device_id = :pk`. Returns
+    /// the entire partition (`BENCH_QUERY_PARTITION_SIZE` rows).
+    async fn query_pk_only(&self, pk: &str) -> Result<()>;
+
+    /// `Query` with `device_id = :pk AND ts BETWEEN :lo AND :hi`.
+    async fn query_sk_range(&self, pk: &str, lo: i64, hi: i64) -> Result<()>;
+
+    /// `Query` with `device_id = :pk` + `FilterExpression: flag = :on`.
+    async fn query_filtered(&self, pk: &str) -> Result<()>;
+
+    /// Seed `n` rows in a single composite-key partition for the
+    /// Query workloads. Called once at bench startup. Each row gets a
+    /// `flag` attribute alternating "on"/"off" so `QueryFiltered`
+    /// drops about half.
+    async fn seed_query_partition(&self, pk: &str, n: usize) -> Result<()>;
 }
 
 // (We pull `async-trait` only as a transitive macro through reqwest's tower;
@@ -418,6 +493,78 @@ impl Target for HttpTarget {
             "ConditionExpression": "begins_with(#n, :p)",
         });
         self.post("DynamoDB_20120810.UpdateItem", &body).await
+    }
+
+    async fn scan_full(&self) -> Result<()> {
+        let body = json!({"TableName": self.table});
+        self.post("DynamoDB_20120810.Scan", &body).await
+    }
+
+    async fn scan_limit(&self, limit: u32) -> Result<()> {
+        let body = json!({"TableName": self.table, "Limit": limit});
+        self.post("DynamoDB_20120810.Scan", &body).await
+    }
+
+    async fn scan_filtered(&self, limit: u32) -> Result<()> {
+        let body = json!({
+            "TableName": self.table,
+            "Limit": limit,
+            "FilterExpression": "#c < :half",
+            "ExpressionAttributeNames": {"#c": "counter"},
+            "ExpressionAttributeValues": {":half": {"N": "1"}},
+        });
+        self.post("DynamoDB_20120810.Scan", &body).await
+    }
+
+    async fn query_pk_only(&self, pk: &str) -> Result<()> {
+        let body = json!({
+            "TableName": BENCH_QUERY_TABLE,
+            "KeyConditionExpression": "device_id = :pk",
+            "ExpressionAttributeValues": {":pk": {"S": pk}},
+        });
+        self.post("DynamoDB_20120810.Query", &body).await
+    }
+
+    async fn query_sk_range(&self, pk: &str, lo: i64, hi: i64) -> Result<()> {
+        let body = json!({
+            "TableName": BENCH_QUERY_TABLE,
+            "KeyConditionExpression": "device_id = :pk AND ts BETWEEN :lo AND :hi",
+            "ExpressionAttributeValues": {
+                ":pk": {"S": pk},
+                ":lo": {"N": lo.to_string()},
+                ":hi": {"N": hi.to_string()},
+            },
+        });
+        self.post("DynamoDB_20120810.Query", &body).await
+    }
+
+    async fn query_filtered(&self, pk: &str) -> Result<()> {
+        let body = json!({
+            "TableName": BENCH_QUERY_TABLE,
+            "KeyConditionExpression": "device_id = :pk",
+            "FilterExpression": "flag = :on",
+            "ExpressionAttributeValues": {
+                ":pk": {"S": pk},
+                ":on": {"S": "on"},
+            },
+        });
+        self.post("DynamoDB_20120810.Query", &body).await
+    }
+
+    async fn seed_query_partition(&self, pk: &str, n: usize) -> Result<()> {
+        // Seed `n` rows in (device_id=pk, ts=0..n) with alternating
+        // flag values so QueryFiltered drops about half.
+        for i in 0..n {
+            let flag = if i % 2 == 0 { "on" } else { "off" };
+            let item = json!({
+                "device_id": {"S": pk},
+                "ts": {"N": i.to_string()},
+                "flag": {"S": flag},
+            });
+            let body = json!({"TableName": BENCH_QUERY_TABLE, "Item": item});
+            self.post("DynamoDB_20120810.PutItem", &body).await?;
+        }
+        Ok(())
     }
 }
 
@@ -789,6 +936,145 @@ impl Target for PgTarget {
         tx.commit().await.context("commit")?;
         Ok(())
     }
+
+    // ===== Scan + Query =====================================================
+    //
+    // direct-pg mirrors the actual SQL rektifier emits — see
+    // `crates/rekt-storage-libpq/src/{scan,query}.rs`. The bench
+    // intentionally drops result rows (only timing) — same as the
+    // other PgTarget methods.
+
+    async fn scan_full(&self) -> Result<()> {
+        let client = self.pool.get().await.context("pool get")?;
+        let sql = format!(
+            "SELECT data FROM \"{0}\" ORDER BY id LIMIT $1",
+            self.table
+        );
+        let stmt = client
+            .prepare_typed_cached(&sql, &[Type::INT8])
+            .await
+            .context("prepare scan_full")?;
+        // Match rektifier's soft default; the working set is sized
+        // smaller so we never hit it.
+        let _rows = client
+            .query(&stmt, &[&1000_i64])
+            .await
+            .context("execute scan_full")?;
+        Ok(())
+    }
+
+    async fn scan_limit(&self, limit: u32) -> Result<()> {
+        let client = self.pool.get().await.context("pool get")?;
+        let sql = format!(
+            "SELECT data FROM \"{0}\" ORDER BY id LIMIT $1",
+            self.table
+        );
+        let stmt = client
+            .prepare_typed_cached(&sql, &[Type::INT8])
+            .await
+            .context("prepare scan_limit")?;
+        let _rows = client
+            .query(&stmt, &[&(limit as i64)])
+            .await
+            .context("execute scan_limit")?;
+        Ok(())
+    }
+
+    async fn scan_filtered(&self, limit: u32) -> Result<()> {
+        // direct-pg can't easily simulate per-row Rust filter cost
+        // since it would be running in the worker, not the PG client.
+        // We emit the same un-filtered SELECT — the comparison shows
+        // the per-row filter overhead rektifier pays *on top of* the
+        // same SQL.
+        self.scan_limit(limit).await
+    }
+
+    async fn query_pk_only(&self, pk: &str) -> Result<()> {
+        let client = self.pool.get().await.context("pool get")?;
+        let sql = format!(
+            "SELECT doc FROM \"{0}\" WHERE device_id = $1 ORDER BY ts ASC LIMIT $2",
+            BENCH_QUERY_TABLE
+        );
+        let stmt = client
+            .prepare_typed_cached(&sql, &[Type::TEXT, Type::INT8])
+            .await
+            .context("prepare query_pk_only")?;
+        let _rows = client
+            .query(&stmt, &[&pk, &1000_i64])
+            .await
+            .context("execute query_pk_only")?;
+        Ok(())
+    }
+
+    async fn query_sk_range(&self, pk: &str, lo: i64, hi: i64) -> Result<()> {
+        let client = self.pool.get().await.context("pool get")?;
+        let sql = format!(
+            "SELECT doc FROM \"{0}\" \
+             WHERE device_id = $1 AND ts BETWEEN $2::numeric AND $3::numeric \
+             ORDER BY ts ASC LIMIT $4",
+            BENCH_QUERY_TABLE
+        );
+        let stmt = client
+            .prepare_typed_cached(
+                &sql,
+                &[Type::TEXT, Type::TEXT, Type::TEXT, Type::INT8],
+            )
+            .await
+            .context("prepare query_sk_range")?;
+        let lo_s = lo.to_string();
+        let hi_s = hi.to_string();
+        let _rows = client
+            .query(&stmt, &[&pk, &lo_s, &hi_s, &1000_i64])
+            .await
+            .context("execute query_sk_range")?;
+        Ok(())
+    }
+
+    async fn query_filtered(&self, pk: &str) -> Result<()> {
+        // Like scan_filtered: per-row filter cost is in the rektifier
+        // dispatcher, not in the PG client. Emit the same SQL as
+        // pk_only — the bench reports show what rektifier pays *on
+        // top of* the same backing query.
+        self.query_pk_only(pk).await
+    }
+
+    async fn seed_query_partition(&self, pk: &str, n: usize) -> Result<()> {
+        // Best-effort cleanup so re-runs start from a known state, then
+        // populate. Both INSERTs go through the same path as
+        // rektifier's PG INSERT.
+        let client = self.pool.get().await.context("pool get")?;
+        let delete_sql = format!("DELETE FROM \"{0}\" WHERE device_id = $1", BENCH_QUERY_TABLE);
+        let del_stmt = client
+            .prepare_typed_cached(&delete_sql, &[Type::TEXT])
+            .await
+            .context("prepare seed cleanup")?;
+        client
+            .execute(&del_stmt, &[&pk])
+            .await
+            .context("execute seed cleanup")?;
+
+        let insert_sql = format!(
+            "INSERT INTO \"{0}\" (doc) VALUES ($1)",
+            BENCH_QUERY_TABLE
+        );
+        let ins_stmt = client
+            .prepare_typed_cached(&insert_sql, &[Type::JSONB])
+            .await
+            .context("prepare seed insert")?;
+        for i in 0..n {
+            let flag = if i % 2 == 0 { "on" } else { "off" };
+            let item = serde_json::json!({
+                "device_id": {"S": pk},
+                "ts": {"N": i.to_string()},
+                "flag": {"S": flag},
+            });
+            client
+                .execute(&ins_stmt, &[&Json(&item)])
+                .await
+                .context("execute seed insert")?;
+        }
+        Ok(())
+    }
 }
 
 impl PgTarget {
@@ -934,6 +1220,16 @@ async fn run(args: RunArgs) -> Result<()> {
             .put("bench-hot", &payload)
             .await
             .context("populating hot key")?;
+    }
+    if args.workload.needs_query_partition() {
+        eprintln!(
+            "seeding query partition `{}` with {} composite rows on `{}`...",
+            BENCH_QUERY_PK, BENCH_QUERY_PARTITION_SIZE, BENCH_QUERY_TABLE
+        );
+        target
+            .seed_query_partition(BENCH_QUERY_PK, BENCH_QUERY_PARTITION_SIZE)
+            .await
+            .context("seeding query partition")?;
     }
 
     // Build per-worker state.
@@ -1139,6 +1435,15 @@ async fn dispatch_op(
             let marker = format!("m{counter}");
             target.update_slow_cond_begins_with(&pk, "ali", &marker).await
         }
+        Workload::ScanFull => target.scan_full().await,
+        Workload::ScanLimit => target.scan_limit(20).await,
+        Workload::ScanFiltered => target.scan_filtered(50).await,
+        Workload::QueryPkOnly => target.query_pk_only(BENCH_QUERY_PK).await,
+        Workload::QuerySkRange => {
+            // 20-wide range hitting the middle of the seeded partition.
+            target.query_sk_range(BENCH_QUERY_PK, 15, 34).await
+        }
+        Workload::QueryFiltered => target.query_filtered(BENCH_QUERY_PK).await,
     }
 }
 
@@ -1215,6 +1520,12 @@ fn workload_label(w: Workload) -> &'static str {
         Workload::UpdateTxAddNum => "UpdateItem-tx-add-num (5)",
         Workload::UpdateTxAddSet => "UpdateItem-tx-add-set (5)",
         Workload::UpdateTxCondBeginsWith => "UpdateItem-tx-cond-begins-with (4e)",
+        Workload::ScanFull => "Scan (no limit)",
+        Workload::ScanLimit => "Scan (limit=20)",
+        Workload::ScanFiltered => "Scan (limit=50 + filter)",
+        Workload::QueryPkOnly => "Query (pk-only)",
+        Workload::QuerySkRange => "Query (sk range)",
+        Workload::QueryFiltered => "Query (pk + filter)",
     }
 }
 
