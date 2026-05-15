@@ -4256,3 +4256,79 @@ fn diff_batch_write_unprocessed_items_always_empty() {
     assert_eq!(r_ours["UnprocessedItems"], json!({}));
     delete_both("users", "{\"id\":{\"S\":\"bw-d-uk\"}}");
 }
+
+// ===== BatchWriteItem mix + multi-table (B5) ==================================
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_write_mixed_put_and_delete() {
+    ensure_users_table();
+    // Pre-seed rows on both endpoints that we will delete.
+    for id in ["bw-mx-d1","bw-mx-d2"] {
+        let item = format!("{{\"id\":{{\"S\":\"{id}\"}},\"label\":{{\"S\":\"old\"}}}}");
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",&item]);
+    }
+    let req_items = "{\"users\":[\
+        {\"PutRequest\":{\"Item\":{\"id\":{\"S\":\"bw-mx-n1\"},\"label\":{\"S\":\"new1\"}}}},\
+        {\"DeleteRequest\":{\"Key\":{\"id\":{\"S\":\"bw-mx-d1\"}}}},\
+        {\"DeleteRequest\":{\"Key\":{\"id\":{\"S\":\"bw-mx-d2\"}}}},\
+        {\"PutRequest\":{\"Item\":{\"id\":{\"S\":\"bw-mx-n2\"},\"label\":{\"S\":\"new2\"}}}}\
+    ]}";
+    let _ = aws(REF, &["dynamodb","batch-write-item","--request-items",req_items]);
+    let _ = aws(OURS, &["dynamodb","batch-write-item","--request-items",req_items]);
+
+    // Parity: new1 / new2 present on both, d1 / d2 absent on both.
+    for id in ["bw-mx-n1","bw-mx-n2","bw-mx-d1","bw-mx-d2"] {
+        let key = format!("{{\"id\":{{\"S\":\"{id}\"}}}}");
+        let g_ref = aws(REF, &["dynamodb","get-item","--table-name","users","--key",&key]);
+        let g_ours = aws(OURS, &["dynamodb","get-item","--table-name","users","--key",&key]);
+        assert_eq!(g_ref, g_ours, "parity drift on id={id}");
+    }
+    for id in ["bw-mx-n1","bw-mx-n2"] {
+        delete_both("users", &format!("{{\"id\":{{\"S\":\"{id}\"}}}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_write_multi_table_fan_out() {
+    ensure_users_table();
+    ensure_device_events_table();
+    let req_items = "{\"users\":[\
+        {\"PutRequest\":{\"Item\":{\"id\":{\"S\":\"bw-mt-d-u\"},\"label\":{\"S\":\"u\"}}}}\
+    ],\"device_events\":[\
+        {\"PutRequest\":{\"Item\":{\"device_id\":{\"S\":\"bw-mt-d-dev\"},\"ts\":{\"N\":\"1\"},\"flag\":{\"S\":\"on\"}}}}\
+    ]}";
+    let _ = aws(REF, &["dynamodb","batch-write-item","--request-items",req_items]);
+    let _ = aws(OURS, &["dynamodb","batch-write-item","--request-items",req_items]);
+
+    let g_ref_u = aws(REF, &["dynamodb","get-item","--table-name","users","--key","{\"id\":{\"S\":\"bw-mt-d-u\"}}"]);
+    let g_ours_u = aws(OURS, &["dynamodb","get-item","--table-name","users","--key","{\"id\":{\"S\":\"bw-mt-d-u\"}}"]);
+    assert_eq!(g_ref_u, g_ours_u);
+    let g_ref_e = aws(REF, &["dynamodb","get-item","--table-name","device_events","--key","{\"device_id\":{\"S\":\"bw-mt-d-dev\"},\"ts\":{\"N\":\"1\"}}"]);
+    let g_ours_e = aws(OURS, &["dynamodb","get-item","--table-name","device_events","--key","{\"device_id\":{\"S\":\"bw-mt-d-dev\"},\"ts\":{\"N\":\"1\"}}"]);
+    assert_eq!(g_ref_e, g_ours_e);
+
+    delete_both("users", "{\"id\":{\"S\":\"bw-mt-d-u\"}}");
+    delete_both_composite("device_events","device_id","bw-mt-d-dev","ts","{\"N\":\"1\"}");
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_write_delete_of_missing_row_is_noop() {
+    ensure_users_table();
+    let req_items = "{\"users\":[\
+        {\"DeleteRequest\":{\"Key\":{\"S\"=>\"will-fail-to-parse\"}}}\
+    ]}";
+    // ^ deliberately malformed JSON so the loose parse hits zero. We
+    // want valid-but-missing-row to be a no-op; do a real call:
+    let _ = req_items; // unused
+    let valid = "{\"users\":[\
+        {\"DeleteRequest\":{\"Key\":{\"id\":{\"S\":\"bw-d-never-existed\"}}}}\
+    ]}";
+    let r_ref = aws(REF, &["dynamodb","batch-write-item","--request-items",valid]);
+    let r_ours = aws(OURS, &["dynamodb","batch-write-item","--request-items",valid]);
+    assert_eq!(r_ref["UnprocessedItems"], json!({}));
+    assert_eq!(r_ours["UnprocessedItems"], json!({}));
+}

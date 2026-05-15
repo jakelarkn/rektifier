@@ -5442,3 +5442,167 @@ async fn batch_write_put_wrong_pk_type_rejected() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+// ===== BatchWriteItem Put+Delete mix + multi-table (B5) =======================
+
+#[tokio::test]
+async fn batch_write_mixed_put_and_delete_single_table() {
+    let app = app();
+    // Pre-seed two rows that we'll delete.
+    put_item(&app, "users", json!({"id":{"S":"bw-mx-old1"},"label":{"S":"a"}})).await;
+    put_item(&app, "users", json!({"id":{"S":"bw-mx-old2"},"label":{"S":"b"}})).await;
+
+    let req_items = json!({"users":[
+        {"PutRequest":{"Item":{"id":{"S":"bw-mx-new1"},"label":{"S":"X"}}}},
+        {"DeleteRequest":{"Key":{"id":{"S":"bw-mx-old1"}}}},
+        {"DeleteRequest":{"Key":{"id":{"S":"bw-mx-old2"}}}},
+        {"PutRequest":{"Item":{"id":{"S":"bw-mx-new2"},"label":{"S":"Y"}}}}
+    ]});
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems": req_items}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // new1, new2 present; old1, old2 gone.
+    let n1 = get_item_value(&app, "users", json!({"id":{"S":"bw-mx-new1"}})).await;
+    assert_eq!(n1["Item"]["label"]["S"].as_str(), Some("X"));
+    let n2 = get_item_value(&app, "users", json!({"id":{"S":"bw-mx-new2"}})).await;
+    assert_eq!(n2["Item"]["label"]["S"].as_str(), Some("Y"));
+    let g_old1 = get_item_value(&app, "users", json!({"id":{"S":"bw-mx-old1"}})).await;
+    assert!(g_old1.get("Item").is_none());
+    let g_old2 = get_item_value(&app, "users", json!({"id":{"S":"bw-mx-old2"}})).await;
+    assert!(g_old2.get("Item").is_none());
+}
+
+#[tokio::test]
+async fn batch_write_delete_of_missing_row_is_noop() {
+    let app = app();
+    // No pre-seed; delete a key that doesn't exist.
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{"users":[
+                {"DeleteRequest":{"Key":{"id":{"S":"never-existed"}}}}
+            ]}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn batch_write_rejects_put_plus_delete_of_same_key() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{"users":[
+                {"PutRequest":{"Item":{"id":{"S":"bw-mx-clash"},"label":{"S":"x"}}}},
+                {"DeleteRequest":{"Key":{"id":{"S":"bw-mx-clash"}}}}
+            ]}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["message"].as_str().unwrap().contains("duplicate"));
+}
+
+#[tokio::test]
+async fn batch_write_multi_table_fan_out() {
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"bw-mt-u-del"},"label":{"S":"x"}})).await;
+    let req_items = json!({
+        "users":[
+            {"PutRequest":{"Item":{"id":{"S":"bw-mt-u-new"},"label":{"S":"new"}}}},
+            {"DeleteRequest":{"Key":{"id":{"S":"bw-mt-u-del"}}}}
+        ],
+        "device_events":[
+            {"PutRequest":{"Item":{
+                "device_id":{"S":"bw-mt-d"},"ts":{"N":"1"},"flag":{"S":"on"}
+            }}}
+        ]
+    });
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems": req_items}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // users: new present, del gone.
+    let n = get_item_value(&app, "users", json!({"id":{"S":"bw-mt-u-new"}})).await;
+    assert_eq!(n["Item"]["label"]["S"].as_str(), Some("new"));
+    let d = get_item_value(&app, "users", json!({"id":{"S":"bw-mt-u-del"}})).await;
+    assert!(d.get("Item").is_none());
+    // device_events: row present.
+    let e = get_item_value(
+        &app,
+        "device_events",
+        json!({"device_id":{"S":"bw-mt-d"},"ts":{"N":"1"}}),
+    )
+    .await;
+    assert_eq!(e["Item"]["flag"]["S"].as_str(), Some("on"));
+}
+
+#[tokio::test]
+async fn batch_write_multi_table_unknown_table_fails_whole_request() {
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"bw-mt-fail"},"label":{"S":"alive"}})).await;
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{
+                "users":[
+                    {"PutRequest":{"Item":{"id":{"S":"bw-mt-should-not-write"},"label":{"S":"nope"}}}}
+                ],
+                "no-such-table":[
+                    {"PutRequest":{"Item":{"id":{"S":"x"}}}}
+                ]
+            }}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // No partial write should have happened — translator rejects
+    // before any SQL fires.
+    let pre = get_item_value(&app, "users", json!({"id":{"S":"bw-mt-should-not-write"}})).await;
+    assert!(pre.get("Item").is_none(),
+        "translator must reject the whole batch before issuing SQL");
+    // The pre-existing row should still be alive (no rollback artifact).
+    let alive = get_item_value(&app, "users", json!({"id":{"S":"bw-mt-fail"}})).await;
+    assert_eq!(alive["Item"]["label"]["S"].as_str(), Some("alive"));
+}
+
+#[tokio::test]
+async fn batch_write_multi_table_total_cap_summed() {
+    let app = app();
+    // 13 users + 13 events = 26 > 25.
+    let mut us = Vec::new();
+    let mut es = Vec::new();
+    for n in 0..13 {
+        us.push(json!({"PutRequest":{"Item":{"id":{"S":format!("bw-tc-u{n}")}}}}));
+        es.push(json!({"PutRequest":{"Item":{
+            "device_id":{"S":format!("bw-tc-d{n}")},"ts":{"N":"1"}
+        }}}));
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{"users": us, "device_events": es}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["message"].as_str().unwrap().contains("Too many"));
+}
