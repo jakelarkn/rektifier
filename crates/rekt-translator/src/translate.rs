@@ -8,7 +8,7 @@ use crate::checks::{
 use crate::classify::classify_condition;
 use crate::error::{map_substitute_for_condition, TranslateError};
 use crate::key_condition::extract_key_condition;
-use crate::keys::{extract_key, reject_extra_key_attrs, KeyRole};
+use crate::keys::{extract_key_pair, reject_extra_key_attrs};
 use crate::paging::{decode_esk, decode_scan_esk, validate_limit};
 use crate::projection::resolve_select_and_projection;
 use crate::plan::{
@@ -36,11 +36,7 @@ pub fn translate_put_item(
     //    The unconditional fast path ignores them (PG derives via
     //    GENERATED ALWAYS AS), but the conditional / ALL_OLD paths need
     //    them to look up the pre-update row.
-    let pk = extract_key(&req.item, &schema.pk_attr, schema.pk_type, KeyRole::Pk)?;
-    let sk = match (&schema.sk_attr, schema.sk_type) {
-        (Some(attr), Some(t)) => Some(extract_key(&req.item, attr, t, KeyRole::Sk)?),
-        _ => None,
-    };
+    let (pk, sk) = extract_key_pair(&req.item, schema)?;
 
     // 2. Resolve ReturnValues. PutItem accepts only NONE and ALL_OLD.
     let return_values = resolve_put_delete_return_values(req.return_values.as_deref(), "PutItem")?;
@@ -74,11 +70,7 @@ pub fn translate_get_item(
     req: &GetItemRequest,
     schema: &TableSchema,
 ) -> Result<GetItemPlan, TranslateError> {
-    let pk = extract_key(&req.key, &schema.pk_attr, schema.pk_type, KeyRole::Pk)?;
-    let sk = match (&schema.sk_attr, schema.sk_type) {
-        (Some(attr), Some(t)) => Some(extract_key(&req.key, attr, t, KeyRole::Sk)?),
-        _ => None,
-    };
+    let (pk, sk) = extract_key_pair(&req.key, schema)?;
     reject_extra_key_attrs(&req.key, schema)?;
     Ok(GetItemPlan { pk, sk })
 }
@@ -88,11 +80,7 @@ pub fn translate_delete_item(
     req: &DeleteItemRequest,
     schema: &TableSchema,
 ) -> Result<DeleteItemPlan, TranslateError> {
-    let pk = extract_key(&req.key, &schema.pk_attr, schema.pk_type, KeyRole::Pk)?;
-    let sk = match (&schema.sk_attr, schema.sk_type) {
-        (Some(attr), Some(t)) => Some(extract_key(&req.key, attr, t, KeyRole::Sk)?),
-        _ => None,
-    };
+    let (pk, sk) = extract_key_pair(&req.key, schema)?;
     reject_extra_key_attrs(&req.key, schema)?;
 
     let return_values =
@@ -140,11 +128,7 @@ pub fn translate_update_item(
     // 2. Validate the Key against the schema (same machinery as GetItem /
     //    DeleteItem). Caller must supply pk (and sk if composite); no
     //    foreign attributes in Key.
-    let pk = extract_key(&req.key, &schema.pk_attr, schema.pk_type, KeyRole::Pk)?;
-    let sk = match (&schema.sk_attr, schema.sk_type) {
-        (Some(attr), Some(t)) => Some(extract_key(&req.key, attr, t, KeyRole::Sk)?),
-        _ => None,
-    };
+    let (pk, sk) = extract_key_pair(&req.key, schema)?;
     reject_extra_key_attrs(&req.key, schema)?;
 
     // 3. Parse + resolve the UpdateExpression. ExpressionAttributeNames /
@@ -399,13 +383,8 @@ pub fn translate_batch_get_item(
         let mut seen: HashSet<(KeyValue, Option<KeyValue>)> =
             HashSet::with_capacity(ka.keys.len());
         for key_item in &ka.keys {
-            let pk = extract_key(key_item, &schema.pk_attr, schema.pk_type, KeyRole::Pk)?;
-            let sk = match (&schema.sk_attr, schema.sk_type) {
-                (Some(attr), Some(t)) => Some(extract_key(key_item, attr, t, KeyRole::Sk)?),
-                _ => None,
-            };
+            let tuple = extract_key_pair(key_item, schema)?;
             reject_extra_key_attrs(key_item, schema)?;
-            let tuple = (pk, sk);
             if !seen.insert(tuple.clone()) {
                 return Err(TranslateError::DuplicateKeyInBatch);
             }
@@ -474,12 +453,7 @@ pub fn translate_batch_write_item(
                 (Some(p), None) => {
                     // Validate the Item contains the right key attrs at
                     // the right types — same machinery PutItem uses.
-                    let pk =
-                        extract_key(&p.item, &schema.pk_attr, schema.pk_type, KeyRole::Pk)?;
-                    let sk = match (&schema.sk_attr, schema.sk_type) {
-                        (Some(attr), Some(t)) => Some(extract_key(&p.item, attr, t, KeyRole::Sk)?),
-                        _ => None,
-                    };
+                    let (pk, sk) = extract_key_pair(&p.item, schema)?;
                     let tuple = (pk.clone(), sk.clone());
                     if !seen.insert(tuple) {
                         return Err(TranslateError::DuplicateKeyInBatch);
@@ -493,11 +467,7 @@ pub fn translate_batch_write_item(
                     });
                 }
                 (None, Some(d)) => {
-                    let pk = extract_key(&d.key, &schema.pk_attr, schema.pk_type, KeyRole::Pk)?;
-                    let sk = match (&schema.sk_attr, schema.sk_type) {
-                        (Some(attr), Some(t)) => Some(extract_key(&d.key, attr, t, KeyRole::Sk)?),
-                        _ => None,
-                    };
+                    let (pk, sk) = extract_key_pair(&d.key, schema)?;
                     reject_extra_key_attrs(&d.key, schema)?;
                     let tuple = (pk.clone(), sk.clone());
                     if !seen.insert(tuple) {
