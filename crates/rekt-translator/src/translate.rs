@@ -9,7 +9,7 @@ use crate::classify::classify_condition;
 use crate::error::{map_substitute_for_condition, TranslateError};
 use crate::key_condition::extract_key_condition;
 use crate::keys::{extract_key, reject_extra_key_attrs, KeyRole};
-use crate::paging::{decode_esk, validate_limit};
+use crate::paging::{decode_esk, decode_scan_esk, validate_limit};
 use crate::plan::{
     ConditionPlan, DeleteItemPlan, GetItemPlan, PutItemPlan, QueryPlan, ReturnValuesMode,
     ScanPlan, UpdateItemPlan,
@@ -253,12 +253,17 @@ pub fn translate_query(
         schema,
     )?;
 
+    // ScanIndexForward defaults to true (DDB default). Q5 honors
+    // false → DESC sort + flipped ESK comparison.
+    let forward = req.scan_index_forward.unwrap_or(true);
+
     Ok(QueryPlan {
         pk: bounds.pk,
         sk_condition: bounds.sk_condition,
         limit,
         esk_sk,
         filter,
+        forward,
     })
 }
 
@@ -267,9 +272,7 @@ pub fn translate_scan(
     req: &ScanRequest,
     schema: &TableSchema,
 ) -> Result<ScanPlan, TranslateError> {
-    // Q4 doesn't consult the schema; Q5 will (filter validation, etc).
-    let _ = schema;
-    // Q4 rejects every advanced feature; Q5/Q7 lift them in order.
+    // Reject features deferred per PLAN-4 (D4 / D5 / Q7).
     if req.index_name.is_some() {
         return Err(TranslateError::ScanFeatureNotSupported {
             what: "IndexName (GSI/LSI scan)",
@@ -280,7 +283,40 @@ pub fn translate_scan(
             what: "Segment / TotalSegments (parallel scan)",
         });
     }
-    Ok(ScanPlan {})
+
+    let limit = req.limit.map(validate_limit).transpose()?;
+
+    let (esk_pk, esk_sk) = match &req.exclusive_start_key {
+        None => (None, None),
+        Some(esk) => {
+            let (pk, sk) = decode_scan_esk(esk, schema)?;
+            (Some(pk), sk)
+        }
+    };
+
+    let empty_names: BTreeMap<String, String> = BTreeMap::new();
+    let empty_values: BTreeMap<String, AttributeValue> = BTreeMap::new();
+    let names = req
+        .expression_attribute_names
+        .as_ref()
+        .unwrap_or(&empty_names);
+    let values = req
+        .expression_attribute_values
+        .as_ref()
+        .unwrap_or(&empty_values);
+    let filter = translate_condition(
+        req.filter_expression.as_deref(),
+        names,
+        values,
+        schema,
+    )?;
+
+    Ok(ScanPlan {
+        limit,
+        esk_pk,
+        esk_sk,
+        filter,
+    })
 }
 
 /// Shared `ReturnValues` resolver for PutItem and DeleteItem. DDB accepts

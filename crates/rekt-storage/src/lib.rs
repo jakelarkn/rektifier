@@ -325,6 +325,7 @@ pub trait Backend: Send + Sync + 'static {
     /// L-th row's keys, and the caller passes that back as the next
     /// ESK. `count` and `scanned_count` are equal until Q3 adds
     /// FilterExpression.
+    #[allow(clippy::too_many_arguments)]
     async fn query_raw(
         &self,
         shape: &TableShape<'_>,
@@ -333,21 +334,25 @@ pub trait Backend: Send + Sync + 'static {
         limit: Option<u32>,
         exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
         filter: Option<FilterEvalFn<'_>>,
+        forward: bool,
     ) -> Result<QueryOutcome, BackendError>;
 
     /// Scan — unbounded read over the whole table.
     ///
-    /// Emits `SELECT <jsonb_col> FROM <table> ORDER BY <pk_col>
-    /// [, <sk_col>] LIMIT $L`. Q4's signature is minimal — Q5 adds
-    /// `filter`, `limit`, `exclusive_start_key`. The dispatcher
-    /// applies a soft cap of 1000 items pending Q5.
-    ///
-    /// Returns every row in `items`. `count` and `scanned_count` are
-    /// equal until Q5 adds FilterExpression. `last_evaluated_key`
-    /// always `None` in Q4.
+    /// Emits `SELECT <jsonb_col> FROM <table>
+    ///   [WHERE (<pk_col>, <sk_col>) > ($esk_pk, $esk_sk)]
+    ///   ORDER BY <pk_col> [, <sk_col>] LIMIT $L+1`.
+    /// Reads `L+1` rows so the backend can populate
+    /// `last_evaluated_key` from the L-th row when more rows remain.
+    /// Filter (when supplied) runs per row after the read — same
+    /// pattern as Query, with `scanned_count` (pre-filter) vs `count`
+    /// (post-filter).
     async fn scan_raw(
         &self,
         shape: &TableShape<'_>,
+        filter: Option<FilterEvalFn<'_>>,
+        limit: Option<u32>,
+        exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
     ) -> Result<ScanOutcome, BackendError>;
 }
 

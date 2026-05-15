@@ -301,6 +301,7 @@ impl Backend for MockBackend {
         limit: Option<u32>,
         exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
         filter: Option<FilterEvalFn<'_>>,
+        forward: bool,
     ) -> Result<QueryOutcome, BackendError> {
         let pk_value = kv_to_string(pk);
 
@@ -323,15 +324,28 @@ impl Backend for MockBackend {
             .collect();
 
         if let Some(sk_type) = shape.sk_type {
-            hits.sort_by(|a, b| compare_sk_strings(&a.0, &b.0, sk_type));
+            hits.sort_by(|a, b| {
+                let cmp = compare_sk_strings(&a.0, &b.0, sk_type);
+                if forward {
+                    cmp
+                } else {
+                    cmp.reverse()
+                }
+            });
         }
 
-        // Apply ESK: keep rows strictly greater than esk_sk.
+        // Apply ESK: keep rows strictly greater (forward) or less
+        // (descending) than esk_sk.
         if let Some((_, Some(esk_sk))) = exclusive_start_key {
             if let Some(sk_type) = shape.sk_type {
                 let cutoff = kv_to_string(esk_sk);
                 hits.retain(|(sk, _)| {
-                    compare_sk_strings(sk, &cutoff, sk_type) == std::cmp::Ordering::Greater
+                    let cmp = compare_sk_strings(sk, &cutoff, sk_type);
+                    if forward {
+                        cmp == std::cmp::Ordering::Greater
+                    } else {
+                        cmp == std::cmp::Ordering::Less
+                    }
                 });
             }
         }
@@ -381,11 +395,10 @@ impl Backend for MockBackend {
     async fn scan_raw(
         &self,
         shape: &TableShape<'_>,
+        filter: Option<FilterEvalFn<'_>>,
+        limit: Option<u32>,
+        exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
     ) -> Result<ScanOutcome, BackendError> {
-        // Collect every row in this table from the mock store. Sort by
-        // pk then sk per the PgBackend ORDER BY, so dispatch tests can
-        // assert deterministic order even though DDB Scan order is
-        // officially undefined.
         let store = self.store.lock().unwrap();
         let mut hits: Vec<(String, String, serde_json::Value)> = store
             .iter()
@@ -393,7 +406,6 @@ impl Backend for MockBackend {
             .map(|((_, pk, sk), v)| (pk.clone(), sk.clone(), v.clone()))
             .collect();
         hits.sort_by(|a, b| {
-            // PK ordering uses the table's pk_type; same for sk.
             let pk_cmp = compare_sk_strings(&a.0, &b.0, shape.pk_type);
             if pk_cmp != std::cmp::Ordering::Equal {
                 return pk_cmp;
@@ -403,14 +415,69 @@ impl Backend for MockBackend {
                 None => std::cmp::Ordering::Equal,
             }
         });
-        let items: Vec<serde_json::Value> =
-            hits.into_iter().map(|(_, _, v)| v).collect();
-        let n = items.len() as u32;
+
+        // Apply ESK as lex (pk, sk) > (esk_pk, esk_sk).
+        if let Some((esk_pk, esk_sk)) = exclusive_start_key {
+            let esk_pk_s = kv_to_string(esk_pk);
+            let esk_sk_s = esk_sk.map(kv_to_string).unwrap_or_default();
+            hits.retain(|(pk, sk, _)| {
+                let pk_cmp = compare_sk_strings(pk, &esk_pk_s, shape.pk_type);
+                match pk_cmp {
+                    std::cmp::Ordering::Greater => true,
+                    std::cmp::Ordering::Less => false,
+                    std::cmp::Ordering::Equal => match shape.sk_type {
+                        Some(t) => {
+                            compare_sk_strings(sk, &esk_sk_s, t)
+                                == std::cmp::Ordering::Greater
+                        }
+                        // Hash-only: equal pk → not strictly after the
+                        // cursor, drop.
+                        None => false,
+                    },
+                }
+            });
+        }
+
+        let lim = limit.unwrap_or(1000) as usize;
+        let has_more = hits.len() > lim;
+        if has_more {
+            hits.truncate(lim);
+        }
+
+        // LEK from the L-th *scanned* row (pre-filter).
+        let last_evaluated_key = if has_more {
+            hits.last().map(|(pk, sk, _)| {
+                let pk_kv = match shape.pk_type {
+                    KeyType::S => KeyValue::S(pk.clone()),
+                    KeyType::N => KeyValue::N(pk.clone()),
+                    KeyType::B => KeyValue::S(pk.clone()),
+                };
+                let sk_kv = shape.sk_type.map(|t| match t {
+                    KeyType::S => KeyValue::S(sk.clone()),
+                    KeyType::N => KeyValue::N(sk.clone()),
+                    KeyType::B => KeyValue::S(sk.clone()),
+                });
+                (pk_kv, sk_kv)
+            })
+        } else {
+            None
+        };
+
+        let scanned_count = hits.len() as u32;
+        let items: Vec<serde_json::Value> = match filter {
+            None => hits.into_iter().map(|(_, _, v)| v).collect(),
+            Some(f) => hits
+                .into_iter()
+                .map(|(_, _, v)| v)
+                .filter(|row| f(row))
+                .collect(),
+        };
+        let count = items.len() as u32;
         Ok(ScanOutcome {
             items,
-            count: n,
-            scanned_count: n,
-            last_evaluated_key: None,
+            count,
+            scanned_count,
+            last_evaluated_key,
         })
     }
 
@@ -3937,4 +4004,254 @@ async fn scan_round_trips_every_attribute_variant() {
     assert!(found["ss_attr"]["SS"].is_array());
     assert!(found["ns_attr"]["NS"].is_array());
     assert!(found["bs_attr"]["BS"].is_array());
+}
+
+// ===== Scan Q5: Limit + ExclusiveStartKey + FilterExpression ==============
+
+#[tokio::test]
+async fn scan_limit_sets_lek_when_more_remain() {
+    let app = app();
+    for n in 1..=4 {
+        put_item(
+            &app,
+            "users",
+            json!({"id":{"S":format!("scan-lek-{n}")},"label":{"S":"v"}}),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "Scan",
+            json!({"TableName":"users","Limit":2}),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["Count"], 2);
+    assert!(body.get("LastEvaluatedKey").is_some(),
+        "Limit=2 < 4 items → LEK should be set");
+}
+
+#[tokio::test]
+async fn scan_multi_page_traversal_reassembles() {
+    let app = app();
+    for n in 1..=6 {
+        put_item(
+            &app,
+            "users",
+            json!({"id":{"S":format!("scan-page-{n:02}")},"label":{"S":"v"}}),
+        )
+        .await;
+    }
+
+    let mut all_ids: Vec<String> = vec![];
+    let mut esk: Option<Value> = None;
+    for pages in 1..=10 {
+        let mut body_in = json!({"TableName":"users","Limit":2});
+        if let Some(e) = &esk {
+            body_in["ExclusiveStartKey"] = e.clone();
+        }
+        let resp = app
+            .clone()
+            .oneshot(ddb_request("Scan", body_in))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        for item in body["Items"].as_array().unwrap() {
+            let id = item["id"]["S"].as_str().unwrap();
+            // Only collect ids we put for this test (other tests
+            // share the `users` mock table).
+            if id.starts_with("scan-page-") {
+                all_ids.push(id.to_string());
+            }
+        }
+        match body.get("LastEvaluatedKey") {
+            Some(lek) if !lek.is_null() => esk = Some(lek.clone()),
+            _ => break,
+        }
+        if pages == 10 {
+            panic!("pagination didn't terminate");
+        }
+    }
+    // Must include all 6 ids (PG order is ascending pk).
+    for n in 1..=6 {
+        let want = format!("scan-page-{n:02}");
+        assert!(all_ids.contains(&want), "missing {want} in {all_ids:?}");
+    }
+}
+
+#[tokio::test]
+async fn scan_filter_drops_some_rows() {
+    let app = app();
+    for n in 1..=4 {
+        let role = if n % 2 == 0 { "admin" } else { "user" };
+        put_item(
+            &app,
+            "users",
+            json!({
+                "id":{"S":format!("scan-filt-{n}")},
+                "tier":{"S":role}
+            }),
+        )
+        .await;
+    }
+
+    let resp = app
+        .oneshot(ddb_request(
+            "Scan",
+            json!({
+                "TableName":"users",
+                "FilterExpression":"tier = :want",
+                "ExpressionAttributeValues":{":want":{"S":"admin"}}
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    // ScannedCount should include every row in the mock store; Count
+    // should be 2 (the admin entries we just inserted).
+    assert!(body["ScannedCount"].as_u64().unwrap() >= 4);
+    let admin_count = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["id"]["S"].as_str().unwrap().starts_with("scan-filt-"))
+        .count();
+    assert_eq!(admin_count, 2);
+}
+
+#[tokio::test]
+async fn scan_filter_with_limit_lek_when_count_zero() {
+    let app = app();
+    for n in 1..=4 {
+        put_item(
+            &app,
+            "users",
+            json!({"id":{"S":format!("scan-fl-{n}")},"tier":{"S":"user"}}),
+        )
+        .await;
+    }
+    // Limit=2 caps scan to first two rows in pk order. Filter wants
+    // "admin" — none match → Count=0, ScannedCount=2, LEK present.
+    let resp = app
+        .oneshot(ddb_request(
+            "Scan",
+            json!({
+                "TableName":"users",
+                "FilterExpression":"tier = :want",
+                "ExpressionAttributeValues":{":want":{"S":"admin"}},
+                "Limit": 2
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["ScannedCount"], 2);
+    assert_eq!(body["Count"], 0);
+    assert!(body.get("LastEvaluatedKey").is_some());
+}
+
+// ===== Query Q5: ScanIndexForward=false =====================================
+
+#[tokio::test]
+async fn query_scan_index_forward_false_returns_descending() {
+    let app = app();
+    for ts in 1..=5 {
+        put_item(
+            &app,
+            "device_events",
+            json!({
+                "device_id":{"S":"q-desc"},
+                "ts":{"N":ts.to_string()},
+                "val":{"N":ts.to_string()}
+            }),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName":"device_events",
+                "KeyConditionExpression":"device_id = :pk",
+                "ExpressionAttributeValues":{":pk":{"S":"q-desc"}},
+                "ScanIndexForward": false
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let ts: Vec<&str> = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["ts"]["N"].as_str().unwrap())
+        .collect();
+    assert_eq!(ts, vec!["5", "4", "3", "2", "1"]);
+}
+
+#[tokio::test]
+async fn query_descending_pagination_resumes_correctly() {
+    let app = app();
+    for ts in 1..=6 {
+        put_item(
+            &app,
+            "device_events",
+            json!({
+                "device_id":{"S":"q-desc-page"},
+                "ts":{"N":ts.to_string()},
+                "val":{"N":"x"}
+            }),
+        )
+        .await;
+    }
+
+    // First descending page: L=2 → ts 6, 5; LEK at sk=5.
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName":"device_events",
+                "KeyConditionExpression":"device_id = :pk",
+                "ExpressionAttributeValues":{":pk":{"S":"q-desc-page"}},
+                "ScanIndexForward": false,
+                "Limit": 2
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let ts: Vec<&str> = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["ts"]["N"].as_str().unwrap())
+        .collect();
+    assert_eq!(ts, vec!["6", "5"]);
+    let lek = body.get("LastEvaluatedKey").cloned().expect("LEK");
+
+    // Second descending page: continue from LEK → ts 4, 3.
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName":"device_events",
+                "KeyConditionExpression":"device_id = :pk",
+                "ExpressionAttributeValues":{":pk":{"S":"q-desc-page"}},
+                "ScanIndexForward": false,
+                "Limit": 2,
+                "ExclusiveStartKey": lek
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let ts: Vec<&str> = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["ts"]["N"].as_str().unwrap())
+        .collect();
+    assert_eq!(ts, vec!["4", "3"]);
 }

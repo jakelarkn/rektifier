@@ -521,6 +521,7 @@ async fn handle_query(state: &AppState, body: &Bytes) -> Result<Response, ApiErr
             plan.limit,
             esk_pair,
             filter_fn,
+            plan.forward,
         )
         .await?;
 
@@ -565,10 +566,25 @@ async fn handle_scan(state: &AppState, body: &Bytes) -> Result<Response, ApiErro
         ApiError::ResourceNotFound(format!("Table not found: {}", req.table_name))
     })?;
 
-    // translate_scan validates that IndexName / Segment / TotalSegments
-    // aren't set; Q4's plan struct is empty.
-    let _plan = translate_scan(&req, schema)?;
-    let outcome = state.backend.scan_raw(&schema.shape()).await?;
+    let plan = translate_scan(&req, schema)?;
+
+    // ESK: assemble (pk, sk) pair from the plan's decoded keys.
+    let esk_pair: Option<(&rekt_storage::KeyValue, Option<&rekt_storage::KeyValue>)> =
+        plan.esk_pk.as_ref().map(|pk| (pk, plan.esk_sk.as_ref()));
+
+    // Filter: same closure pattern as handle_query.
+    let filter_fn: Option<rekt_storage::FilterEvalFn<'_>> =
+        plan.filter.as_ref().map(|cp| {
+            let cond = cp.condition.clone();
+            let f: rekt_storage::FilterEvalFn<'_> =
+                Box::new(move |row| evaluate_condition(Some(row), &cond));
+            f
+        });
+
+    let outcome = state
+        .backend
+        .scan_raw(&schema.shape(), filter_fn, plan.limit, esk_pair)
+        .await?;
 
     let items: Vec<Item> = outcome
         .items
@@ -580,12 +596,16 @@ async fn handle_scan(state: &AppState, body: &Bytes) -> Result<Response, ApiErro
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    let last_evaluated_key = outcome
+        .last_evaluated_key
+        .as_ref()
+        .map(|(pk, sk)| encode_lek(pk, sk.as_ref(), schema));
+
     Ok(json_ok(&ScanResponse {
         items,
         count: outcome.count,
         scanned_count: outcome.scanned_count,
-        // Q4 never sets LEK; Q5 will.
-        last_evaluated_key: None,
+        last_evaluated_key,
     }))
 }
 

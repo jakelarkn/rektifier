@@ -1528,6 +1528,7 @@ mod tests {
             limit: None,
             exclusive_start_key: None,
             filter_expression: None,
+            scan_index_forward: None,
         }
     }
 
@@ -2144,5 +2145,128 @@ mod tests {
             err,
             TranslateError::ScanFeatureNotSupported { .. }
         ));
+    }
+
+    // ============================================================
+    // Q5 — Scan Limit/ESK/Filter + Query ScanIndexForward
+    // ============================================================
+
+    #[test]
+    fn scan_carries_limit_into_plan() {
+        let mut req = scan_req("users");
+        req.limit = Some(50);
+        let plan = translate_scan(&req, &schema_hash_s()).unwrap();
+        assert_eq!(plan.limit, Some(50));
+    }
+
+    #[test]
+    fn scan_invalid_limit_rejected() {
+        let mut req = scan_req("users");
+        req.limit = Some(1001);
+        let err = translate_scan(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(err, TranslateError::InvalidLimit { got: 1001 }));
+    }
+
+    #[test]
+    fn scan_esk_carries_pk_and_sk() {
+        let mut req = scan_req("events");
+        req.exclusive_start_key = Some(item_of(&[
+            ("device_id", AttributeValue::S("dev-X".into())),
+            ("ts", AttributeValue::N("100".into())),
+        ]));
+        let plan = translate_scan(&req, &schema_composite_s_n()).unwrap();
+        assert_eq!(plan.esk_pk, Some(KeyValue::S("dev-X".into())));
+        assert_eq!(plan.esk_sk, Some(KeyValue::N("100".into())));
+    }
+
+    #[test]
+    fn scan_esk_hash_only() {
+        let mut req = scan_req("users");
+        req.exclusive_start_key =
+            Some(item_of(&[("id", AttributeValue::S("u1".into()))]));
+        let plan = translate_scan(&req, &schema_hash_s()).unwrap();
+        assert_eq!(plan.esk_pk, Some(KeyValue::S("u1".into())));
+        assert!(plan.esk_sk.is_none());
+    }
+
+    #[test]
+    fn scan_esk_extra_attr_rejected() {
+        let mut req = scan_req("events");
+        req.exclusive_start_key = Some(item_of(&[
+            ("device_id", AttributeValue::S("d".into())),
+            ("ts", AttributeValue::N("1".into())),
+            ("rogue", AttributeValue::S("x".into())),
+        ]));
+        let err = translate_scan(&req, &schema_composite_s_n()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::InvalidExclusiveStartKey { .. }
+        ));
+    }
+
+    #[test]
+    fn scan_esk_wrong_sk_type_rejected() {
+        let mut req = scan_req("events");
+        req.exclusive_start_key = Some(item_of(&[
+            ("device_id", AttributeValue::S("d".into())),
+            ("ts", AttributeValue::S("not-a-num".into())),
+        ]));
+        let err = translate_scan(&req, &schema_composite_s_n()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::InvalidExclusiveStartKey { .. }
+        ));
+    }
+
+    #[test]
+    fn scan_filter_parses_into_plan() {
+        let mut req = scan_req("users");
+        req.filter_expression = Some("flag = :want".into());
+        req.expression_attribute_values = Some(BTreeMap::from([(
+            ":want".to_string(),
+            AttributeValue::S("active".into()),
+        )]));
+        let plan = translate_scan(&req, &schema_hash_s()).unwrap();
+        assert!(plan.filter.is_some());
+    }
+
+    #[test]
+    fn scan_filter_nested_path_rejected() {
+        let mut req = scan_req("users");
+        req.filter_expression = Some("meta.score = :v".into());
+        req.expression_attribute_values = Some(BTreeMap::from([(
+            ":v".to_string(),
+            AttributeValue::N("1".into()),
+        )]));
+        let err = translate_scan(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::UnsupportedConditionNestedPath { .. }
+        ));
+    }
+
+    #[test]
+    fn query_forward_defaults_true() {
+        let req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        let plan = translate_query(&req, &schema_hash_s()).unwrap();
+        assert!(plan.forward);
+    }
+
+    #[test]
+    fn query_scan_index_forward_false_carries() {
+        let mut req = query_req(
+            "events",
+            "device_id = :pk",
+            &[(":pk", AttributeValue::S("d".into()))],
+            &[],
+        );
+        req.scan_index_forward = Some(false);
+        let plan = translate_query(&req, &schema_composite_s_n()).unwrap();
+        assert!(!plan.forward);
     }
 }

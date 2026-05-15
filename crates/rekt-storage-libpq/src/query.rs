@@ -32,6 +32,7 @@ use tracing::Instrument;
 
 const DEFAULT_LIMIT: u32 = 1000;
 
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     level = "debug",
     skip_all,
@@ -46,6 +47,7 @@ pub(crate) async fn query_raw(
     limit: Option<u32>,
     exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
     filter: Option<FilterEvalFn<'_>>,
+    forward: bool,
 ) -> Result<QueryOutcome, BackendError> {
     if sk_condition.is_some() && shape.sk_col.is_none() {
         return Err(BackendError::UnexpectedSortKey {
@@ -166,9 +168,11 @@ pub(crate) async fn query_raw(
 
     // ExclusiveStartKey (composite tables only; hash-only short-
     // circuited above). For forward order, we want rows strictly
-    // greater than the ESK's sk component. The ESK's pk is required to
-    // equal the query pk in v1 (translator-enforced); we don't re-bind
-    // it here since the PK equality is already in the WHERE.
+    // greater than the ESK's sk component; for descending, strictly
+    // less. The ESK's pk is required to equal the query pk in v1
+    // (translator-enforced); we don't re-bind it here since the PK
+    // equality is already in the WHERE.
+    let esk_cmp = if forward { ">" } else { "<" };
     let esk_sk_bound: Option<Bound<'_>>;
     match exclusive_start_key {
         None => {
@@ -177,7 +181,9 @@ pub(crate) async fn query_raw(
         Some((_esk_pk, Some(esk_sk))) => {
             let sk_col = sk_col_q.as_deref().expect("ESK with composite");
             let sk_type = sk_pg.clone().expect("ESK with composite");
-            where_sql.push_str(&format!(" AND {sk_col} > ${next_idx}{sk_cast}"));
+            where_sql.push_str(&format!(
+                " AND {sk_col} {esk_cmp} ${next_idx}{sk_cast}"
+            ));
             types.push(sk_type);
             esk_sk_bound = Some(Bound(esk_sk));
             next_idx += 1;
@@ -196,8 +202,9 @@ pub(crate) async fn query_raw(
     // by counting returned rows.
     let lim_input = limit.unwrap_or(DEFAULT_LIMIT);
     let lim_plus_one = (lim_input as i64).saturating_add(1);
+    let order_dir = if forward { "ASC" } else { "DESC" };
     let order_by = match shape.sk_col {
-        Some(sk_col) => format!(" ORDER BY {} ASC", quote_ident(sk_col)),
+        Some(sk_col) => format!(" ORDER BY {} {order_dir}", quote_ident(sk_col)),
         None => String::new(),
     };
     types.push(Type::INT8);

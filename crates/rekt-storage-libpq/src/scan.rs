@@ -1,26 +1,28 @@
-//! `scan_raw`: unbounded read over the whole table.
+//! `scan_raw`: full-table read with keyset pagination + optional
+//! filter.
 //!
 //! SQL shape:
 //!
 //! ```sql
 //! SELECT <jsonb_col> FROM <table>
+//!   [ WHERE <pk_col> > $1::<pk_type> ]                         -- hash-only ESK
+//!   [ WHERE (<pk_col>, <sk_col>) > ($1, $2)::<pk_type, sk_type> ]  -- composite ESK
 //!   ORDER BY <pk_col> [, <sk_col>]
-//!   LIMIT $1
+//!   LIMIT $N+1
 //! ```
 //!
-//! Q4 binds `LIMIT` as a soft cap (1000 items — see
-//! `COMPATIBILITY_NOTES.md`) and exposes no other knobs. Q5 will lift
-//! `Limit`, `ExclusiveStartKey`, `FilterExpression`, and parallel-scan
-//! state through here.
-//!
-//! ORDER BY is deterministic so Q5's keyset pagination has a stable
-//! row order to resume against. DDB's Scan order is officially
-//! undefined; the diff tests assert set equality, not list equality.
+//! The `L+1` sentinel pattern mirrors `query_raw`: read one extra
+//! row to detect "more remain"; LEK is derived from the L-th
+//! *scanned* (pre-filter) row's keys so paging continues even when
+//! a filter drops everything in the current page.
 
-use crate::types::{map_pg_err, quote_ident};
+use crate::types::{cast_for_keytype, map_pg_err, pg_type_for_keytype, quote_ident, Bound};
 use crate::PgBackend;
-use rekt_storage::{BackendError, ScanOutcome, TableShape};
-use tokio_postgres::types::{Json, Type};
+use bytes::Bytes;
+use rekt_storage::{
+    BackendError, FilterEvalFn, KeyType, KeyValue, ScanOutcome, TableShape,
+};
+use tokio_postgres::types::{Json, ToSql, Type};
 use tracing::Instrument;
 
 const DEFAULT_LIMIT: u32 = 1000;
@@ -34,44 +36,174 @@ const DEFAULT_LIMIT: u32 = 1000;
 pub(crate) async fn scan_raw(
     backend: &PgBackend,
     shape: &TableShape<'_>,
+    filter: Option<FilterEvalFn<'_>>,
+    limit: Option<u32>,
+    exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
 ) -> Result<ScanOutcome, BackendError> {
     let table = quote_ident(shape.table);
     let jsonb_col = quote_ident(shape.jsonb_col);
-    let pk_col = quote_ident(shape.pk_col);
+    let pk_col_q = quote_ident(shape.pk_col);
+    let pk_cast = cast_for_keytype(shape.pk_type);
+    let pk_pg = pg_type_for_keytype(shape.pk_type);
 
+    let sk_col_q = shape.sk_col.map(quote_ident);
+    let sk_cast = shape.sk_type.map(cast_for_keytype).unwrap_or("");
+    let sk_pg = shape.sk_type.map(pg_type_for_keytype);
+
+    // ---- Assemble WHERE + params for ESK ----
+    let mut where_sql = String::new();
+    let mut types: Vec<Type> = vec![];
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![];
+    let mut next_idx: usize = 1;
+
+    let esk_pk_bound: Option<Bound<'_>>;
+    let esk_sk_bound: Option<Bound<'_>>;
+    match exclusive_start_key {
+        None => {
+            esk_pk_bound = None;
+            esk_sk_bound = None;
+        }
+        Some((esk_pk, esk_sk)) => match (sk_col_q.as_deref(), sk_pg.clone(), esk_sk) {
+            (Some(sk_col), Some(sk_type), Some(sk_val)) => {
+                // Composite: row-constructor comparison.
+                where_sql.push_str(&format!(
+                    " WHERE ({pk_col_q}, {sk_col}) > (${}{pk_cast}, ${}{sk_cast})",
+                    next_idx,
+                    next_idx + 1
+                ));
+                types.push(pk_pg.clone());
+                types.push(sk_type);
+                esk_pk_bound = Some(Bound(esk_pk));
+                esk_sk_bound = Some(Bound(sk_val));
+                next_idx += 2;
+            }
+            (None, _, None) => {
+                // Hash-only: just `pk > $1`.
+                where_sql.push_str(&format!(
+                    " WHERE {pk_col_q} > ${}{pk_cast}",
+                    next_idx
+                ));
+                types.push(pk_pg.clone());
+                esk_pk_bound = Some(Bound(esk_pk));
+                esk_sk_bound = None;
+                next_idx += 1;
+            }
+            // Shape/ESK mismatch — translator-layer bug; treat as no ESK.
+            _ => {
+                esk_pk_bound = None;
+                esk_sk_bound = None;
+            }
+        },
+    }
+    if let Some(b) = esk_pk_bound.as_ref() {
+        params.push(b);
+    }
+    if let Some(b) = esk_sk_bound.as_ref() {
+        params.push(b);
+    }
+
+    // ---- ORDER BY ----
     let order_by = match shape.sk_col {
-        Some(sk) => format!("{pk_col}, {}", quote_ident(sk)),
-        None => pk_col.clone(),
+        Some(sk) => format!("{pk_col_q}, {}", quote_ident(sk)),
+        None => pk_col_q.clone(),
     };
 
+    // ---- LIMIT ----
+    let lim_input = limit.unwrap_or(DEFAULT_LIMIT);
+    let lim_plus_one = (lim_input as i64).saturating_add(1);
+    types.push(Type::INT8);
+    params.push(&lim_plus_one);
+    let limit_idx = next_idx;
+
     let sql = format!(
-        "SELECT {jsonb_col} FROM {table} ORDER BY {order_by} LIMIT $1"
+        "SELECT {jsonb_col} FROM {table}{where_sql} ORDER BY {order_by} LIMIT ${limit_idx}"
     );
 
+    // ---- Execute ----
     let client = backend.client().await?;
     let stmt = client
-        .prepare_typed_cached(&sql, &[Type::INT8])
+        .prepare_typed_cached(&sql, &types)
         .instrument(tracing::debug_span!("pg.prepare"))
         .await
         .map_err(|e| map_pg_err(shape.table, e))?;
-
-    let lim = DEFAULT_LIMIT as i64;
     let rows = client
-        .query(&stmt, &[&lim])
+        .query(&stmt, &params)
         .instrument(tracing::debug_span!("pg.query"))
         .await
         .map_err(|e| map_pg_err(shape.table, e))?;
 
-    let mut items: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
-    for row in rows {
+    // ---- Decode + L+1 sentinel + filter ----
+    //
+    // Same two-pass shape as query.rs: decode all scanned rows so the
+    // L-th row is known for LEK before filter drops it, then apply
+    // the filter to the (possibly truncated) list.
+    let mut scanned_rows: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+    for row in &rows {
         let Json(v): Json<serde_json::Value> = row.get(0);
-        items.push(v);
+        scanned_rows.push(v);
     }
-    let n = items.len() as u32;
+    let has_more = scanned_rows.len() as i64 == lim_plus_one;
+    if has_more {
+        scanned_rows.truncate(lim_input as usize);
+    }
+    let last_evaluated_key = if has_more {
+        scanned_rows
+            .last()
+            .and_then(|row| lek_from_row(row, shape))
+    } else {
+        None
+    };
+    let scanned_count = scanned_rows.len() as u32;
+    let items: Vec<serde_json::Value> = match filter {
+        None => scanned_rows,
+        Some(f) => scanned_rows.into_iter().filter(|row| f(row)).collect(),
+    };
+    let count = items.len() as u32;
     Ok(ScanOutcome {
         items,
-        count: n,
-        scanned_count: n,
-        last_evaluated_key: None,
+        count,
+        scanned_count,
+        last_evaluated_key,
     })
+}
+
+/// Pull `(pk, Option<sk>)` out of a stored row's DDB-JSON. Same shape
+/// as the Query helper; duplicated here so the two modules stay
+/// decoupled.
+fn lek_from_row(
+    row: &serde_json::Value,
+    shape: &TableShape<'_>,
+) -> Option<(KeyValue, Option<KeyValue>)> {
+    let pk = extract_key_from_jsonb(row, shape.pk_col, shape.pk_type)?;
+    let sk = match (shape.sk_col, shape.sk_type) {
+        (Some(col), Some(ty)) => Some(extract_key_from_jsonb(row, col, ty)?),
+        _ => None,
+    };
+    Some((pk, sk))
+}
+
+fn extract_key_from_jsonb(
+    row: &serde_json::Value,
+    attr: &str,
+    ty: KeyType,
+) -> Option<KeyValue> {
+    let tagged = row.get(attr)?;
+    match ty {
+        KeyType::S => tagged
+            .get("S")?
+            .as_str()
+            .map(|s| KeyValue::S(s.to_string())),
+        KeyType::N => tagged
+            .get("N")?
+            .as_str()
+            .map(|s| KeyValue::N(s.to_string())),
+        KeyType::B => {
+            use base64::Engine;
+            let s = tagged.get("B")?.as_str()?;
+            base64::engine::general_purpose::STANDARD
+                .decode(s)
+                .ok()
+                .map(|b| KeyValue::B(Bytes::from(b)))
+        }
+    }
 }

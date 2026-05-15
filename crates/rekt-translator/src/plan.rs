@@ -120,11 +120,20 @@ pub fn touched_paths(expr: &UpdateExpression) -> std::collections::BTreeSet<Stri
     paths
 }
 
-/// Scan plan: unbounded read over the whole table. Q4 is the
-/// skeleton with no knobs — the struct is intentionally empty so
-/// Q5 can grow it (filter, limit, esk) without breaking callers.
+/// Scan plan: full-table read.
+///
+/// `limit` is the per-call cap (soft default 1000 — see
+/// `COMPATIBILITY_NOTES.md`). `esk_pk` + `esk_sk` together form the
+/// keyset cursor — both come from the previous response's LEK.
+/// `filter` is the parsed FilterExpression (per-row Rust eval, same
+/// pattern as Query — PLAN-4 D2).
 #[derive(Debug, Clone, Default)]
-pub struct ScanPlan {}
+pub struct ScanPlan {
+    pub limit: Option<u32>,
+    pub esk_pk: Option<KeyValue>,
+    pub esk_sk: Option<KeyValue>,
+    pub filter: Option<ConditionPlan>,
+}
 
 /// Query plan: bounded read of one partition.
 ///
@@ -134,10 +143,10 @@ pub struct ScanPlan {}
 /// is the sort-key half of the `ExclusiveStartKey` cursor; the PK half
 /// is `pk` (translator-enforced equality with the query PK) so we only
 /// carry the SK component through to storage. `filter` (Q3) is the
-/// parsed FilterExpression evaluated per-row in Rust by the dispatcher;
-/// `ConditionPlan.routing` is populated but not consulted in Q3 since
-/// all shapes evaluate in Rust (D2 in PLAN-4 — SQL push-down deferred).
-/// Q5 adds `forward`.
+/// parsed FilterExpression evaluated per-row in Rust by the dispatcher.
+/// `forward` (Q5) toggles the sort order — `true` is the DDB default;
+/// `false` is `ScanIndexForward=false` (descending SK, flipped ESK
+/// comparison).
 #[derive(Debug, Clone)]
 pub struct QueryPlan {
     pub pk: KeyValue,
@@ -145,6 +154,7 @@ pub struct QueryPlan {
     pub limit: Option<u32>,
     pub esk_sk: Option<KeyValue>,
     pub filter: Option<ConditionPlan>,
+    pub forward: bool,
 }
 
 #[derive(Debug, Clone)]

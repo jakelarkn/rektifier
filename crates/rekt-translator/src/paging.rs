@@ -65,6 +65,47 @@ pub(crate) fn decode_esk(
     Ok(esk_sk)
 }
 
+/// Decode a Scan `ExclusiveStartKey`. Unlike Query, the cursor's PK
+/// isn't constrained to match anything (Scan reads across
+/// partitions) — but the ESK must still contain exactly the key
+/// attrs the schema declares, in the right types.
+pub(crate) fn decode_scan_esk(
+    esk: &Item,
+    schema: &TableSchema,
+) -> Result<(KeyValue, Option<KeyValue>), TranslateError> {
+    let esk_pk = extract_key(esk, &schema.pk_attr, schema.pk_type, KeyRole::Pk)
+        .map_err(|_| TranslateError::InvalidExclusiveStartKey {
+            reason: format!(
+                "missing or wrong-typed partition key `{}`",
+                schema.pk_attr
+            ),
+        })?;
+    let esk_sk = match (&schema.sk_attr, schema.sk_type) {
+        (Some(attr), Some(ty)) => Some(
+            extract_key(esk, attr, ty, KeyRole::Sk).map_err(|_| {
+                TranslateError::InvalidExclusiveStartKey {
+                    reason: format!("missing or wrong-typed sort key `{attr}`"),
+                }
+            })?,
+        ),
+        _ => None,
+    };
+    // Reject extra attrs in the ESK.
+    let allowed: &[&str] = match &schema.sk_attr {
+        Some(sk) => &[schema.pk_attr.as_str(), sk.as_str()][..],
+        None => &[schema.pk_attr.as_str()][..],
+    };
+    let allowed_set: std::collections::BTreeSet<&str> = allowed.iter().copied().collect();
+    for attr in esk.keys() {
+        if !allowed_set.contains(attr.as_str()) {
+            return Err(TranslateError::InvalidExclusiveStartKey {
+                reason: format!("unexpected attribute `{attr}` in ExclusiveStartKey"),
+            });
+        }
+    }
+    Ok((esk_pk, esk_sk))
+}
+
 /// Encode a `(pk, sk)` cursor as a DDB-JSON `Item` for the
 /// `LastEvaluatedKey` response field. The shape matches what DDB
 /// returns and what `decode_esk` accepts on the next call.

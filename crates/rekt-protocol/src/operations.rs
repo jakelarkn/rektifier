@@ -136,6 +136,12 @@ pub struct QueryRequest {
     /// differ).
     #[serde(default)]
     pub filter_expression: Option<String>,
+    /// Sort direction. `Some(false)` reverses to descending — items
+    /// are returned in sort-key DESC order and pagination resumes
+    /// strictly *before* the `ExclusiveStartKey`. `None` and
+    /// `Some(true)` are both ascending (DDB default).
+    #[serde(default)]
+    pub scan_index_forward: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -168,8 +174,26 @@ pub struct ScanRequest {
     pub segment: Option<u32>,
     #[serde(default)]
     pub total_segments: Option<u32>,
-    // Q5 adds: filter_expression, limit, exclusive_start_key,
-    // expression_attribute_names/values.
+    /// Max items to scan from PG per call. Soft default 1000 — see
+    /// `COMPATIBILITY_NOTES.md`.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Pagination cursor (the `LastEvaluatedKey` from the previous
+    /// response). For Scan, the cursor contains the table's full
+    /// key set (pk for hash-only; pk + sk for composite) and rektifier
+    /// resumes strictly after this key in `(pk, sk)` order.
+    #[serde(default)]
+    pub exclusive_start_key: Option<Item>,
+    /// Optional post-scan filter. Same v1 ConditionExpression grammar
+    /// as Query; same per-row Rust evaluation in Q5 (SQL push-down is
+    /// a deferred perf phase, PLAN-4 D2).
+    #[serde(default)]
+    pub filter_expression: Option<String>,
+    #[serde(default)]
+    pub expression_attribute_names: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    pub expression_attribute_values:
+        Option<std::collections::BTreeMap<String, crate::AttributeValue>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

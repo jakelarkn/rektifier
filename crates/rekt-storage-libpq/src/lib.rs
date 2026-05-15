@@ -191,6 +191,7 @@ impl Backend for PgBackend {
         limit: Option<u32>,
         exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
         filter: Option<FilterEvalFn<'_>>,
+        forward: bool,
     ) -> Result<QueryOutcome, BackendError> {
         query::query_raw(
             self,
@@ -200,6 +201,7 @@ impl Backend for PgBackend {
             limit,
             exclusive_start_key,
             filter,
+            forward,
         )
         .await
     }
@@ -207,8 +209,11 @@ impl Backend for PgBackend {
     async fn scan_raw(
         &self,
         shape: &TableShape<'_>,
+        filter: Option<FilterEvalFn<'_>>,
+        limit: Option<u32>,
+        exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
     ) -> Result<ScanOutcome, BackendError> {
-        scan::scan_raw(self, shape).await
+        scan::scan_raw(self, shape, filter, limit, exclusive_start_key).await
     }
 }
 #[cfg(test)]
@@ -2103,7 +2108,7 @@ mod tests {
         }
 
         let out = backend
-            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, None, None, None)
+            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, None, None, None, true)
             .await
             .unwrap();
         assert_eq!(out.count, 3);
@@ -2166,6 +2171,7 @@ mod tests {
                 None,
                 None,
                 None,
+                true,
             )
             .await
             .unwrap();
@@ -2181,6 +2187,7 @@ mod tests {
                 None,
                 None,
                 None,
+                true,
             )
             .await
             .unwrap();
@@ -2200,6 +2207,7 @@ mod tests {
                 None,
                 None,
                 None,
+                true,
             )
             .await
             .unwrap();
@@ -2222,6 +2230,7 @@ mod tests {
                 None,
                 None,
                 None,
+                true,
             )
             .await
             .unwrap();
@@ -2279,6 +2288,7 @@ mod tests {
                 None,
                 None,
                 None,
+                true,
             )
             .await
             .unwrap();
@@ -2299,6 +2309,7 @@ mod tests {
                 None,
                 None,
                 None,
+                true,
             )
             .await
             .unwrap();
@@ -2348,7 +2359,7 @@ mod tests {
             .await;
         }
         let out = backend
-            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, Some(3), None, None)
+            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, Some(3), None, None, true)
             .await
             .unwrap();
         assert_eq!(out.count, 3);
@@ -2407,7 +2418,7 @@ mod tests {
             .await;
         }
         let out = backend
-            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, Some(2), None, None)
+            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, Some(2), None, None, true)
             .await
             .unwrap();
         assert_eq!(out.count, 2);
@@ -2423,7 +2434,7 @@ mod tests {
 
         // Last page: no LEK.
         let out = backend
-            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, Some(10), None, None)
+            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, Some(10), None, None, true)
             .await
             .unwrap();
         assert_eq!(out.count, 5);
@@ -2484,7 +2495,7 @@ mod tests {
                 .as_ref()
                 .map(|(p, s)| (p, s.as_ref()));
             let out = backend
-                .query_raw(&shape, &pk, None, Some(3), esk_ref, None)
+                .query_raw(&shape, &pk, None, Some(3), esk_ref, None, true)
                 .await
                 .unwrap();
             for item in &out.items {
@@ -2554,6 +2565,7 @@ mod tests {
                 Some(2),
                 None,
                 None,
+                true,
             )
             .await
             .unwrap();
@@ -2573,6 +2585,7 @@ mod tests {
                 Some(2),
                 Some(esk),
                 None,
+                true,
             )
             .await
             .unwrap();
@@ -2654,6 +2667,7 @@ mod tests {
                 None,
                 None,
                 Some(flag_eq_filter("on")),
+                true,
             )
             .await
             .unwrap();
@@ -2718,6 +2732,7 @@ mod tests {
                 Some(2),
                 None,
                 Some(flag_eq_filter("NO_MATCH")),
+                true,
             )
             .await
             .unwrap();
@@ -2781,6 +2796,7 @@ mod tests {
                 None,
                 None,
                 Some(flag_eq_filter("on")),
+                true,
             )
             .await
             .unwrap();
@@ -2834,7 +2850,7 @@ mod tests {
             )
             .await;
         }
-        let out = backend.scan_raw(&shape).await.unwrap();
+        let out = backend.scan_raw(&shape, None, None, None).await.unwrap();
         assert_eq!(out.count, 4);
         assert_eq!(out.scanned_count, 4);
         assert!(out.last_evaluated_key.is_none());
@@ -2889,7 +2905,7 @@ mod tests {
             )
             .await;
         }
-        let out = backend.scan_raw(&shape).await.unwrap();
+        let out = backend.scan_raw(&shape, None, None, None).await.unwrap();
         assert_eq!(out.count, 4);
         // PG ORDER BY (device_id, ts) ascending.
         let keys: Vec<(String, String)> = out
@@ -2941,13 +2957,224 @@ mod tests {
             sk_type: None,
             jsonb_col: "data",
         };
-        let out = backend.scan_raw(&shape).await.unwrap();
+        let out = backend.scan_raw(&shape, None, None, None).await.unwrap();
         assert_eq!(out.count, 0);
         assert_eq!(out.scanned_count, 0);
         assert!(out.items.is_empty());
 
         client
             .batch_execute("DROP TABLE rekt_t_scan_empty;")
+            .await
+            .unwrap();
+    }
+
+    // ============================================================
+    // Q5 — Scan Limit/ESK/Filter + Query forward=false
+    // ============================================================
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn scan_limit_sets_lek_and_resumes() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_scan_lek;
+                 CREATE TABLE rekt_t_scan_lek (
+                   doc       jsonb NOT NULL,
+                   device_id text    GENERATED ALWAYS AS (doc#>>'{device_id,S}')     STORED,
+                   ts        numeric GENERATED ALWAYS AS ((doc#>>'{ts,N}')::numeric) STORED,
+                   PRIMARY KEY (device_id, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_scan_lek",
+            pk_col: "device_id",
+            pk_type: KeyType::S,
+            sk_col: Some("ts"),
+            sk_type: Some(KeyType::N),
+            jsonb_col: "doc",
+        };
+        // 6 rows across 2 partitions; expected scan order is
+        // (d1, 1), (d1, 2), (d1, 3), (d2, 1), (d2, 2), (d2, 3).
+        for dev in ["d1", "d2"] {
+            for ts in 1..=3 {
+                pg_put(
+                    &backend,
+                    &shape,
+                    &serde_json::json!({
+                        "device_id":{"S":dev},
+                        "ts":{"N":ts.to_string()},
+                        "val":{"S":"x"}
+                    }),
+                )
+                .await;
+            }
+        }
+        // First page: L=2 → (d1,1), (d1,2); LEK at (d1, 2).
+        let out = backend
+            .scan_raw(&shape, None, Some(2), None)
+            .await
+            .unwrap();
+        assert_eq!(out.count, 2);
+        let (lek_pk, lek_sk) = out.last_evaluated_key.clone().expect("LEK present");
+        assert_eq!(lek_pk, KeyValue::S("d1".into()));
+        assert_eq!(lek_sk, Some(KeyValue::N("2".into())));
+
+        // Resume from LEK. Should see (d1,3), (d2,1) next with L=2.
+        let esk_pk = lek_pk;
+        let esk_sk = lek_sk;
+        let esk = (&esk_pk, esk_sk.as_ref());
+        let out = backend
+            .scan_raw(&shape, None, Some(2), Some(esk))
+            .await
+            .unwrap();
+        let pairs: Vec<(String, String)> = out
+            .items
+            .iter()
+            .map(|i| {
+                (
+                    i["device_id"]["S"].as_str().unwrap().to_string(),
+                    i["ts"]["N"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("d1".into(), "3".into()),
+                ("d2".into(), "1".into()),
+            ]
+        );
+
+        client
+            .batch_execute("DROP TABLE rekt_t_scan_lek;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn scan_filter_drops_some_rows() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_scan_filt;
+                 CREATE TABLE rekt_t_scan_filt (
+                   data jsonb NOT NULL,
+                   id   text  GENERATED ALWAYS AS (data#>>'{id,S}') STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_scan_filt",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        for n in 1..=4 {
+            let flag = if n % 2 == 0 { "on" } else { "off" };
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({"id":{"S":format!("u{n}")},"flag":{"S":flag}}),
+            )
+            .await;
+        }
+        let filter: rekt_storage::FilterEvalFn<'static> = Box::new(|row| {
+            row.get("flag")
+                .and_then(|v| v.get("S"))
+                .and_then(|v| v.as_str())
+                == Some("on")
+        });
+        let out = backend
+            .scan_raw(&shape, Some(filter), None, None)
+            .await
+            .unwrap();
+        assert_eq!(out.scanned_count, 4);
+        assert_eq!(out.count, 2);
+
+        client
+            .batch_execute("DROP TABLE rekt_t_scan_filt;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn query_forward_false_returns_descending_paginated() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_q_desc;
+                 CREATE TABLE rekt_t_q_desc (
+                   doc       jsonb NOT NULL,
+                   device_id text    GENERATED ALWAYS AS (doc#>>'{device_id,S}')     STORED,
+                   ts        numeric GENERATED ALWAYS AS ((doc#>>'{ts,N}')::numeric) STORED,
+                   PRIMARY KEY (device_id, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_q_desc",
+            pk_col: "device_id",
+            pk_type: KeyType::S,
+            sk_col: Some("ts"),
+            sk_type: Some(KeyType::N),
+            jsonb_col: "doc",
+        };
+        for ts in 1..=6 {
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({
+                    "device_id":{"S":"d1"},
+                    "ts":{"N":ts.to_string()},
+                    "val":{"S":"x"}
+                }),
+            )
+            .await;
+        }
+        let pk = KeyValue::S("d1".into());
+
+        // Descending, L=2: ts 6, 5; LEK at sk=5.
+        let out = backend
+            .query_raw(&shape, &pk, None, Some(2), None, None, false)
+            .await
+            .unwrap();
+        let ts: Vec<&str> = out
+            .items
+            .iter()
+            .map(|i| i["ts"]["N"].as_str().unwrap())
+            .collect();
+        assert_eq!(ts, vec!["6", "5"]);
+        let (_, lek_sk) = out.last_evaluated_key.clone().expect("LEK");
+        assert_eq!(lek_sk, Some(KeyValue::N("5".into())));
+
+        // Continue descending with ESK: ts 4, 3.
+        let esk_sk_val = KeyValue::N("5".into());
+        let esk = (&pk, Some(&esk_sk_val));
+        let out = backend
+            .query_raw(&shape, &pk, None, Some(2), Some(esk), None, false)
+            .await
+            .unwrap();
+        let ts: Vec<&str> = out
+            .items
+            .iter()
+            .map(|i| i["ts"]["N"].as_str().unwrap())
+            .collect();
+        assert_eq!(ts, vec!["4", "3"]);
+
+        client
+            .batch_execute("DROP TABLE rekt_t_q_desc;")
             .await
             .unwrap();
     }
