@@ -355,6 +355,27 @@ pub trait Backend: Send + Sync + 'static {
         exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
     ) -> Result<ScanOutcome, BackendError>;
 
+    /// BatchWriteItem — multi-row upsert + multi-key delete against
+    /// a single table, in one transaction.
+    ///
+    /// `ops` may freely mix `WriteOp::Put` and `WriteOp::Delete`. The
+    /// Put-statement runs before the Delete-statement within the
+    /// transaction; request-position interleaving within the input
+    /// `&[WriteOp]` slice is not preserved across the two emitted
+    /// statements (matches DDB observationally — see PLAN-6 D3).
+    ///
+    /// Caller is responsible for deduplication: the translator
+    /// rejects "same key twice in one table" and "Put + Delete of the
+    /// same key" before this method is reached.
+    ///
+    /// Returns a `BatchWriteOutcome` (currently always empty — v1
+    /// never produces `UnprocessedItems`).
+    async fn batch_write_raw(
+        &self,
+        shape: &TableShape<'_>,
+        ops: &[WriteOp],
+    ) -> Result<BatchWriteOutcome, BackendError>;
+
     /// BatchGetItem — multi-key SELECT against a single table.
     ///
     /// Emits one SQL statement, regardless of `keys.len()`. Hash-only
@@ -372,6 +393,38 @@ pub trait Backend: Send + Sync + 'static {
         shape: &TableShape<'_>,
         keys: &[(KeyValue, Option<KeyValue>)],
     ) -> Result<BatchGetOutcome, BackendError>;
+}
+
+/// A single write request inside a per-table BatchWriteItem batch.
+/// Mirrors the wire shape but pre-typed for the storage layer; the
+/// translator extracts `(pk, sk)` from the request's `Item` (Put) or
+/// `Key` (Delete) before this enum is constructed.
+#[derive(Debug, Clone)]
+pub enum WriteOp {
+    /// PutItem-equivalent upsert: replaces any existing row at the
+    /// derived `(pk[, sk])`. `item` is the full DDB-JSON item that
+    /// will be written to the jsonb column; PG derives the key
+    /// columns from it via `GENERATED ALWAYS AS`.
+    Put {
+        pk: KeyValue,
+        sk: Option<KeyValue>,
+        item: serde_json::Value,
+    },
+    /// DeleteItem-equivalent: idempotent on missing rows.
+    Delete {
+        pk: KeyValue,
+        sk: Option<KeyValue>,
+    },
+}
+
+/// Result of a `batch_write_raw` call. Always `Default` in v1
+/// (success is the only signalled outcome — any SQL-level failure
+/// surfaces as a `BackendError`). The struct exists so B7's
+/// `unprocessed` field can be added without widening the trait.
+#[derive(Debug, Clone, Default)]
+pub struct BatchWriteOutcome {
+    // Future fields (unused in v1):
+    //   pub unprocessed: Vec<WriteOp>,
 }
 
 /// Result of a `batch_get_raw` call. v1 consumes only `items.len()`

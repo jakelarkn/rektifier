@@ -12,18 +12,19 @@ use crate::keys::{extract_key, reject_extra_key_attrs, KeyRole};
 use crate::paging::{decode_esk, decode_scan_esk, validate_limit};
 use crate::projection::resolve_select_and_projection;
 use crate::plan::{
-    BatchGetItemPlan, BatchGetPerTable, ConditionPlan, DeleteItemPlan, GetItemPlan, PutItemPlan,
-    QueryPlan, ReturnValuesMode, ScanPlan, UpdateItemPlan,
+    BatchGetItemPlan, BatchGetPerTable, BatchWriteItemPlan, BatchWritePerTable, ConditionPlan,
+    DeleteItemPlan, GetItemPlan, PutItemPlan, QueryPlan, ReturnValuesMode, ScanPlan,
+    UpdateItemPlan,
 };
 use crate::schema::TableSchema;
 use rekt_expressions::{
     parse_condition_expression, parse_update_expression, substitute_condition, substitute_update,
 };
 use rekt_protocol::{
-    AttributeValue, BatchGetItemRequest, DeleteItemRequest, GetItemRequest, PutItemRequest,
-    QueryRequest, ScanRequest, UpdateItemRequest,
+    AttributeValue, BatchGetItemRequest, BatchWriteItemRequest, DeleteItemRequest, GetItemRequest,
+    PutItemRequest, QueryRequest, ScanRequest, UpdateItemRequest,
 };
-use rekt_storage::KeyValue;
+use rekt_storage::{KeyValue, WriteOp};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[tracing::instrument(level = "debug", skip_all, name = "translate.put_item", fields(table = %schema.name))]
@@ -419,6 +420,101 @@ pub fn translate_batch_get_item(
     }
 
     Ok(BatchGetItemPlan { per_table })
+}
+
+/// BatchWriteItem — per-table key validation + cross-table cap enforcement.
+///
+/// Mirrors `translate_batch_get_item`'s shape: per-table schema lookup,
+/// per-key/per-item type validation, HashSet dedupe across the whole
+/// table's writes (Put + Delete combined — DDB rejects "same key in
+/// one request" regardless of op kind), and a total-write cap (DDB
+/// default 25; operator-tunable).
+///
+/// `WriteOp::Put` carries the full DDB-JSON item; the translator
+/// validates the item contains the schema's key attrs at the right
+/// types, then the storage layer's `INSERT ... ON CONFLICT DO UPDATE`
+/// uses the generated key columns to upsert.
+///
+/// `WriteOp::Delete` carries the typed key tuple only.
+#[tracing::instrument(level = "debug", skip_all, name = "translate.batch_write_item")]
+pub fn translate_batch_write_item(
+    req: &BatchWriteItemRequest,
+    schemas: &HashMap<String, TableSchema>,
+    max_writes: u32,
+) -> Result<BatchWriteItemPlan, TranslateError> {
+    if req.request_items.is_empty() {
+        return Err(TranslateError::EmptyBatchWriteRequest);
+    }
+    let total: usize = req.request_items.values().map(|v| v.len()).sum();
+    if total > max_writes as usize {
+        return Err(TranslateError::TooManyWritesInBatch {
+            got: total as u32,
+            max: max_writes,
+        });
+    }
+
+    let mut per_table: Vec<BatchWritePerTable> = Vec::with_capacity(req.request_items.len());
+    for (table_name, writes) in &req.request_items {
+        let schema = schemas
+            .get(table_name)
+            .ok_or_else(|| TranslateError::ResourceNotFoundForBatch {
+                table: table_name.clone(),
+            })?;
+        if writes.is_empty() {
+            return Err(TranslateError::EmptyWritesInBatch {
+                table: table_name.clone(),
+            });
+        }
+
+        let mut ops: Vec<WriteOp> = Vec::with_capacity(writes.len());
+        let mut seen: HashSet<(KeyValue, Option<KeyValue>)> = HashSet::with_capacity(writes.len());
+        for w in writes {
+            // Exactly-one-of: Put XOR Delete.
+            match (&w.put_request, &w.delete_request) {
+                (Some(p), None) => {
+                    // Validate the Item contains the right key attrs at
+                    // the right types — same machinery PutItem uses.
+                    let pk =
+                        extract_key(&p.item, &schema.pk_attr, schema.pk_type, KeyRole::Pk)?;
+                    let sk = match (&schema.sk_attr, schema.sk_type) {
+                        (Some(attr), Some(t)) => Some(extract_key(&p.item, attr, t, KeyRole::Sk)?),
+                        _ => None,
+                    };
+                    let tuple = (pk.clone(), sk.clone());
+                    if !seen.insert(tuple) {
+                        return Err(TranslateError::DuplicateKeyInBatch);
+                    }
+                    let item_json = serde_json::to_value(&p.item)
+                        .expect("AttributeValue Serialize is infallible");
+                    ops.push(WriteOp::Put {
+                        pk,
+                        sk,
+                        item: item_json,
+                    });
+                }
+                (None, Some(d)) => {
+                    let pk = extract_key(&d.key, &schema.pk_attr, schema.pk_type, KeyRole::Pk)?;
+                    let sk = match (&schema.sk_attr, schema.sk_type) {
+                        (Some(attr), Some(t)) => Some(extract_key(&d.key, attr, t, KeyRole::Sk)?),
+                        _ => None,
+                    };
+                    reject_extra_key_attrs(&d.key, schema)?;
+                    let tuple = (pk.clone(), sk.clone());
+                    if !seen.insert(tuple) {
+                        return Err(TranslateError::DuplicateKeyInBatch);
+                    }
+                    ops.push(WriteOp::Delete { pk, sk });
+                }
+                _ => return Err(TranslateError::MalformedWriteRequest),
+            }
+        }
+        per_table.push(BatchWritePerTable {
+            table_name: table_name.clone(),
+            ops,
+        });
+    }
+
+    Ok(BatchWriteItemPlan { per_table })
 }
 
 /// Shared `ReturnValues` resolver for PutItem and DeleteItem. DDB accepts

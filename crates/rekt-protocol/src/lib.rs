@@ -10,7 +10,8 @@ pub mod operations;
 
 pub use attribute_value::{AttributeValue, Item};
 pub use operations::{
-    BatchGetItemRequest, BatchGetItemResponse, DeleteItemRequest, DeleteItemResponse,
-    GetItemRequest, GetItemResponse, KeysAndAttributes, PutItemRequest, PutItemResponse,
-    QueryRequest, QueryResponse, ScanRequest, ScanResponse, UpdateItemRequest, UpdateItemResponse,
+    BatchGetItemRequest, BatchGetItemResponse, BatchWriteItemRequest, BatchWriteItemResponse,
+    DeleteItemRequest, DeleteItemResponse, DeleteRequest, GetItemRequest, GetItemResponse,
+    KeysAndAttributes, PutItemRequest, PutItemResponse, PutRequest, QueryRequest, QueryResponse,
+    ScanRequest, ScanResponse, UpdateItemRequest, UpdateItemResponse, WriteRequest,
 };

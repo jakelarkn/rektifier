@@ -46,14 +46,15 @@ pub use materialize::{
     materialize_insert_only_update, materialize_simple_sql_update, materialize_simple_update,
 };
 pub use plan::{
-    touched_paths, BatchGetItemPlan, BatchGetPerTable, ConditionPlan, ConditionRouting,
-    DeleteItemPlan, GetItemPlan, PutItemPlan, QueryPlan, ReturnValuesMode, ScanPlan,
-    SimpleSqlUpdatePrimitives, SimpleUpdatePrimitives, UpdateItemPlan,
+    touched_paths, BatchGetItemPlan, BatchGetPerTable, BatchWriteItemPlan, BatchWritePerTable,
+    ConditionPlan, ConditionRouting, DeleteItemPlan, GetItemPlan, PutItemPlan, QueryPlan,
+    ReturnValuesMode, ScanPlan, SimpleSqlUpdatePrimitives, SimpleUpdatePrimitives, UpdateItemPlan,
 };
 pub use schema::TableSchema;
 pub use translate::{
-    translate_batch_get_item, translate_delete_item, translate_get_item, translate_put_item,
-    translate_query, translate_scan, translate_update_item,
+    translate_batch_get_item, translate_batch_write_item, translate_delete_item,
+    translate_get_item, translate_put_item, translate_query, translate_scan,
+    translate_update_item,
 };
 #[cfg(test)]
 mod tests {

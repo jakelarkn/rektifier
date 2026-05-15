@@ -8,9 +8,9 @@ use rekt_expressions::Condition;
 use rekt_server::{router, AppState};
 use rekt_sigv4::{PermissiveVerifier, Verifier};
 use rekt_storage::{
-    Backend, BackendError, BatchGetOutcome, ConditionEvalFn, FilterEvalFn, GeneralUpdateFn,
-    KeyType, KeyValue, QueryOutcome, ScanOutcome, SkCondition, TableShape, UpdateDecision,
-    UpdateOutcome,
+    Backend, BackendError, BatchGetOutcome, BatchWriteOutcome, ConditionEvalFn, FilterEvalFn,
+    GeneralUpdateFn, KeyType, KeyValue, QueryOutcome, ScanOutcome, SkCondition, TableShape,
+    UpdateDecision, UpdateOutcome, WriteOp,
 };
 use rekt_translator::{evaluate_condition, TableSchema};
 use serde_json::{json, Value};
@@ -498,6 +498,39 @@ impl Backend for MockBackend {
             }
         }
         Ok(BatchGetOutcome { items })
+    }
+
+    async fn batch_write_raw(
+        &self,
+        shape: &TableShape<'_>,
+        ops: &[WriteOp],
+    ) -> Result<BatchWriteOutcome, BackendError> {
+        // Mirror the PG path's "Puts first, then Deletes" ordering so
+        // mock + libpq produce identical state under a same-key
+        // Put+Delete in one request (rare; translator rejects exactly
+        // that case anyway, but let's not diverge).
+        let mut store = self.store.lock().unwrap();
+        for op in ops {
+            if let WriteOp::Put { pk, sk, item } = op {
+                let key = (
+                    shape.table.to_string(),
+                    kv_to_string(pk),
+                    sk.as_ref().map(kv_to_string).unwrap_or_default(),
+                );
+                store.insert(key, item.clone());
+            }
+        }
+        for op in ops {
+            if let WriteOp::Delete { pk, sk } = op {
+                let key = (
+                    shape.table.to_string(),
+                    kv_to_string(pk),
+                    sk.as_ref().map(kv_to_string).unwrap_or_default(),
+                );
+                store.remove(&key);
+            }
+        }
+        Ok(BatchWriteOutcome::default())
     }
 
     async fn update_insert_only_raw(
@@ -5153,4 +5186,259 @@ async fn batch_get_reserved_word_in_bare_projection_rejected() {
         msg.contains("reserved keyword") || msg.contains("Reserved"),
         "expected reserved-word rejection, got: {msg}"
     );
+}
+
+// ===== BatchWriteItem Put-only single-table (B4) =============================
+
+/// Helper: GetItem against the mock to verify what BatchWriteItem
+/// actually persisted (or removed).
+async fn get_item_value(app: &axum::Router, table: &str, key: Value) -> Value {
+    let body = json!({"TableName": table, "Key": key});
+    let resp = app
+        .clone()
+        .oneshot(ddb_request("GetItem", body))
+        .await
+        .unwrap();
+    body_json(resp).await
+}
+
+#[tokio::test]
+async fn batch_write_put_only_persists_items() {
+    let app = app();
+    let req_items = json!({"users":[
+        {"PutRequest":{"Item":{"id":{"S":"bw-a"},"label":{"S":"A"}}}},
+        {"PutRequest":{"Item":{"id":{"S":"bw-b"},"label":{"S":"B"}}}},
+        {"PutRequest":{"Item":{"id":{"S":"bw-c"},"label":{"S":"C"}}}}
+    ]});
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems": req_items}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["UnprocessedItems"], json!({}));
+
+    // Verify via GetItem.
+    for (id, label) in [("bw-a","A"),("bw-b","B"),("bw-c","C")] {
+        let got = get_item_value(&app, "users", json!({"id":{"S":id}})).await;
+        assert_eq!(got["Item"]["label"]["S"].as_str(), Some(label));
+    }
+}
+
+#[tokio::test]
+async fn batch_write_put_overwrites_existing() {
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"bw-over"},"label":{"S":"old"}})).await;
+    let req_items = json!({"users":[
+        {"PutRequest":{"Item":{"id":{"S":"bw-over"},"label":{"S":"new"}}}}
+    ]});
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems": req_items}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let got = get_item_value(&app, "users", json!({"id":{"S":"bw-over"}})).await;
+    assert_eq!(got["Item"]["label"]["S"].as_str(), Some("new"));
+}
+
+#[tokio::test]
+async fn batch_write_composite_key_puts() {
+    let app = app();
+    let req_items = json!({"device_events":[
+        {"PutRequest":{"Item":{
+            "device_id":{"S":"bw-d"},"ts":{"N":"1"},"flag":{"S":"on"}
+        }}},
+        {"PutRequest":{"Item":{
+            "device_id":{"S":"bw-d"},"ts":{"N":"2"},"flag":{"S":"off"}
+        }}}
+    ]});
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems": req_items}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let got1 = get_item_value(&app, "device_events", json!({"device_id":{"S":"bw-d"},"ts":{"N":"1"}})).await;
+    assert_eq!(got1["Item"]["flag"]["S"].as_str(), Some("on"));
+    let got2 = get_item_value(&app, "device_events", json!({"device_id":{"S":"bw-d"},"ts":{"N":"2"}})).await;
+    assert_eq!(got2["Item"]["flag"]["S"].as_str(), Some("off"));
+}
+
+#[tokio::test]
+async fn batch_write_rejects_empty_request_items() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"].as_str().unwrap().ends_with("#ValidationException"));
+    assert!(body["message"].as_str().unwrap().contains("RequestItems"));
+}
+
+#[tokio::test]
+async fn batch_write_rejects_empty_per_table_writes() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{"users":[]}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn batch_write_rejects_duplicate_put_keys() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{"users":[
+                {"PutRequest":{"Item":{"id":{"S":"bw-dup"},"label":{"S":"a"}}}},
+                {"PutRequest":{"Item":{"id":{"S":"bw-dup"},"label":{"S":"b"}}}}
+            ]}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["message"].as_str().unwrap().contains("duplicate"));
+}
+
+#[tokio::test]
+async fn batch_write_rejects_malformed_write_request() {
+    // Both PutRequest and DeleteRequest present.
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{"users":[
+                {"PutRequest":{"Item":{"id":{"S":"x"}}},
+                 "DeleteRequest":{"Key":{"id":{"S":"y"}}}}
+            ]}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("exactly one"));
+}
+
+#[tokio::test]
+async fn batch_write_rejects_neither_put_nor_delete() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{"users":[{}]}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn batch_write_unknown_table_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{"nope":[
+                {"PutRequest":{"Item":{"id":{"S":"x"}}}}
+            ]}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ResourceNotFoundException"));
+}
+
+#[tokio::test]
+async fn batch_write_too_many_requests_rejected() {
+    let app = app();
+    let mut writes = Vec::new();
+    for n in 0..26u32 {
+        writes.push(json!({"PutRequest":{"Item":{"id":{"S":format!("over-{n}")}}}}));
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{"users": writes}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["message"].as_str().unwrap().contains("Too many"));
+}
+
+#[tokio::test]
+async fn batch_write_25_requests_accepted() {
+    let app = app();
+    let mut writes = Vec::new();
+    for n in 0..25u32 {
+        writes.push(json!({"PutRequest":{"Item":{"id":{"S":format!("at-cap-{n}")}}}}));
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{"users": writes}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn batch_write_put_missing_pk_attr_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{"users":[
+                {"PutRequest":{"Item":{"label":{"S":"no-pk"}}}}
+            ]}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn batch_write_put_wrong_pk_type_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{"users":[
+                {"PutRequest":{"Item":{"id":{"N":"42"}}}}
+            ]}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

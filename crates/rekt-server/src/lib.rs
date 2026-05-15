@@ -27,18 +27,19 @@ use axum::routing::post;
 use axum::Router;
 use bytes::Bytes;
 use rekt_protocol::{
-    BatchGetItemRequest, BatchGetItemResponse, DeleteItemRequest, DeleteItemResponse,
-    GetItemRequest, GetItemResponse, Item, PutItemRequest, PutItemResponse, QueryRequest,
-    QueryResponse, ScanRequest, ScanResponse, UpdateItemRequest, UpdateItemResponse,
+    BatchGetItemRequest, BatchGetItemResponse, BatchWriteItemRequest, BatchWriteItemResponse,
+    DeleteItemRequest, DeleteItemResponse, GetItemRequest, GetItemResponse, Item, PutItemRequest,
+    PutItemResponse, QueryRequest, QueryResponse, ScanRequest, ScanResponse, UpdateItemRequest,
+    UpdateItemResponse, WriteRequest,
 };
 use rekt_sigv4::{SigV4Error, Verifier};
 use rekt_storage::{Backend, BackendError, UpdateDecision, UpdateOutcome};
 use rekt_translator::{
     apply_update_expression, encode_lek, evaluate_condition, materialize_insert_only_update,
     materialize_simple_sql_update, materialize_simple_update, touched_paths,
-    translate_batch_get_item, translate_delete_item, translate_get_item, translate_put_item,
-    translate_query, translate_scan, translate_update_item, ConditionRouting, ReturnValuesMode,
-    TableSchema, TranslateError,
+    translate_batch_get_item, translate_batch_write_item, translate_delete_item,
+    translate_get_item, translate_put_item, translate_query, translate_scan,
+    translate_update_item, ConditionRouting, ReturnValuesMode, TableSchema, TranslateError,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -265,6 +266,7 @@ async fn dispatch(State(state): State<AppState>, req: Request) -> Result<Respons
         "Query" => handle_query(&state, &body).await,
         "Scan" => handle_scan(&state, &body).await,
         "BatchGetItem" => handle_batch_get_item(&state, &body).await,
+        "BatchWriteItem" => handle_batch_write_item(&state, &body).await,
         _ => Err(ApiError::UnknownOperation(format!(
             "operation `{op}` not implemented"
         ))),
@@ -748,6 +750,52 @@ async fn handle_batch_get_item(state: &AppState, body: &Bytes) -> Result<Respons
         responses,
         // Always `{}` in v1 — D11 in PLAN-6.
         unprocessed_keys: HashMap::new(),
+    }))
+}
+
+#[tracing::instrument(
+    level = "debug",
+    skip_all,
+    name = "server.batch_write_item",
+    fields(tables = tracing::field::Empty, total_ops = tracing::field::Empty)
+)]
+async fn handle_batch_write_item(state: &AppState, body: &Bytes) -> Result<Response, ApiError> {
+    let req: BatchWriteItemRequest = serde_json::from_slice(body).map_err(|e| {
+        ApiError::Serialization(format!("invalid BatchWriteItem body: {e}"))
+    })?;
+
+    let plan = translate_batch_write_item(
+        &req,
+        state.schemas.as_ref(),
+        state.batch_limits.batch_write_max_requests,
+    )?;
+
+    tracing::Span::current().record("tables", plan.per_table.len());
+    let total_ops: usize = plan.per_table.iter().map(|t| t.ops.len()).sum();
+    tracing::Span::current().record("total_ops", total_ops);
+
+    // Per-table serial fan-out (D1). Each table opens its own
+    // transaction inside `batch_write_raw`; cross-table writes are
+    // *not* atomic (matches DDB).
+    for table_plan in &plan.per_table {
+        let schema = state
+            .schemas
+            .get(&table_plan.table_name)
+            .ok_or_else(|| {
+                ApiError::ResourceNotFound(format!(
+                    "Table not found: {}",
+                    table_plan.table_name
+                ))
+            })?;
+        state
+            .backend
+            .batch_write_raw(&schema.shape(), &table_plan.ops)
+            .await?;
+    }
+
+    Ok(json_ok(&BatchWriteItemResponse {
+        // Always `{}` in v1 — D11 in PLAN-6.
+        unprocessed_items: HashMap::<String, Vec<WriteRequest>>::new(),
     }))
 }
 

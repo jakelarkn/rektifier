@@ -29,6 +29,7 @@
 //!   `delete_item_raw`, and the two `_with_condition_raw` siblings.
 
 mod batch_get;
+mod batch_write;
 mod condition_sql;
 mod put_delete;
 mod query;
@@ -41,8 +42,9 @@ use async_trait::async_trait;
 use deadpool_postgres::{Manager, Pool};
 use rekt_expressions::Condition;
 use rekt_storage::{
-    Backend, BackendError, BatchGetOutcome, ConditionEvalFn, FilterEvalFn, GeneralUpdateFn,
-    KeyValue, QueryOutcome, ScanOutcome, SkCondition, TableShape, UpdateOutcome,
+    Backend, BackendError, BatchGetOutcome, BatchWriteOutcome, ConditionEvalFn, FilterEvalFn,
+    GeneralUpdateFn, KeyValue, QueryOutcome, ScanOutcome, SkCondition, TableShape, UpdateOutcome,
+    WriteOp,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -223,6 +225,14 @@ impl Backend for PgBackend {
         keys: &[(KeyValue, Option<KeyValue>)],
     ) -> Result<BatchGetOutcome, BackendError> {
         batch_get::batch_get_raw(self, shape, keys).await
+    }
+
+    async fn batch_write_raw(
+        &self,
+        shape: &TableShape<'_>,
+        ops: &[WriteOp],
+    ) -> Result<BatchWriteOutcome, BackendError> {
+        batch_write::batch_write_raw(self, shape, ops).await
     }
 }
 #[cfg(test)]
@@ -3658,6 +3668,248 @@ mod tests {
             .batch_execute("DROP TABLE rekt_t_bg_comp;")
             .await
             .unwrap();
+    }
+
+    // ===== BatchWriteItem (B4–B5) ============================================
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn batch_write_put_only_hash() {
+        use rekt_storage::WriteOp;
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_bw_hash_s;
+                 CREATE TABLE rekt_t_bw_hash_s (
+                   data jsonb NOT NULL,
+                   id   text  GENERATED ALWAYS AS (data#>>'{id,S}') STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_bw_hash_s",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        let ops = vec![
+            WriteOp::Put {
+                pk: KeyValue::S("a".into()),
+                sk: None,
+                item: serde_json::json!({"id":{"S":"a"},"label":{"S":"A"}}),
+            },
+            WriteOp::Put {
+                pk: KeyValue::S("b".into()),
+                sk: None,
+                item: serde_json::json!({"id":{"S":"b"},"label":{"S":"B"}}),
+            },
+        ];
+        backend.batch_write_raw(&shape, &ops).await.unwrap();
+
+        // Verify via GetItem.
+        for (id, lab) in [("a","A"),("b","B")] {
+            let got = backend
+                .get_item_raw(&shape, &KeyValue::S(id.into()), None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(got["label"]["S"].as_str(), Some(lab));
+        }
+
+        // Upsert: re-Put with new label.
+        let ops2 = vec![WriteOp::Put {
+            pk: KeyValue::S("a".into()),
+            sk: None,
+            item: serde_json::json!({"id":{"S":"a"},"label":{"S":"A2"}}),
+        }];
+        backend.batch_write_raw(&shape, &ops2).await.unwrap();
+        let got = backend
+            .get_item_raw(&shape, &KeyValue::S("a".into()), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got["label"]["S"].as_str(), Some("A2"));
+
+        client
+            .batch_execute("DROP TABLE rekt_t_bw_hash_s;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn batch_write_put_composite() {
+        use rekt_storage::WriteOp;
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_bw_comp;
+                 CREATE TABLE rekt_t_bw_comp (
+                   data      jsonb   NOT NULL,
+                   device_id text    GENERATED ALWAYS AS (data#>>'{device_id,S}') STORED,
+                   ts        numeric GENERATED ALWAYS AS ((data#>>'{ts,N}')::numeric) STORED,
+                   PRIMARY KEY (device_id, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_bw_comp",
+            pk_col: "device_id",
+            pk_type: KeyType::S,
+            sk_col: Some("ts"),
+            sk_type: Some(KeyType::N),
+            jsonb_col: "data",
+        };
+        let ops = vec![
+            WriteOp::Put {
+                pk: KeyValue::S("d1".into()),
+                sk: Some(KeyValue::N("1".into())),
+                item: serde_json::json!({"device_id":{"S":"d1"},"ts":{"N":"1"}}),
+            },
+            WriteOp::Put {
+                pk: KeyValue::S("d1".into()),
+                sk: Some(KeyValue::N("2".into())),
+                item: serde_json::json!({"device_id":{"S":"d1"},"ts":{"N":"2"}}),
+            },
+            WriteOp::Put {
+                pk: KeyValue::S("d2".into()),
+                sk: Some(KeyValue::N("1".into())),
+                item: serde_json::json!({"device_id":{"S":"d2"},"ts":{"N":"1"}}),
+            },
+        ];
+        backend.batch_write_raw(&shape, &ops).await.unwrap();
+
+        let got = backend
+            .get_item_raw(
+                &shape,
+                &KeyValue::S("d1".into()),
+                Some(&KeyValue::N("2".into())),
+            )
+            .await
+            .unwrap();
+        assert!(got.is_some());
+
+        client
+            .batch_execute("DROP TABLE rekt_t_bw_comp;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn batch_write_put_and_delete_hash() {
+        use rekt_storage::WriteOp;
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_bw_mix;
+                 CREATE TABLE rekt_t_bw_mix (
+                   data jsonb NOT NULL,
+                   id   text  GENERATED ALWAYS AS (data#>>'{id,S}') STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_bw_mix",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+
+        // Pre-seed two rows that will get deleted.
+        for id in ["del-1","del-2"] {
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({"id":{"S":id}}),
+            )
+            .await;
+        }
+        // Mix Put + Delete in one batch.
+        let ops = vec![
+            WriteOp::Put {
+                pk: KeyValue::S("new-1".into()),
+                sk: None,
+                item: serde_json::json!({"id":{"S":"new-1"},"label":{"S":"x"}}),
+            },
+            WriteOp::Delete {
+                pk: KeyValue::S("del-1".into()),
+                sk: None,
+            },
+            WriteOp::Delete {
+                pk: KeyValue::S("del-2".into()),
+                sk: None,
+            },
+            WriteOp::Put {
+                pk: KeyValue::S("new-2".into()),
+                sk: None,
+                item: serde_json::json!({"id":{"S":"new-2"},"label":{"S":"y"}}),
+            },
+        ];
+        backend.batch_write_raw(&shape, &ops).await.unwrap();
+
+        // new-1, new-2 exist; del-1, del-2 gone.
+        assert!(backend.get_item_raw(&shape, &KeyValue::S("new-1".into()), None).await.unwrap().is_some());
+        assert!(backend.get_item_raw(&shape, &KeyValue::S("new-2".into()), None).await.unwrap().is_some());
+        assert!(backend.get_item_raw(&shape, &KeyValue::S("del-1".into()), None).await.unwrap().is_none());
+        assert!(backend.get_item_raw(&shape, &KeyValue::S("del-2".into()), None).await.unwrap().is_none());
+
+        // Delete of a non-existent row is a no-op (no error).
+        backend
+            .batch_write_raw(
+                &shape,
+                &[WriteOp::Delete {
+                    pk: KeyValue::S("never-existed".into()),
+                    sk: None,
+                }],
+            )
+            .await
+            .unwrap();
+
+        client
+            .batch_execute("DROP TABLE rekt_t_bw_mix;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn batch_write_unknown_table_surfaces_table_not_found() {
+        use rekt_storage::WriteOp;
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let shape = TableShape {
+            table: "rekt_t_bw_no_such_table_xyz",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        let err = backend
+            .batch_write_raw(
+                &shape,
+                &[WriteOp::Put {
+                    pk: KeyValue::S("x".into()),
+                    sk: None,
+                    item: serde_json::json!({"id":{"S":"x"}}),
+                }],
+            )
+            .await
+            .unwrap_err();
+        match err {
+            BackendError::TableNotFound { .. } => {}
+            other => panic!("expected TableNotFound, got {other:?}"),
+        }
     }
 
     #[tokio::test]

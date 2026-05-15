@@ -12,7 +12,7 @@
 //!   feeds `ReturnValues=UPDATED_*` projection.
 
 use rekt_expressions::{Condition, UpdateExpression};
-use rekt_storage::{KeyValue, SkCondition};
+use rekt_storage::{KeyValue, SkCondition, WriteOp};
 
 #[derive(Debug, Clone)]
 pub struct PutItemPlan {
@@ -233,6 +233,27 @@ pub struct BatchGetPerTable {
     /// Carried through so the dispatcher can record a per-table
     /// tracing field; no behavioral effect (D7).
     pub consistent_read: bool,
+}
+
+/// BatchWriteItem plan: per-table groups of resolved `WriteOp`s.
+///
+/// Order of `per_table` mirrors `BatchGetItemPlan`: whatever the
+/// serde `HashMap` iterator yields — we do *not* sort. Order of
+/// `ops` within a table preserves the request's `Vec<WriteRequest>`
+/// order.
+#[derive(Debug, Clone, Default)]
+pub struct BatchWriteItemPlan {
+    pub per_table: Vec<BatchWritePerTable>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchWritePerTable {
+    pub table_name: String,
+    /// Pre-validated, pre-deduped, pre-typed write operations.
+    /// `WriteOp::Put` carries the full DDB-JSON item (which contains
+    /// the key attrs); `WriteOp::Delete` carries the typed key
+    /// tuple only.
+    pub ops: Vec<WriteOp>,
 }
 
 /// Storage-ready primitives for an UpdateItem with a `SimpleSql`-

@@ -269,15 +269,37 @@ pub enum TranslateError {
     #[error("AttributesToGet not supported; use ProjectionExpression")]
     AttributesToGetNotSupported,
 
-    /// BatchGetItem named a table that isn't declared in the config.
-    /// DDB raises `ResourceNotFoundException` for the same case; the
-    /// server maps this variant to the same HTTP error shape.
-    ///
-    /// Lives on the translator boundary (rather than the dispatcher)
-    /// because a single BatchGetItem request can name many tables, so
-    /// the schema lookup is part of the translator's per-table loop.
+    /// BatchGetItem or BatchWriteItem named a table that isn't declared
+    /// in the config. DDB raises `ResourceNotFoundException` for the
+    /// same case; the server maps this variant to that wire shape.
     #[error("Table not found: {table}")]
     ResourceNotFoundForBatch { table: String },
+
+    // ----- BatchWriteItem -----
+    /// `RequestItems` was absent or `{}`. DDB rejects.
+    #[error(
+        "BatchWriteItem cannot have an empty value for the RequestItems parameter"
+    )]
+    EmptyBatchWriteRequest,
+
+    /// A per-table `Vec<WriteRequest>` was empty (`[]`).
+    #[error("BatchWriteItem RequestItems[{table}] must not be empty")]
+    EmptyWritesInBatch { table: String },
+
+    /// Sum of writes across all per-table entries exceeded the
+    /// configured cap (DDB default 25). Operator-tunable via
+    /// `[batch_limits].batch_write_max_requests`.
+    #[error(
+        "Too many items requested for the BatchWriteItem call: {got} (max {max})"
+    )]
+    TooManyWritesInBatch { got: u32, max: u32 },
+
+    /// A `WriteRequest` had both `PutRequest` and `DeleteRequest` set,
+    /// or neither. DDB's wire-shape requires exactly one.
+    #[error(
+        "A WriteRequest must contain exactly one of PutRequest or DeleteRequest"
+    )]
+    MalformedWriteRequest,
 }
 
 impl From<ParseError> for TranslateError {

@@ -254,6 +254,53 @@ pub struct BatchGetItemRequest {
     pub return_consumed_capacity: Option<String>,
 }
 
+/// A single write request inside a `BatchWriteItem`. DDB's wire shape
+/// is externally-tagged: each entry is either `{"PutRequest": {...}}`
+/// or `{"DeleteRequest": {...}}`. We mirror that with two `Option`
+/// fields and validate "exactly one set" in the translator
+/// (`MalformedWriteRequest`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct WriteRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub put_request: Option<PutRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_request: Option<DeleteRequest>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PutRequest {
+    pub item: Item,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct DeleteRequest {
+    pub key: Item,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct BatchWriteItemRequest {
+    pub request_items: std::collections::HashMap<String, Vec<WriteRequest>>,
+    /// Accepted-and-dropped (metering not implemented).
+    #[serde(default)]
+    pub return_consumed_capacity: Option<String>,
+    /// Accepted-and-dropped (metering not implemented).
+    #[serde(default)]
+    pub return_item_collection_metrics: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct BatchWriteItemResponse {
+    /// Always `{}` in v1 — rektifier has no throttle / partial-failure
+    /// surface (D11). Field is present so SDK retry loops have a
+    /// well-shaped value to interrogate.
+    pub unprocessed_items: std::collections::HashMap<String, Vec<WriteRequest>>,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct BatchGetItemResponse {

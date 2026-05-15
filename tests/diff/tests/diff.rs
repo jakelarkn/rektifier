@@ -4178,3 +4178,81 @@ fn diff_batch_get_consistent_read_silently_accepted() {
     );
     delete_both("users", "{\"id\":{\"S\":\"bg-cr\"}}");
 }
+
+// ===== BatchWriteItem Put-only (B4) ==========================================
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_write_put_only_persists() {
+    ensure_users_table();
+    let req_items = "{\"users\":[\
+        {\"PutRequest\":{\"Item\":{\"id\":{\"S\":\"bw-d-a\"},\"label\":{\"S\":\"A\"}}}},\
+        {\"PutRequest\":{\"Item\":{\"id\":{\"S\":\"bw-d-b\"},\"label\":{\"S\":\"B\"}}}}\
+    ]}";
+    let r_ref = aws(REF, &["dynamodb","batch-write-item","--request-items",req_items]);
+    let r_ours = aws(OURS, &["dynamodb","batch-write-item","--request-items",req_items]);
+    // Both endpoints return empty UnprocessedItems on success.
+    assert_eq!(r_ref["UnprocessedItems"], json!({}));
+    assert_eq!(r_ours["UnprocessedItems"], json!({}));
+
+    // GetItem on each should return the same item.
+    for id in ["bw-d-a","bw-d-b"] {
+        let key = format!("{{\"id\":{{\"S\":\"{id}\"}}}}");
+        let g_ref = aws(REF, &["dynamodb","get-item","--table-name","users","--key",&key]);
+        let g_ours = aws(OURS, &["dynamodb","get-item","--table-name","users","--key",&key]);
+        assert_eq!(g_ref, g_ours, "parity drift on id={id}");
+    }
+
+    for id in ["bw-d-a","bw-d-b"] {
+        delete_both("users", &format!("{{\"id\":{{\"S\":\"{id}\"}}}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_write_composite_table() {
+    ensure_device_events_table();
+    let pk = "bw-d-comp";
+    let req_items = format!(
+        "{{\"device_events\":[\
+            {{\"PutRequest\":{{\"Item\":{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"10\"}},\"flag\":{{\"S\":\"on\"}}}}}}}},\
+            {{\"PutRequest\":{{\"Item\":{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"20\"}},\"flag\":{{\"S\":\"off\"}}}}}}}}\
+        ]}}"
+    );
+    let _ = aws(REF, &["dynamodb","batch-write-item","--request-items",&req_items]);
+    let _ = aws(OURS, &["dynamodb","batch-write-item","--request-items",&req_items]);
+    for ts in ["10","20"] {
+        let key = format!("{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"{ts}\"}}}}");
+        let g_ref = aws(REF, &["dynamodb","get-item","--table-name","device_events","--key",&key]);
+        let g_ours = aws(OURS, &["dynamodb","get-item","--table-name","device_events","--key",&key]);
+        assert_eq!(g_ref, g_ours);
+        delete_both_composite("device_events","device_id",pk,"ts",&format!("{{\"N\":\"{ts}\"}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_write_duplicate_keys_both_reject() {
+    let req_items = "{\"users\":[\
+        {\"PutRequest\":{\"Item\":{\"id\":{\"S\":\"bw-d-dup\"}}}},\
+        {\"PutRequest\":{\"Item\":{\"id\":{\"S\":\"bw-d-dup\"}}}}\
+    ]}";
+    let err_ref = aws_expecting_failure(REF, &["dynamodb","batch-write-item","--request-items",req_items]);
+    let err_ours = aws_expecting_failure(OURS, &["dynamodb","batch-write-item","--request-items",req_items]);
+    assert!(err_ref.contains("duplicate") || err_ref.contains("Duplicate"),
+        "ref didn't reject dup: {err_ref}");
+    assert!(err_ours.contains("duplicate") || err_ours.contains("Duplicate"),
+        "ours didn't reject dup: {err_ours}");
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_write_unprocessed_items_always_empty() {
+    ensure_users_table();
+    let req_items = "{\"users\":[{\"PutRequest\":{\"Item\":{\"id\":{\"S\":\"bw-d-uk\"}}}}]}";
+    let r_ref = aws(REF, &["dynamodb","batch-write-item","--request-items",req_items]);
+    let r_ours = aws(OURS, &["dynamodb","batch-write-item","--request-items",req_items]);
+    assert_eq!(r_ref["UnprocessedItems"], json!({}));
+    assert_eq!(r_ours["UnprocessedItems"], json!({}));
+    delete_both("users", "{\"id\":{\"S\":\"bw-d-uk\"}}");
+}
