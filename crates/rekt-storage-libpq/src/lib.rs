@@ -2595,7 +2595,11 @@ mod tests {
             .map(|i| i["ts"]["S"].as_str().unwrap())
             .collect();
         assert_eq!(ts, vec!["2026-01-03", "2026-01-04"]);
-        assert!(out.last_evaluated_key.is_none());
+        // DDB parity: LEK is present whenever the page fills exactly
+        // to Limit, even if no more matching rows remain. The next
+        // call would return 0 items + no LEK.
+        let (_, lek_sk) = out.last_evaluated_key.expect("LEK present on filled page");
+        assert_eq!(lek_sk, Some(KeyValue::S("2026-01-04".into())));
 
         client
             .batch_execute("DROP TABLE rekt_t_q_esk_bw;")

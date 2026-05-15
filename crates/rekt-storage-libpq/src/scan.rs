@@ -109,10 +109,14 @@ pub(crate) async fn scan_raw(
     };
 
     // ---- LIMIT ----
+    // Match DDB's LEK semantic: set LastEvaluatedKey iff the page
+    // filled exactly to the requested Limit (whether or not more
+    // data exists past it). Read exactly `Limit` rows — no L+1
+    // sentinel.
     let lim_input = limit.unwrap_or(DEFAULT_LIMIT);
-    let lim_plus_one = (lim_input as i64).saturating_add(1);
+    let lim_bound = lim_input as i64;
     types.push(Type::INT8);
-    params.push(&lim_plus_one);
+    params.push(&lim_bound);
     let limit_idx = next_idx;
 
     let sql = format!(
@@ -132,21 +136,19 @@ pub(crate) async fn scan_raw(
         .await
         .map_err(|e| map_pg_err(shape.table, e))?;
 
-    // ---- Decode + L+1 sentinel + filter ----
+    // ---- Decode + filter ----
     //
-    // Same two-pass shape as query.rs: decode all scanned rows so the
-    // L-th row is known for LEK before filter drops it, then apply
-    // the filter to the (possibly truncated) list.
+    // Same two-pass shape as query.rs: decode all scanned rows so
+    // the L-th row is known for LEK before filter drops it, then
+    // apply the filter to produce the items list. LEK is set
+    // whenever the page filled exactly to Limit (DDB parity).
     let mut scanned_rows: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
     for row in &rows {
         let Json(v): Json<serde_json::Value> = row.get(0);
         scanned_rows.push(v);
     }
-    let has_more = scanned_rows.len() as i64 == lim_plus_one;
-    if has_more {
-        scanned_rows.truncate(lim_input as usize);
-    }
-    let last_evaluated_key = if has_more {
+    let filled_to_limit = scanned_rows.len() as u32 == lim_input;
+    let last_evaluated_key = if filled_to_limit {
         scanned_rows
             .last()
             .and_then(|row| lek_from_row(row, shape))

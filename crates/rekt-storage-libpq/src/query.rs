@@ -198,17 +198,21 @@ pub(crate) async fn query_raw(
         params.push(b);
     }
 
-    // LIMIT (always last). Bind as L+1 so we can detect "more remain"
-    // by counting returned rows.
+    // LIMIT (always last). DDB sets `LastEvaluatedKey` whenever the
+    // page fills exactly to the requested `Limit`, regardless of
+    // whether any more rows actually exist past it (per DDB docs:
+    // "LastEvaluatedKey not empty does NOT mean more data exists").
+    // We match that semantic by reading exactly `Limit` rows and
+    // setting LEK iff we returned that many — no L+1 sentinel.
     let lim_input = limit.unwrap_or(DEFAULT_LIMIT);
-    let lim_plus_one = (lim_input as i64).saturating_add(1);
+    let lim_bound = lim_input as i64;
     let order_dir = if forward { "ASC" } else { "DESC" };
     let order_by = match shape.sk_col {
         Some(sk_col) => format!(" ORDER BY {} {order_dir}", quote_ident(sk_col)),
         None => String::new(),
     };
     types.push(Type::INT8);
-    params.push(&lim_plus_one);
+    params.push(&lim_bound);
 
     let sql = format!(
         "SELECT {jsonb_col} FROM {table} WHERE {where_sql}{order_by} LIMIT ${next_idx}"
@@ -227,29 +231,24 @@ pub(crate) async fn query_raw(
         .await
         .map_err(|e| map_pg_err(shape.table, e))?;
 
-    // ---- Decode + apply L+1 sentinel + per-row filter ----
+    // ---- Decode + per-row filter ----
     //
-    // Two-pass strategy: decode all returned rows first (so we can
-    // identify the L-th row for LEK *before* filter drops it), then
-    // apply the filter to produce the post-filter `items` list.
+    // Two-pass: decode all scanned rows first so the L-th row is
+    // available for LEK *before* filter drops it, then apply the
+    // filter to produce the post-filter `items` list.
     //
     // DDB semantics: Limit caps the number of *scanned* rows (pre-
     // filter); FilterExpression then drops rows post-scan. LEK is
-    // set whenever the scan stopped due to Limit (i.e. we got L+1
-    // rows back), regardless of how many rows passed the filter —
-    // even Count=0 + LEK is a valid response that tells the client
-    // "no matches in this page, keep paging."
+    // set whenever the page filled exactly to Limit — even
+    // Count=0 + LEK is valid ("no matches in this page; keep
+    // paging").
     let mut scanned_rows: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
     for row in &rows {
         let Json(v): Json<serde_json::Value> = row.get(0);
         scanned_rows.push(v);
     }
-    let has_more = scanned_rows.len() as i64 == lim_plus_one;
-    if has_more {
-        // Drop the sentinel before LEK lookup so the L-th row is `last`.
-        scanned_rows.truncate(lim_input as usize);
-    }
-    let last_evaluated_key = if has_more {
+    let filled_to_limit = scanned_rows.len() as u32 == lim_input;
+    let last_evaluated_key = if filled_to_limit {
         scanned_rows
             .last()
             .and_then(|row| lek_from_row(row, shape))

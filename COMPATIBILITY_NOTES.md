@@ -244,6 +244,21 @@ miss every row against rektifier.
 **Closure plan:** lift alongside `PLAN-4` D8 (which makes the same
 restriction explicit for Query's KCE).
 
+### `begins_with` on B-typed sort key in `KeyConditionExpression` is rejected — Strict
+
+Per PLAN-4 D8, rektifier rejects `KeyConditionExpression` of the
+form `pk = :v AND begins_with(<B-sk>, :pfx)` at translate time with
+`ValidationException: begins_with operand must be S`. DDB-local
+accepts the same KCE and performs a real binary-prefix match.
+
+**Migration risk:** code that relies on B-SK prefix queries against
+DDB will fail against rektifier. The diff harness pins this
+divergence in `diff_query_binsorted_begins_with_b_sk_divergence` so
+we notice if either side changes.
+
+**Closure plan:** same as the slow-path-eval entry above — lift
+together when the evaluator learns to decode B prefixes.
+
 ### Updating a key attribute via `SET` / `REMOVE` / `ADD` / `DELETE` is rejected — Parity
 
 `check_not_key` in `crates/rekt-translator/src/checks.rs` rejects any

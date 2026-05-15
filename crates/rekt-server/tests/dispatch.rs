@@ -350,17 +350,16 @@ impl Backend for MockBackend {
             }
         }
 
+        // Match PgBackend: truncate to Limit, then set LEK iff the
+        // page filled exactly to Limit (DDB parity — LEK present
+        // doesn't imply more data exists).
         let lim = limit.unwrap_or(1000) as usize;
-        let has_more = hits.len() > lim;
-        if has_more {
+        if hits.len() > lim {
             hits.truncate(lim);
         }
+        let filled_to_limit = limit.is_some_and(|l| hits.len() == l as usize);
 
-        // LEK is derived from the last *scanned* row (the one that
-        // capped at Limit), not the last filter-passing row. Compute
-        // it before applying the filter so the cursor advances even
-        // when the filter drops everything in the current page.
-        let last_evaluated_key = if has_more {
+        let last_evaluated_key = if filled_to_limit {
             hits.last().map(|(sk_str, _)| {
                 let sk_kv = shape.sk_type.map(|t| match t {
                     KeyType::S => KeyValue::S(sk_str.clone()),
@@ -438,14 +437,15 @@ impl Backend for MockBackend {
             });
         }
 
+        // Truncate to Limit; LEK iff the page filled to Limit (DDB
+        // parity — see PgBackend scan.rs).
         let lim = limit.unwrap_or(1000) as usize;
-        let has_more = hits.len() > lim;
-        if has_more {
+        if hits.len() > lim {
             hits.truncate(lim);
         }
+        let filled_to_limit = limit.is_some_and(|l| hits.len() == l as usize);
 
-        // LEK from the L-th *scanned* row (pre-filter).
-        let last_evaluated_key = if has_more {
+        let last_evaluated_key = if filled_to_limit {
             hits.last().map(|(pk, sk, _)| {
                 let pk_kv = match shape.pk_type {
                     KeyType::S => KeyValue::S(pk.clone()),
