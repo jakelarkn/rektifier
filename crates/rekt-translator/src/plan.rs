@@ -317,5 +317,12 @@ pub enum TransactWriteKind {
     Put { item_json: serde_json::Value },
     Delete,
     ConditionCheck,
-    // T5: Update.
+    /// Parsed UpdateExpression + the request's `Key` Item (used when
+    /// the row doesn't exist and we need to synthesize the new-row
+    /// shape from the key attrs). Dispatcher builds a
+    /// `GeneralUpdateFn` closure from these.
+    Update {
+        expression: UpdateExpression,
+        key: rekt_protocol::Item,
+    },
 }

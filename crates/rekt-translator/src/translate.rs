@@ -719,10 +719,79 @@ pub fn translate_transact_write_items(
                 condition: Some(condition),
                 return_old_on_failure,
             });
+        } else if let Some(upd) = ti.update.as_ref() {
+            let schema = schemas.get(&upd.table_name).ok_or_else(|| {
+                TranslateError::ResourceNotFoundForTransact {
+                    table: upd.table_name.clone(),
+                }
+            })?;
+            let (pk, sk) = extract_key_pair(&upd.key, schema)?;
+            reject_extra_key_attrs(&upd.key, schema)?;
+            let target = (upd.table_name.clone(), pk.clone(), sk.clone());
+            if !seen.insert(target) {
+                return Err(TranslateError::DuplicateTransactTarget);
+            }
+
+            let raw_expr = parse_update_expression(&upd.update_expression)?;
+            let names = upd.expression_attribute_names.as_ref().unwrap_or(&empty_names);
+            let values = upd
+                .expression_attribute_values
+                .as_ref()
+                .unwrap_or(&empty_values);
+            let expression = substitute_update(raw_expr, names, values)?;
+            if expression.set.is_empty()
+                && expression.remove.is_empty()
+                && expression.add.is_empty()
+                && expression.delete.is_empty()
+            {
+                return Err(TranslateError::EmptyUpdateExpression);
+            }
+            // Reuse the per-clause validation Update has — Transact's Update
+            // is otherwise identical to single-row UpdateItem semantics.
+            for clause in &expression.set {
+                check_top_level(&clause.path)?;
+                check_not_key(&clause.path, schema)?;
+                check_set_rhs_paths_top_level(&clause.value)?;
+            }
+            for path in &expression.remove {
+                check_top_level(path)?;
+                check_not_key(path, schema)?;
+            }
+            for action in &expression.add {
+                check_top_level(&action.path)?;
+                check_not_key(&action.path, schema)?;
+                check_add_value_type(&action.value)?;
+            }
+            for action in &expression.delete {
+                check_top_level(&action.path)?;
+                check_not_key(&action.path, schema)?;
+                check_delete_value_type(&action.value)?;
+            }
+
+            let condition = translate_condition(
+                upd.condition_expression.as_deref(),
+                names,
+                values,
+                schema,
+            )?;
+            let return_old_on_failure = parse_return_old_on_failure(
+                upd.return_values_on_condition_check_failure.as_deref(),
+            )?;
+            items.push(TransactWritePlanItem {
+                table_name: upd.table_name.clone(),
+                pk,
+                sk,
+                kind: TransactWriteKind::Update {
+                    expression,
+                    key: upd.key.clone(),
+                },
+                condition,
+                return_old_on_failure,
+            });
         } else {
-            // Update lands in T5.
+            // All four variants handled — shouldn't reach.
             return Err(TranslateError::MalformedTransactItem {
-                expected: "Put / Delete / ConditionCheck (Update lands in PLAN-8 T5)",
+                expected: "Put | Delete | Update | ConditionCheck",
             });
         }
     }

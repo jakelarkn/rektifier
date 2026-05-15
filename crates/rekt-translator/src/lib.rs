@@ -3231,18 +3231,58 @@ mod tests {
     }
 
     #[test]
-    fn transact_write_update_rejected_until_t5() {
+    fn transact_write_update_ok() {
+        let mut values = BTreeMap::new();
+        values.insert(":v".into(), AttributeValue::S("new".into()));
         let req = tw_req(vec![rekt_protocol::TransactWriteItem {
             update: Some(rekt_protocol::TransactUpdate {
                 table_name: "users".into(),
                 key: item_of(&[("id", AttributeValue::S("a".into()))]),
                 update_expression: "SET label = :v".into(),
+                expression_attribute_values: Some(values),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]);
+        let plan = translate_transact_write_items(&req, &schemas_map(), 100).unwrap();
+        assert!(matches!(plan.items[0].kind, TransactWriteKind::Update { .. }));
+    }
+
+    #[test]
+    fn transact_write_update_empty_expression_rejected() {
+        let req = tw_req(vec![rekt_protocol::TransactWriteItem {
+            update: Some(rekt_protocol::TransactUpdate {
+                table_name: "users".into(),
+                key: item_of(&[("id", AttributeValue::S("a".into()))]),
+                update_expression: "SET".into(),
                 ..Default::default()
             }),
             ..Default::default()
         }]);
         let err = translate_transact_write_items(&req, &schemas_map(), 100).unwrap_err();
-        assert!(matches!(err, TranslateError::MalformedTransactItem { .. }));
+        // Either parse error or EmptyUpdateExpression — anything but Ok.
+        assert!(
+            matches!(err, TranslateError::EmptyUpdateExpression)
+                || matches!(err, TranslateError::InvalidUpdateExpression(_))
+        );
+    }
+
+    #[test]
+    fn transact_write_update_touches_key_rejected() {
+        let mut values = BTreeMap::new();
+        values.insert(":v".into(), AttributeValue::S("new".into()));
+        let req = tw_req(vec![rekt_protocol::TransactWriteItem {
+            update: Some(rekt_protocol::TransactUpdate {
+                table_name: "users".into(),
+                key: item_of(&[("id", AttributeValue::S("a".into()))]),
+                update_expression: "SET id = :v".into(),
+                expression_attribute_values: Some(values),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]);
+        let err = translate_transact_write_items(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::UpdateTouchesKey { .. }));
     }
 
     #[test]

@@ -528,7 +528,19 @@ pub enum TransactWriteOp<'a> {
         condition: ConditionEvalFn<'a>,
         return_old_on_failure: bool,
     },
-    // Update lands in T5.
+    /// UpdateItem-equivalent inside the cross-table tx. Goes through
+    /// the general RMW path: SELECT FOR UPDATE, evaluate condition,
+    /// hand `existing` to `apply` to compute the new full row,
+    /// UPDATE / INSERT. The closure encapsulates the parsed
+    /// `UpdateExpression` (and any condition decision) so storage
+    /// stays independent of the expression evaluator.
+    Update {
+        shape: TableShape<'a>,
+        pk: KeyValue,
+        sk: Option<KeyValue>,
+        apply: GeneralUpdateFn<'a>,
+        return_old_on_failure: bool,
+    },
 }
 
 /// Success outcome of a `transact_write_raw` call. Carries no data

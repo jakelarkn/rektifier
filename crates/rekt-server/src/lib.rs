@@ -1122,6 +1122,32 @@ async fn handle_transact_write_items(
                     return_old_on_failure: plan_item.return_old_on_failure,
                 });
             }
+            TransactWriteKind::Update { expression, key } => {
+                // Build a GeneralUpdateFn that evaluates the optional
+                // ConditionExpression (Fail on false) and then applies
+                // the parsed UpdateExpression to produce the new row.
+                // `Fn` (not `FnOnce`) so the storage layer could call
+                // it inside a retry loop — though the in-tx variant
+                // is single-pass.
+                let condition_for_closure = plan_item.condition.as_ref().map(|c| c.condition.clone());
+                let apply: rekt_storage::GeneralUpdateFn<'_> = Box::new(move |existing| {
+                    if let Some(cond) = &condition_for_closure {
+                        if !evaluate_condition(existing, cond) {
+                            return Ok(UpdateDecision::Fail);
+                        }
+                    }
+                    let new_item = apply_update_expression(existing, &expression, &key)
+                        .map_err(|e| BackendError::Other(format!("UpdateExpression eval failed: {e}")))?;
+                    Ok(UpdateDecision::Apply(new_item))
+                });
+                ops.push(TransactWriteOp::Update {
+                    shape,
+                    pk: plan_item.pk,
+                    sk: plan_item.sk,
+                    apply,
+                    return_old_on_failure: plan_item.return_old_on_failure,
+                });
+            }
         }
     }
 

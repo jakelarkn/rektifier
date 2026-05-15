@@ -4962,3 +4962,69 @@ fn diff_transact_write_condition_check_failure_rolls_back() {
     assert!(r_ref.get("Item").is_none(), "ref leaked atomicity: {r_ref}");
     assert!(r_ours.get("Item").is_none(), "ours leaked atomicity: {r_ours}");
 }
+
+// ===== TransactWriteItems T5 — Update =======================================
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_transact_write_update_existing_row() {
+    ensure_users_table();
+    let seed = "{\"id\":{\"S\":\"tw-d-upd-1\"},\"label\":{\"S\":\"old\"}}";
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",seed]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",seed]);
+
+    let items = "[{\"Update\":{\
+        \"TableName\":\"users\",\
+        \"Key\":{\"id\":{\"S\":\"tw-d-upd-1\"}},\
+        \"UpdateExpression\":\"SET label = :v\",\
+        \"ExpressionAttributeValues\":{\":v\":{\"S\":\"new\"}}\
+    }}]";
+    let _ = aws(REF, &["dynamodb","transact-write-items","--transact-items",items]);
+    let _ = aws(OURS, &["dynamodb","transact-write-items","--transact-items",items]);
+
+    let key = "{\"id\":{\"S\":\"tw-d-upd-1\"}}";
+    let r_ref = aws(REF, &["dynamodb","get-item","--table-name","users","--key",key]);
+    let r_ours = aws(OURS, &["dynamodb","get-item","--table-name","users","--key",key]);
+    assert_eq!(r_ref["Item"], r_ours["Item"]);
+    assert_eq!(r_ref["Item"]["label"]["S"], "new");
+
+    delete_both("users", key);
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_transact_write_update_with_failing_condition_atomicity() {
+    ensure_users_table();
+    let seed = "{\"id\":{\"S\":\"tw-d-upd-cf\"},\"label\":{\"S\":\"keep_me\"}}";
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",seed]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",seed]);
+
+    let items = "[\
+        {\"Put\":{\"TableName\":\"users\",\"Item\":{\"id\":{\"S\":\"tw-d-upd-side\"},\"label\":{\"S\":\"side\"}}}},\
+        {\"Update\":{\
+            \"TableName\":\"users\",\
+            \"Key\":{\"id\":{\"S\":\"tw-d-upd-cf\"}},\
+            \"UpdateExpression\":\"SET label = :new\",\
+            \"ConditionExpression\":\"label = :old\",\
+            \"ExpressionAttributeValues\":{\":new\":{\"S\":\"updated\"},\":old\":{\"S\":\"different\"}}\
+        }}\
+    ]";
+    let _ = aws_expecting_failure(REF, &["dynamodb","transact-write-items","--transact-items",items]);
+    let _ = aws_expecting_failure(OURS, &["dynamodb","transact-write-items","--transact-items",items]);
+
+    // Sibling Put must NOT exist on either endpoint.
+    let side_key = "{\"id\":{\"S\":\"tw-d-upd-side\"}}";
+    let r_ref = aws(REF, &["dynamodb","get-item","--table-name","users","--key",side_key]);
+    let r_ours = aws(OURS, &["dynamodb","get-item","--table-name","users","--key",side_key]);
+    assert!(r_ref.get("Item").is_none(), "ref leaked: {r_ref}");
+    assert!(r_ours.get("Item").is_none(), "ours leaked: {r_ours}");
+
+    // Target row label unchanged.
+    let key = "{\"id\":{\"S\":\"tw-d-upd-cf\"}}";
+    let r_ref = aws(REF, &["dynamodb","get-item","--table-name","users","--key",key]);
+    let r_ours = aws(OURS, &["dynamodb","get-item","--table-name","users","--key",key]);
+    assert_eq!(r_ref["Item"]["label"]["S"], "keep_me");
+    assert_eq!(r_ours["Item"]["label"]["S"], "keep_me");
+
+    delete_both("users", key);
+}

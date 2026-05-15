@@ -413,6 +413,69 @@ pub(crate) async fn update_with_simple_condition_raw(
     }
 }
 
+/// Tx-scoped general RMW: SELECT FOR UPDATE → call `apply(existing)` →
+/// UPDATE / INSERT. Single-pass (no retry loop) because the caller's
+/// REPEATABLE READ tx surfaces any race-on-INSERT as SQLSTATE 40001
+/// (serialization_failure), which propagates up to the transact_write
+/// CancellationReasons array as "TransactionConflict".
+///
+/// Caller controls the tx; this helper does not begin/commit/rollback.
+pub(crate) async fn update_general_rmw_inside_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    shape: &TableShape<'_>,
+    pk: &KeyValue,
+    sk: Option<&KeyValue>,
+    apply: &GeneralUpdateFn<'_>,
+) -> Result<UpdateOutcome, BackendError> {
+    check_sk_shape(shape, sk)?;
+    let prep = RmwSqlPrep::build(shape);
+
+    let select_stmt = tx
+        .prepare_typed_cached(&prep.select_sql, &prep.key_types)
+        .await
+        .map_err(|e| map_pg_err(shape.table, e))?;
+    let update_stmt = tx
+        .prepare_typed_cached(&prep.update_sql, &prep.update_types)
+        .await
+        .map_err(|e| map_pg_err(shape.table, e))?;
+    let insert_stmt = tx
+        .prepare_typed_cached(&prep.insert_sql, &[Type::JSONB])
+        .await
+        .map_err(|e| map_pg_err(shape.table, e))?;
+
+    let existing = prep.select_for_update(tx, &select_stmt, pk, sk).await?;
+    match apply(existing.as_ref())? {
+        UpdateDecision::Fail => Err(BackendError::ConditionalCheckFailed),
+        UpdateDecision::Apply(new_item) => {
+            let new_json = Json(&new_item);
+            let rows = if existing.is_some() {
+                prep.exec_update(tx, &update_stmt, &new_json, pk, sk).await?
+            } else {
+                tx.execute(&insert_stmt, &[&new_json])
+                    .instrument(tracing::debug_span!("pg.insert_on_conflict"))
+                    .await
+                    .map_err(|e| map_pg_err(shape.table, e))?
+            };
+            if rows > 0 {
+                Ok(UpdateOutcome {
+                    new_item,
+                    old_item: existing,
+                })
+            } else {
+                // INSERT-DO-NOTHING returned 0 rows: a concurrent INSERT
+                // landed between our SELECT FOR UPDATE and our INSERT.
+                // Under REPEATABLE READ this is rare (40001 usually
+                // surfaces first) but possible at READ COMMITTED. The
+                // single-row trait method retries; the in-tx variant
+                // can't (caller owns the tx), so surface as
+                // ConditionalCheckFailed — the caller may retry the
+                // whole TransactWriteItems.
+                Err(BackendError::ConditionalCheckFailed)
+            }
+        }
+    }
+}
+
 #[tracing::instrument(level = "debug", skip_all, name = "pg.update_general_rmw_raw", fields(table = %shape.table))]
 pub(crate) async fn update_general_rmw_raw(
     backend: &PgBackend,

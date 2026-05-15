@@ -15,6 +15,7 @@ use crate::put_delete::{
     condition_check_inside_tx, delete_item_inside_tx, delete_with_condition_inside_tx,
     put_item_inside_tx, put_with_condition_inside_tx,
 };
+use crate::update::update_general_rmw_inside_tx;
 use crate::types::map_pg_err;
 use crate::PgBackend;
 use rekt_storage::{
@@ -90,6 +91,11 @@ pub(crate) async fn transact_write_raw(
                 condition,
                 ..
             } => condition_check_inside_tx(&tx, shape, pk, sk.as_ref(), condition)
+                .await
+                .map(|_| ()),
+            TransactWriteOp::Update {
+                shape, pk, sk, apply, ..
+            } => update_general_rmw_inside_tx(&tx, shape, pk, sk.as_ref(), apply)
                 .await
                 .map(|_| ()),
         };

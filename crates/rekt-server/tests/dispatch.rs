@@ -578,33 +578,46 @@ impl Backend for MockBackend {
         let n = items.len();
         let mut failed_at: Option<(usize, &'static str)> = None;
         for (i, op) in items.iter().enumerate() {
-            let (shape_table, pk, sk, cond): (
-                &str,
-                &KeyValue,
-                Option<&KeyValue>,
-                Option<&ConditionEvalFn<'_>>,
-            ) = match op {
-                TransactWriteOp::Put {
-                    shape, pk, sk, condition, ..
-                } => (shape.table, pk, sk.as_ref(), condition.as_ref()),
-                TransactWriteOp::Delete {
-                    shape, pk, sk, condition, ..
-                } => (shape.table, pk, sk.as_ref(), condition.as_ref()),
-                TransactWriteOp::ConditionCheck {
-                    shape, pk, sk, condition, ..
-                } => (shape.table, pk, sk.as_ref(), Some(condition)),
-            };
-            if let Some(c) = cond {
-                let key = (
-                    shape_table.to_string(),
-                    kv_to_string(pk),
-                    sk.map(kv_to_string).unwrap_or_default(),
-                );
-                let existing = store.get(&key).cloned();
-                if !c(existing.as_ref()) {
-                    failed_at = Some((i, "ConditionalCheckFailed"));
-                    break;
+            // Capture the (table, pk, sk) lookup key for both phases.
+            let (shape_table, pk, sk): (&str, &KeyValue, Option<&KeyValue>) = match op {
+                TransactWriteOp::Put { shape, pk, sk, .. } => (shape.table, pk, sk.as_ref()),
+                TransactWriteOp::Delete { shape, pk, sk, .. } => (shape.table, pk, sk.as_ref()),
+                TransactWriteOp::ConditionCheck { shape, pk, sk, .. } => {
+                    (shape.table, pk, sk.as_ref())
                 }
+                TransactWriteOp::Update { shape, pk, sk, .. } => (shape.table, pk, sk.as_ref()),
+            };
+            let store_key = (
+                shape_table.to_string(),
+                kv_to_string(pk),
+                sk.map(kv_to_string).unwrap_or_default(),
+            );
+            let existing = store.get(&store_key).cloned();
+
+            // Evaluate per-op condition (Put/Delete optional;
+            // ConditionCheck mandatory; Update via the apply closure
+            // which embeds its condition).
+            let cond_passes = match op {
+                TransactWriteOp::Put { condition, .. } => {
+                    condition.as_ref().is_none_or(|c| c(existing.as_ref()))
+                }
+                TransactWriteOp::Delete { condition, .. } => {
+                    condition.as_ref().is_none_or(|c| c(existing.as_ref()))
+                }
+                TransactWriteOp::ConditionCheck { condition, .. } => {
+                    condition(existing.as_ref())
+                }
+                TransactWriteOp::Update { apply, .. } => {
+                    match apply(existing.as_ref()) {
+                        Ok(UpdateDecision::Apply(_)) => true,
+                        Ok(UpdateDecision::Fail) => false,
+                        Err(_) => false,
+                    }
+                }
+            };
+            if !cond_passes {
+                failed_at = Some((i, "ConditionalCheckFailed"));
+                break;
             }
         }
         if let Some((idx, code)) = failed_at {
@@ -644,6 +657,26 @@ impl Backend for MockBackend {
                 }
                 TransactWriteOp::ConditionCheck { .. } => {
                     // Read-only guard; no mutation.
+                }
+                TransactWriteOp::Update { shape, pk, sk, apply, .. } => {
+                    let key = (
+                        shape.table.to_string(),
+                        kv_to_string(&pk),
+                        sk.as_ref().map(kv_to_string).unwrap_or_default(),
+                    );
+                    let existing = store.get(&key).cloned();
+                    match apply(existing.as_ref()) {
+                        Ok(UpdateDecision::Apply(new_item)) => {
+                            store.insert(key, new_item);
+                        }
+                        Ok(UpdateDecision::Fail) => {
+                            // Should have been caught in phase 1; if we
+                            // get here it's a non-deterministic apply
+                            // closure (shouldn't happen).
+                            unreachable!("phase 1 already validated apply")
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
         }
@@ -6887,7 +6920,7 @@ async fn transact_write_unknown_field_in_put_rejected() {
 }
 
 #[tokio::test]
-async fn transact_write_update_rejected_until_t5() {
+async fn transact_write_update_invalid_expression_rejected() {
     let app = app();
     let resp = app
         .oneshot(ddb_request(
@@ -6896,7 +6929,7 @@ async fn transact_write_update_rejected_until_t5() {
                 {"Update":{
                     "TableName":"users",
                     "Key":{"id":{"S":"x"}},
-                    "UpdateExpression":"SET label = :v"
+                    "UpdateExpression":"GARBAGE"
                 }}
             ]}),
         ))
@@ -7180,4 +7213,198 @@ async fn transact_write_condition_check_without_expression_rejected() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ===== TransactWriteItems T5 — Update =======================================
+
+#[tokio::test]
+async fn transact_write_update_existing_row() {
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"upd-1"},"label":{"S":"old"}})).await;
+    let body = json!({
+        "TransactItems": [{
+            "Update":{
+                "TableName":"users",
+                "Key":{"id":{"S":"upd-1"}},
+                "UpdateExpression":"SET label = :v",
+                "ExpressionAttributeValues":{":v":{"S":"new"}}
+            }
+        }]
+    });
+    let resp = app
+        .clone()
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"upd-1"}}}),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["Item"]["label"]["S"], "new");
+}
+
+#[tokio::test]
+async fn transact_write_update_creates_missing_row() {
+    let app = app();
+    let body = json!({
+        "TransactItems": [{
+            "Update":{
+                "TableName":"users",
+                "Key":{"id":{"S":"upd-new"}},
+                "UpdateExpression":"SET label = :v",
+                "ExpressionAttributeValues":{":v":{"S":"fresh"}}
+            }
+        }]
+    });
+    let resp = app
+        .clone()
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"upd-new"}}}),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["Item"]["label"]["S"], "fresh");
+}
+
+#[tokio::test]
+async fn transact_write_conditional_update_fails_rolls_back() {
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"upd-cf"},"label":{"S":"alive"}})).await;
+    let body = json!({
+        "TransactItems": [
+            {"Put":{"TableName":"users","Item":{"id":{"S":"upd-side"},"label":{"S":"x"}}}},
+            {"Update":{
+                "TableName":"users",
+                "Key":{"id":{"S":"upd-cf"}},
+                "UpdateExpression":"SET label = :new",
+                "ConditionExpression":"label = :old",
+                "ExpressionAttributeValues":{
+                    ":new":{"S":"updated"},
+                    ":old":{"S":"different"}
+                }
+            }}
+        ]
+    });
+    let resp = app
+        .clone()
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["CancellationReasons"][1]["Code"].as_str().unwrap(),
+        "ConditionalCheckFailed"
+    );
+
+    // Atomicity: sibling Put didn't land.
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"upd-side"}}}),
+        ))
+        .await
+        .unwrap();
+    assert!(body_json(resp).await.get("Item").is_none());
+
+    // Original row label unchanged.
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"upd-cf"}}}),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["Item"]["label"]["S"], "alive");
+}
+
+#[tokio::test]
+async fn transact_write_update_add_numeric() {
+    let app = app();
+    // Use the counters table (N-PK) and ADD a numeric.
+    let body = json!({
+        "TransactItems": [{
+            "Update":{
+                "TableName":"counters",
+                "Key":{"id":{"N":"100"}},
+                "UpdateExpression":"ADD tally :n",
+                "ExpressionAttributeValues":{":n":{"N":"7"}}
+            }
+        }]
+    });
+    let resp = app
+        .clone()
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"counters","Key":{"id":{"N":"100"}}}),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["Item"]["tally"]["N"], "7");
+}
+
+#[tokio::test]
+async fn transact_write_update_empty_expression_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "TransactWriteItems",
+            json!({"TransactItems":[
+                {"Update":{
+                    "TableName":"users",
+                    "Key":{"id":{"S":"x"}},
+                    "UpdateExpression":"SET"
+                }}
+            ]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn transact_write_update_touches_key_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "TransactWriteItems",
+            json!({"TransactItems":[
+                {"Update":{
+                    "TableName":"users",
+                    "Key":{"id":{"S":"x"}},
+                    "UpdateExpression":"SET id = :v",
+                    "ExpressionAttributeValues":{":v":{"S":"y"}}
+                }}
+            ]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("key attribute"));
 }

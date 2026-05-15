@@ -5080,6 +5080,187 @@ mod tests {
         client.batch_execute("DROP TABLE rekt_t_tw_cc_fail;").await.unwrap();
     }
 
+    // ===== TransactWriteItems T5 — Update ====================================
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn transact_write_update_existing_row_round_trip() {
+        use rekt_storage::{TransactWriteOp, UpdateDecision};
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_tw_upd;
+                 CREATE TABLE rekt_t_tw_upd (
+                   data jsonb NOT NULL,
+                   id   text  GENERATED ALWAYS AS (data#>>'{id,S}') STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_tw_upd",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        pg_put(
+            &backend,
+            &shape,
+            &serde_json::json!({"id":{"S":"u1"},"label":{"S":"old"}}),
+        )
+        .await;
+
+        // Build a GeneralUpdateFn that performs `SET label = "new"`.
+        let apply: rekt_storage::GeneralUpdateFn<'_> = Box::new(|existing| {
+            let mut new_item = existing.cloned().unwrap_or_else(
+                || serde_json::json!({"id":{"S":"u1"}}),
+            );
+            new_item.as_object_mut().unwrap().insert(
+                "label".into(),
+                serde_json::json!({"S":"new"}),
+            );
+            Ok(UpdateDecision::Apply(new_item))
+        });
+        let ops = vec![TransactWriteOp::Update {
+            shape: shape.clone(),
+            pk: KeyValue::S("u1".into()),
+            sk: None,
+            apply,
+            return_old_on_failure: false,
+        }];
+        backend.transact_write_raw(ops).await.unwrap();
+
+        let got = backend
+            .get_item_raw(&shape, &KeyValue::S("u1".into()), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got["label"]["S"].as_str().unwrap(), "new");
+
+        client.batch_execute("DROP TABLE rekt_t_tw_upd;").await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn transact_write_update_missing_row_inserts() {
+        use rekt_storage::{TransactWriteOp, UpdateDecision};
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_tw_upd_insert;
+                 CREATE TABLE rekt_t_tw_upd_insert (
+                   data jsonb NOT NULL,
+                   id   text  GENERATED ALWAYS AS (data#>>'{id,S}') STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_tw_upd_insert",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        let apply: rekt_storage::GeneralUpdateFn<'_> = Box::new(|existing| {
+            let mut new_item = existing.cloned().unwrap_or_else(
+                || serde_json::json!({"id":{"S":"fresh"}}),
+            );
+            new_item.as_object_mut().unwrap().insert(
+                "label".into(),
+                serde_json::json!({"S":"created"}),
+            );
+            Ok(UpdateDecision::Apply(new_item))
+        });
+        let ops = vec![TransactWriteOp::Update {
+            shape: shape.clone(),
+            pk: KeyValue::S("fresh".into()),
+            sk: None,
+            apply,
+            return_old_on_failure: false,
+        }];
+        backend.transact_write_raw(ops).await.unwrap();
+
+        let got = backend
+            .get_item_raw(&shape, &KeyValue::S("fresh".into()), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got["label"]["S"].as_str().unwrap(), "created");
+
+        client
+            .batch_execute("DROP TABLE rekt_t_tw_upd_insert;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn transact_write_update_condition_fails_rolls_back() {
+        use rekt_storage::{TransactWriteOp, UpdateDecision};
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_tw_upd_fail;
+                 CREATE TABLE rekt_t_tw_upd_fail (
+                   data jsonb NOT NULL,
+                   id   text  GENERATED ALWAYS AS (data#>>'{id,S}') STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_tw_upd_fail",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        // Apply closure that always returns Fail — simulates a failing
+        // condition wrapped inside the closure.
+        let apply: rekt_storage::GeneralUpdateFn<'_> =
+            Box::new(|_existing| Ok(UpdateDecision::Fail));
+
+        let ops = vec![
+            TransactWriteOp::Put {
+                shape: shape.clone(),
+                pk: KeyValue::S("sibling".into()),
+                sk: None,
+                item: serde_json::json!({"id":{"S":"sibling"},"label":{"S":"x"}}),
+                condition: None,
+                return_old_on_failure: false,
+            },
+            TransactWriteOp::Update {
+                shape: shape.clone(),
+                pk: KeyValue::S("target".into()),
+                sk: None,
+                apply,
+                return_old_on_failure: false,
+            },
+        ];
+        let err = backend.transact_write_raw(ops).await.unwrap_err();
+        assert!(matches!(err, BackendError::TransactionCancelled { .. }));
+
+        // Atomicity: sibling Put must NOT have landed.
+        let got = backend
+            .get_item_raw(&shape, &KeyValue::S("sibling".into()), None)
+            .await
+            .unwrap();
+        assert!(got.is_none(), "atomicity violation: {got:?}");
+
+        client
+            .batch_execute("DROP TABLE rekt_t_tw_upd_fail;")
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires postgres on localhost:5432 (just up)"]
     async fn transact_get_unknown_table_surfaces_table_not_found() {
