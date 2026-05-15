@@ -14,6 +14,9 @@ async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 deadpool-postgres = { workspace = true }
+# Retry layer's exponential backoff uses tokio::time::sleep. The
+# `time` feature is enough; full tokio is left to the dev path.
+tokio = { workspace = true, features = ["time"] }
 tokio-postgres = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

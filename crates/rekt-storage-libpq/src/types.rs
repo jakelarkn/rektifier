@@ -122,27 +122,40 @@ pub(crate) fn map_pg_err(table: &str, e: tokio_postgres::Error) -> BackendError 
         Some(db) => {
             // Structured fields so operators can grep on SQLSTATE.
             // `code()` returns a `&SqlState`; its `.code()` accessor
-            // yields the 5-char identifier.
+            // yields the 5-char identifier. Returning a structured
+            // `PgError` (rather than stuffing into `Other(String)`)
+            // lets Obs-4's retry layer classify on `sqlstate`
+            // without re-parsing strings.
+            let sqlstate = db.code().code().to_string();
             tracing::error!(
                 table = %table,
-                sqlstate = %db.code().code(),
+                sqlstate = %sqlstate,
                 pg_message = %db.message(),
                 detail = ?db.detail(),
                 hint = ?db.hint(),
                 "PG error"
             );
-            BackendError::Other(format!("{} ({})", db.message(), db.code().code()))
+            BackendError::PgError {
+                sqlstate,
+                message: db.message().to_string(),
+            }
         }
         None => {
             // No DbError — this is a transport / protocol error
             // (connection reset, decode failure, etc). The full chain
-            // is the only useful context.
+            // is the only useful context. tokio_postgres doesn't
+            // expose a sqlstate here, but transport errors are
+            // retryable as a class; tag with a synthetic "08000"
+            // (connection_exception) so the classifier picks it up.
             tracing::error!(
                 table = %table,
                 error = %e,
                 "PG transport error (no DbError)"
             );
-            BackendError::Other(e.to_string())
+            BackendError::PgError {
+                sqlstate: "08000".into(),
+                message: e.to_string(),
+            }
         }
     }
 }

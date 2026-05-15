@@ -58,7 +58,14 @@ async fn main() -> Result<()> {
     tracing::info!("all declared tables verified against PG schema");
 
     let schemas = build_schema_map(&config);
-    let backend = PgBackend::new(pool);
+    let backend = PgBackend::new(pool).with_retry_policy(rek_retry_policy(&config));
+    tracing::info!(
+        max_attempts = config.pg.retry.max_attempts,
+        initial_backoff_ms = config.pg.retry.initial_backoff_ms,
+        max_backoff_ms = config.pg.retry.max_backoff_ms,
+        jitter_pct = config.pg.retry.jitter_pct,
+        "PG retry policy configured"
+    );
     let state = AppState {
         verifier: Arc::new(PermissiveVerifier),
         backend: Arc::new(backend),
@@ -149,6 +156,15 @@ fn rek_batch_limits(config: &Config) -> rekt_server::BatchLimits {
     rekt_server::BatchLimits {
         batch_get_max_keys: config.batch_limits.batch_get_max_keys,
         batch_write_max_requests: config.batch_limits.batch_write_max_requests,
+    }
+}
+
+fn rek_retry_policy(config: &Config) -> rekt_storage_libpq::RetryPolicy {
+    rekt_storage_libpq::RetryPolicy {
+        max_attempts: config.pg.retry.max_attempts,
+        initial_backoff: std::time::Duration::from_millis(config.pg.retry.initial_backoff_ms),
+        max_backoff: std::time::Duration::from_millis(config.pg.retry.max_backoff_ms),
+        jitter_pct: config.pg.retry.jitter_pct,
     }
 }
 

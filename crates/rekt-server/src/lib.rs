@@ -284,12 +284,23 @@ impl From<BackendError> for ApiError {
                 );
                 ApiError::Internal(format!("PG connection failed: {reason}"))
             }
+            // PG-layer error reaches us after the retry layer
+            // already exhausted its budget. map_pg_err logged it at
+            // the per-attempt level; emit a final 500-boundary log
+            // so operators see the surfaced-to-client form.
+            BackendError::PgError { sqlstate, message } => {
+                tracing::error!(
+                    sqlstate = %sqlstate,
+                    pg_message = %message,
+                    "PG error -> InternalServerError (500) after retries exhausted"
+                );
+                ApiError::Internal(format!("PG error ({sqlstate}): {message}"))
+            }
             // Every Other -> ApiError::Internal becomes a 500. The PG
-            // layer already logged the detailed cause (table, SQLSTATE,
-            // pg_message) in `map_pg_err`; this site emits an
-            // error-level boundary log so operators reading the API
-            // log can correlate a 500 response with the PG-layer error
-            // that produced it.
+            // layer already logged the detailed cause in `map_pg_err`;
+            // this site emits an error-level boundary log so operators
+            // reading the API log can correlate a 500 response with
+            // the storage-layer error that produced it.
             BackendError::Other(m) => {
                 tracing::error!(
                     backend_error = %m,

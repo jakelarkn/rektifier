@@ -104,6 +104,16 @@ pub enum BackendError {
     #[error("PG connection failed: {reason}")]
     ConnectFailed { reason: String },
 
+    /// A PG-reported error with a structured SQLSTATE. The retry
+    /// layer (Obs-4) classifies on `sqlstate` — `08*`, `40001`,
+    /// `40P01`, `57P0[1-5]` are retryable; everything else
+    /// propagates.
+    #[error("PG error ({sqlstate}): {message}")]
+    PgError {
+        sqlstate: String,
+        message: String,
+    },
+
     #[error("storage error: {0}")]
     Other(String),
 }

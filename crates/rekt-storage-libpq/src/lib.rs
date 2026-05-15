@@ -33,10 +33,13 @@ mod batch_write;
 mod condition_sql;
 mod put_delete;
 mod query;
+mod retry;
 mod scan;
 mod shape;
 mod types;
 mod update;
+
+pub use retry::RetryPolicy;
 
 use async_trait::async_trait;
 use deadpool_postgres::{
@@ -59,11 +62,18 @@ pub struct PgBackend {
     /// vectors. Populated lazily on first touch from a `TableShape`. Keyed
     /// by `shape.table` (the PG table name).
     pub(crate) sql_cache: RwLock<HashMap<String, Arc<shape::ShapeSql>>>,
+    /// Retry policy applied at the trampoline level — every
+    /// `Backend` method on `PgBackend` runs under `with_retry` so a
+    /// transient PG error or pool starvation gets up to
+    /// `max_attempts` attempts before propagating.
+    retry: RetryPolicy,
 }
 
 /// Pool tuning knobs accepted by `PgBackend::connect_with`. Mirrors
 /// `rekt_config::PgConfig` but local to this crate so the storage
-/// layer doesn't depend on the config loader.
+/// layer doesn't depend on the config loader. Retry policy is
+/// supplied separately so callers can build a pool once and try
+/// different retry settings (useful in tests).
 #[derive(Debug, Clone, Copy)]
 pub struct PoolConfig {
     pub max_pool_size: u32,
@@ -100,11 +110,21 @@ impl Default for PoolConfig {
 impl PgBackend {
     /// Wrap an existing pool. Prefer this when the caller wants to share a
     /// `Pool` with other components (e.g. `rekt-meta::verify`).
+    /// Uses the default retry policy; call
+    /// [`PgBackend::with_retry_policy`] to override.
     pub fn new(pool: Pool) -> Self {
         Self {
             pool,
             sql_cache: RwLock::new(HashMap::new()),
+            retry: RetryPolicy::default(),
         }
+    }
+
+    /// Override the retry policy. Returns `self` for fluent chaining
+    /// in the binary's startup path.
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry = policy;
+        self
     }
 
     pub fn connect(connection_string: &str) -> Result<Self, BackendError> {
@@ -198,6 +218,24 @@ fn classify_pool_error(
     }
 }
 
+// ===== Backend trait trampoline ===============================================
+//
+// Each method delegates to a `pub(crate) async fn _raw(...)` in the
+// matching topic module. Methods whose signature doesn't carry a
+// caller-supplied closure are wrapped in `retry::with_retry` so a
+// transient PG error / pool starvation triggers up to
+// `self.retry.max_attempts` attempts.
+//
+// Closure-bearing methods (put_with_condition_raw,
+// delete_with_condition_raw, update_general_rmw_raw, query_raw,
+// scan_raw) are NOT wrapped. Their `Fn` closures can't be safely
+// re-invoked through the FnMut shape `with_retry` requires (the
+// `Box<dyn Fn>` value is moved into the call, not borrowed). They
+// already implement their own race-retry loops where applicable;
+// transient PG errors propagate up to the caller. A future polish
+// could lift them by changing the trait signature to take
+// `&ConditionEvalFn`; out of scope for Obs-4.
+
 #[async_trait]
 impl Backend for PgBackend {
     async fn put_item_raw(
@@ -207,7 +245,10 @@ impl Backend for PgBackend {
         sk: Option<&KeyValue>,
         item: &serde_json::Value,
     ) -> Result<Option<serde_json::Value>, BackendError> {
-        put_delete::put_item_raw(self, shape, pk, sk, item).await
+        retry::with_retry(&self.retry, "put_item", shape.table, || {
+            put_delete::put_item_raw(self, shape, pk, sk, item)
+        })
+        .await
     }
 
     async fn get_item_raw(
@@ -216,7 +257,10 @@ impl Backend for PgBackend {
         pk: &KeyValue,
         sk: Option<&KeyValue>,
     ) -> Result<Option<serde_json::Value>, BackendError> {
-        put_delete::get_item_raw(self, shape, pk, sk).await
+        retry::with_retry(&self.retry, "get_item", shape.table, || {
+            put_delete::get_item_raw(self, shape, pk, sk)
+        })
+        .await
     }
 
     async fn delete_item_raw(
@@ -225,7 +269,10 @@ impl Backend for PgBackend {
         pk: &KeyValue,
         sk: Option<&KeyValue>,
     ) -> Result<Option<serde_json::Value>, BackendError> {
-        put_delete::delete_item_raw(self, shape, pk, sk).await
+        retry::with_retry(&self.retry, "delete_item", shape.table, || {
+            put_delete::delete_item_raw(self, shape, pk, sk)
+        })
+        .await
     }
 
     async fn put_with_condition_raw(
@@ -236,6 +283,7 @@ impl Backend for PgBackend {
         item: &serde_json::Value,
         condition: ConditionEvalFn<'_>,
     ) -> Result<Option<serde_json::Value>, BackendError> {
+        // No transient-error retry — see trampoline header above.
         put_delete::put_with_condition_raw(self, shape, pk, sk, item, condition).await
     }
 
@@ -258,7 +306,10 @@ impl Backend for PgBackend {
         sets: &[(&str, &serde_json::Value)],
         removes: &[&str],
     ) -> Result<UpdateOutcome, BackendError> {
-        update::update_simple_raw(self, shape, pk, sk, insert_item, sets, removes).await
+        retry::with_retry(&self.retry, "update_simple", shape.table, || {
+            update::update_simple_raw(self, shape, pk, sk, insert_item, sets, removes)
+        })
+        .await
     }
 
     async fn update_with_simple_condition_raw(
@@ -270,7 +321,17 @@ impl Backend for PgBackend {
         removes: &[&str],
         condition: &Condition,
     ) -> Result<UpdateOutcome, BackendError> {
-        update::update_with_simple_condition_raw(self, shape, pk, sk, sets, removes, condition).await
+        retry::with_retry(
+            &self.retry,
+            "update_with_simple_condition",
+            shape.table,
+            || {
+                update::update_with_simple_condition_raw(
+                    self, shape, pk, sk, sets, removes, condition,
+                )
+            },
+        )
+        .await
     }
 
     async fn update_general_rmw_raw(
@@ -280,6 +341,8 @@ impl Backend for PgBackend {
         sk: Option<&KeyValue>,
         apply: GeneralUpdateFn<'_>,
     ) -> Result<UpdateOutcome, BackendError> {
+        // No transient-error retry — closure semantics. The internal
+        // race-loop covers concurrent-insert contention.
         update::update_general_rmw_raw(self, shape, pk, sk, apply).await
     }
 
@@ -288,7 +351,10 @@ impl Backend for PgBackend {
         shape: &TableShape<'_>,
         insert_item: &serde_json::Value,
     ) -> Result<UpdateOutcome, BackendError> {
-        update::update_insert_only_raw(self, shape, insert_item).await
+        retry::with_retry(&self.retry, "update_insert_only", shape.table, || {
+            update::update_insert_only_raw(self, shape, insert_item)
+        })
+        .await
     }
 
     async fn query_raw(
@@ -301,6 +367,7 @@ impl Backend for PgBackend {
         filter: Option<FilterEvalFn<'_>>,
         forward: bool,
     ) -> Result<QueryOutcome, BackendError> {
+        // No transient-error retry — FilterEvalFn closure.
         query::query_raw(
             self,
             shape,
@@ -321,6 +388,7 @@ impl Backend for PgBackend {
         limit: Option<u32>,
         exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
     ) -> Result<ScanOutcome, BackendError> {
+        // No transient-error retry — FilterEvalFn closure.
         scan::scan_raw(self, shape, filter, limit, exclusive_start_key).await
     }
 
@@ -329,7 +397,10 @@ impl Backend for PgBackend {
         shape: &TableShape<'_>,
         keys: &[(KeyValue, Option<KeyValue>)],
     ) -> Result<BatchGetOutcome, BackendError> {
-        batch_get::batch_get_raw(self, shape, keys).await
+        retry::with_retry(&self.retry, "batch_get", shape.table, || {
+            batch_get::batch_get_raw(self, shape, keys)
+        })
+        .await
     }
 
     async fn batch_write_raw(
@@ -337,7 +408,10 @@ impl Backend for PgBackend {
         shape: &TableShape<'_>,
         ops: &[WriteOp],
     ) -> Result<BatchWriteOutcome, BackendError> {
-        batch_write::batch_write_raw(self, shape, ops).await
+        retry::with_retry(&self.retry, "batch_write", shape.table, || {
+            batch_write::batch_write_raw(self, shape, ops)
+        })
+        .await
     }
 }
 #[cfg(test)]
