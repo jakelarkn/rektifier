@@ -13,7 +13,9 @@ pub use operations::{
     BatchGetItemRequest, BatchGetItemResponse, BatchWriteItemRequest, BatchWriteItemResponse,
     DeleteItemRequest, DeleteItemResponse, DeleteRequest, GetItemRequest, GetItemResponse,
     Get as TransactGet, KeysAndAttributes, PutItemRequest, PutItemResponse, PutRequest,
-    QueryRequest, QueryResponse, ScanRequest, ScanResponse, TransactGetItem,
-    TransactGetItemResponse, TransactGetItemsRequest, TransactGetItemsResponse, UpdateItemRequest,
-    UpdateItemResponse, WriteRequest,
+    QueryRequest, QueryResponse, ScanRequest, ScanResponse, TransactConditionCheck,
+    TransactDelete, TransactGetItem, TransactGetItemResponse, TransactGetItemsRequest,
+    TransactGetItemsResponse, TransactPut, TransactUpdate, TransactWriteItem,
+    TransactWriteItemsRequest, TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse,
+    WriteRequest,
 };

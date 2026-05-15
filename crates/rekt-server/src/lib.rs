@@ -30,18 +30,19 @@ use rekt_protocol::{
     BatchGetItemRequest, BatchGetItemResponse, BatchWriteItemRequest, BatchWriteItemResponse,
     DeleteItemRequest, DeleteItemResponse, GetItemRequest, GetItemResponse, Item, PutItemRequest,
     PutItemResponse, QueryRequest, QueryResponse, ScanRequest, ScanResponse,
-    TransactGetItemResponse, TransactGetItemsRequest, TransactGetItemsResponse, UpdateItemRequest,
-    UpdateItemResponse, WriteRequest,
+    TransactGetItemResponse, TransactGetItemsRequest, TransactGetItemsResponse,
+    TransactWriteItemsRequest, TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse,
+    WriteRequest,
 };
 use rekt_sigv4::{SigV4Error, Verifier};
-use rekt_storage::{Backend, BackendError, TransactGetOp, UpdateDecision, UpdateOutcome};
+use rekt_storage::{Backend, BackendError, TransactGetOp, TransactWriteOp, UpdateDecision, UpdateOutcome};
 use rekt_translator::{
     apply_update_expression, encode_lek, evaluate_condition, materialize_insert_only_update,
     materialize_simple_sql_update, materialize_simple_update, touched_paths,
     translate_batch_get_item, translate_batch_write_item, translate_delete_item,
     translate_get_item, translate_put_item, translate_query, translate_scan,
-    translate_transact_get_items, translate_update_item, ConditionRouting, ReturnValuesMode,
-    TableSchema, TranslateError,
+    translate_transact_get_items, translate_transact_write_items, translate_update_item,
+    ConditionRouting, ReturnValuesMode, TableSchema, TransactWriteKind, TranslateError,
 };
 use std::any::Any;
 use std::collections::HashMap;
@@ -175,6 +176,11 @@ pub enum ApiError {
     #[error("ConditionalCheckFailedException: {0}")]
     ConditionalCheckFailed(String),
 
+    #[error("TransactionCanceledException")]
+    TransactionCancelled {
+        reasons: Vec<rekt_storage::TransactCancelReason>,
+    },
+
     #[error("InternalServerError: {0}")]
     Internal(String),
 }
@@ -188,6 +194,7 @@ impl ApiError {
             Self::ResourceNotFound(_) => "ResourceNotFoundException",
             Self::AccessDenied(_) => "AccessDeniedException",
             Self::ConditionalCheckFailed(_) => "ConditionalCheckFailedException",
+            Self::TransactionCancelled { .. } => "TransactionCanceledException",
             Self::Internal(_) => "InternalServerError",
         }
     }
@@ -210,16 +217,54 @@ impl ApiError {
             | Self::AccessDenied(m)
             | Self::ConditionalCheckFailed(m)
             | Self::Internal(m) => m.clone(),
+            Self::TransactionCancelled { reasons } => {
+                // DDB's verbatim wording — references the populated
+                // failure codes so clients can read it directly.
+                let codes: Vec<&str> = reasons.iter().map(|r| r.code).collect();
+                format!(
+                    "Transaction cancelled, please refer cancellation reasons for specific reasons [{}]",
+                    codes.join(", ")
+                )
+            }
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = serde_json::json!({
-            "__type": format!("com.amazonaws.dynamodb.v20120810#{}", self.ddb_error_name()),
-            "message": self.message(),
-        });
+        let body = match &self {
+            ApiError::TransactionCancelled { reasons } => {
+                let cancel_array: Vec<serde_json::Value> = reasons
+                    .iter()
+                    .map(|r| {
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("Code".into(), serde_json::Value::String(r.code.into()));
+                        if let Some(msg) = &r.message {
+                            obj.insert(
+                                "Message".into(),
+                                serde_json::Value::String(msg.clone()),
+                            );
+                        }
+                        if let Some(item) = &r.item {
+                            obj.insert("Item".into(), item.clone());
+                        }
+                        serde_json::Value::Object(obj)
+                    })
+                    .collect();
+                serde_json::json!({
+                    "__type": format!(
+                        "com.amazonaws.dynamodb.v20120810#{}",
+                        self.ddb_error_name()
+                    ),
+                    "Message": self.message(),
+                    "CancellationReasons": cancel_array,
+                })
+            }
+            _ => serde_json::json!({
+                "__type": format!("com.amazonaws.dynamodb.v20120810#{}", self.ddb_error_name()),
+                "message": self.message(),
+            }),
+        };
         let body_bytes = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
 
         let mut response = (self.http_status(), body_bytes).into_response();
@@ -317,6 +362,13 @@ impl From<BackendError> for ApiError {
                 );
                 ApiError::Internal(m)
             }
+            BackendError::TransactionCancelled { reasons } => {
+                tracing::warn!(
+                    failing_codes = ?reasons.iter().map(|r| r.code).collect::<Vec<_>>(),
+                    "TransactWriteItems cancelled -> TransactionCanceledException"
+                );
+                ApiError::TransactionCancelled { reasons }
+            }
         }
     }
 }
@@ -396,6 +448,7 @@ async fn dispatch(State(state): State<AppState>, req: Request) -> Result<Respons
         "BatchGetItem" => handle_batch_get_item(&state, &body).await,
         "BatchWriteItem" => handle_batch_write_item(&state, &body).await,
         "TransactGetItems" => handle_transact_get_items(&state, &body).await,
+        "TransactWriteItems" => handle_transact_write_items(&state, &body).await,
         _ => Err(ApiError::UnknownOperation(format!(
             "operation `{op}` not implemented"
         ))),
@@ -992,6 +1045,69 @@ async fn handle_transact_get_items(
     }
 
     Ok(json_ok(&TransactGetItemsResponse { responses }))
+}
+
+#[tracing::instrument(
+    level = "debug",
+    skip_all,
+    name = "server.transact_write_items",
+    fields(items = tracing::field::Empty)
+)]
+async fn handle_transact_write_items(
+    state: &AppState,
+    body: &Bytes,
+) -> Result<Response, ApiError> {
+    let req: TransactWriteItemsRequest = parse_request(body, "TransactWriteItems")?;
+
+    if let Some(t) = req.client_request_token.as_deref() {
+        tracing::debug!(
+            client_request_token_len = t.len(),
+            "TransactWriteItems client_request_token accepted-and-dropped (T8 implements real idempotency)"
+        );
+    }
+
+    let plan = translate_transact_write_items(
+        &req,
+        state.schemas.as_ref(),
+        state.batch_limits.transact_write_max_items,
+    )?;
+    tracing::Span::current().record("items", plan.items.len());
+
+    // Build the storage-level ops, attaching ConditionEvalFn closures
+    // per-item. Each shape is borrowed from the schemas map; the
+    // closures own clones of the parsed Condition AST so the
+    // ConditionEvalFn lifetime ('a) is the call's lifetime.
+    let mut ops: Vec<TransactWriteOp<'_>> = Vec::with_capacity(plan.items.len());
+    for plan_item in plan.items.into_iter() {
+        let schema = state.schemas.get(&plan_item.table_name).ok_or_else(|| {
+            ApiError::ResourceNotFound(format!("Table not found: {}", plan_item.table_name))
+        })?;
+        let shape = schema.shape();
+        let condition_fn: Option<rekt_storage::ConditionEvalFn<'_>> =
+            plan_item.condition.as_ref().map(|cp| {
+                let cond = cp.condition.clone();
+                let f: rekt_storage::ConditionEvalFn<'_> =
+                    Box::new(move |existing| evaluate_condition(existing, &cond));
+                f
+            });
+        match plan_item.kind {
+            TransactWriteKind::Put { item_json } => {
+                ops.push(TransactWriteOp::Put {
+                    shape,
+                    pk: plan_item.pk,
+                    sk: plan_item.sk,
+                    item: item_json,
+                    condition: condition_fn,
+                    return_old_on_failure: plan_item.return_old_on_failure,
+                });
+            }
+        }
+    }
+
+    let _outcome = state.backend.transact_write_raw(ops).await?;
+
+    // DDB emits an empty body on success.
+    Ok(json_ok(&TransactWriteItemsResponse::default()))
 }
 
 /// Shape the UpdateItem response according to `ReturnValues`. Supports

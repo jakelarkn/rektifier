@@ -4,7 +4,7 @@
 //! at the struct level. Unknown fields on requests are ignored (serde default)
 //! so that AWS-CLI-only fields like `ReturnConsumedCapacity` don't 400 us.
 
-use crate::Item;
+use crate::{AttributeValue, Item};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -373,4 +373,114 @@ pub struct TransactGetItemsResponse {
     /// Position-preserving array of per-item responses. Index lines up
     /// with `TransactGetItemsRequest::transact_items` (D8 in PLAN-8).
     pub responses: Vec<TransactGetItemResponse>,
+}
+
+// ===== TransactWriteItems (PLAN-8 T3+) =======================================
+
+/// One write inside a `TransactWriteItems` request. Externally-tagged
+/// on the wire: `{"Put": {...}}` or `{"Delete": {...}}` etc. We mirror
+/// PLAN-6's `WriteRequest` idiom — Option-fielded with
+/// `deny_unknown_fields`, and the translator demands exactly one set.
+/// T3 implements only `Put`; T4/T5 add the others.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+pub struct TransactWriteItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub put: Option<TransactPut>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete: Option<TransactDelete>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<TransactUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition_check: Option<TransactConditionCheck>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+pub struct TransactPut {
+    pub table_name: String,
+    pub item: Item,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition_expression: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression_attribute_names: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression_attribute_values: Option<std::collections::BTreeMap<String, AttributeValue>>,
+    /// DDB's per-item `ReturnValuesOnConditionCheckFailure` — accepts
+    /// `NONE` (default) or `ALL_OLD`. When `ALL_OLD` and this item's
+    /// ConditionExpression fails, the pre-image lands in the
+    /// corresponding `CancellationReasons[i].Item` slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_values_on_condition_check_failure: Option<String>,
+}
+
+/// T4 placeholder — translator rejects with `MalformedTransactItem`
+/// until that phase lifts it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+pub struct TransactDelete {
+    pub table_name: String,
+    pub key: Item,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition_expression: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression_attribute_names: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression_attribute_values: Option<std::collections::BTreeMap<String, AttributeValue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_values_on_condition_check_failure: Option<String>,
+}
+
+/// T5 placeholder — translator rejects until that phase lifts it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+pub struct TransactUpdate {
+    pub table_name: String,
+    pub key: Item,
+    pub update_expression: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition_expression: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression_attribute_names: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression_attribute_values: Option<std::collections::BTreeMap<String, AttributeValue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_values_on_condition_check_failure: Option<String>,
+}
+
+/// T4 placeholder.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+pub struct TransactConditionCheck {
+    pub table_name: String,
+    pub key: Item,
+    pub condition_expression: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression_attribute_names: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression_attribute_values: Option<std::collections::BTreeMap<String, AttributeValue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_values_on_condition_check_failure: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct TransactWriteItemsRequest {
+    pub transact_items: Vec<TransactWriteItem>,
+    /// Idempotency token (≤36 bytes). v1 accepts and discards
+    /// (D10 in PLAN-8 — Inert divergence; T8 implements real
+    /// idempotency).
+    #[serde(default)]
+    pub client_request_token: Option<String>,
+    #[serde(default)]
+    pub return_consumed_capacity: Option<String>,
+    #[serde(default)]
+    pub return_item_collection_metrics: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct TransactWriteItemsResponse {
+    // No data on success. T8 may grow ConsumedCapacity /
+    // ItemCollectionMetrics here.
 }

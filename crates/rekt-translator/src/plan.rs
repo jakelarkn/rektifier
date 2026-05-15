@@ -285,3 +285,36 @@ pub struct TransactGetPlanItem {
     pub sk: Option<KeyValue>,
     pub projection: Option<std::collections::BTreeSet<String>>,
 }
+
+/// TransactWriteItems plan. Position-preserving (D8 in PLAN-8). Each
+/// item carries its pre-validated keys, the kind-specific payload,
+/// and the resolved per-item ConditionExpression (if any). The
+/// dispatcher converts this into the storage-level `Vec<TransactWriteOp>`
+/// by attaching a `ConditionEvalFn` closure per condition.
+#[derive(Debug, Clone, Default)]
+pub struct TransactWriteItemsPlan {
+    pub items: Vec<TransactWritePlanItem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransactWritePlanItem {
+    pub table_name: String,
+    pub pk: KeyValue,
+    pub sk: Option<KeyValue>,
+    pub kind: TransactWriteKind,
+    /// Optional per-item ConditionExpression. Resolved at translate
+    /// time so the dispatcher can wrap it into a `ConditionEvalFn`
+    /// without re-parsing.
+    pub condition: Option<ConditionPlan>,
+    /// `ReturnValuesOnConditionCheckFailure=ALL_OLD` was set.
+    pub return_old_on_failure: bool,
+}
+
+/// Kind-specific payload for a TransactWritePlanItem. T3 supports
+/// `Put`; T4 lifts `Delete` + `ConditionCheck`; T5 lifts `Update`.
+#[derive(Debug, Clone)]
+pub enum TransactWriteKind {
+    Put { item_json: serde_json::Value },
+    // T4: Delete, ConditionCheck.
+    // T5: Update.
+}

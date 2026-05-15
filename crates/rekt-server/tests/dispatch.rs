@@ -10,7 +10,8 @@ use rekt_sigv4::{PermissiveVerifier, Verifier};
 use rekt_storage::{
     Backend, BackendError, BatchGetOutcome, BatchWriteOutcome, ConditionEvalFn, FilterEvalFn,
     GeneralUpdateFn, KeyType, KeyValue, QueryOutcome, ScanOutcome, SkCondition, TableShape,
-    TransactGetOp, TransactGetOutcome, UpdateDecision, UpdateOutcome, WriteOp,
+    TransactCancelReason, TransactGetOp, TransactGetOutcome, TransactWriteOp,
+    TransactWriteOutcome, UpdateDecision, UpdateOutcome, WriteOp,
 };
 use rekt_translator::{evaluate_condition, TableSchema};
 use serde_json::{json, Value};
@@ -566,6 +567,66 @@ impl Backend for MockBackend {
         Ok(TransactGetOutcome { items: out })
     }
 
+    async fn transact_write_raw(
+        &self,
+        items: Vec<TransactWriteOp<'_>>,
+    ) -> Result<TransactWriteOutcome, BackendError> {
+        // Two-pass: check all conditions first (under one mutex hold),
+        // then apply all writes. This preserves the atomic semantic —
+        // if any condition fails we don't mutate anything.
+        let mut store = self.store.lock().unwrap();
+        let n = items.len();
+        let mut failed_at: Option<(usize, &'static str)> = None;
+        for (i, op) in items.iter().enumerate() {
+            match op {
+                TransactWriteOp::Put { shape, pk, sk, condition, .. } => {
+                    if let Some(cond) = condition.as_ref() {
+                        let key = (
+                            shape.table.to_string(),
+                            kv_to_string(pk),
+                            sk.as_ref().map(kv_to_string).unwrap_or_default(),
+                        );
+                        let existing = store.get(&key).cloned();
+                        if !cond(existing.as_ref()) {
+                            failed_at = Some((i, "ConditionalCheckFailed"));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((idx, code)) = failed_at {
+            let mut reasons: Vec<TransactCancelReason> = (0..n)
+                .map(|_| TransactCancelReason {
+                    code: "None",
+                    message: None,
+                    item: None,
+                })
+                .collect();
+            reasons[idx] = TransactCancelReason {
+                code,
+                message: Some("The conditional request failed".into()),
+                item: None,
+            };
+            return Err(BackendError::TransactionCancelled { reasons });
+        }
+
+        // All conditions passed — apply.
+        for op in items {
+            match op {
+                TransactWriteOp::Put { shape, pk, sk, item, .. } => {
+                    let key = (
+                        shape.table.to_string(),
+                        kv_to_string(&pk),
+                        sk.as_ref().map(kv_to_string).unwrap_or_default(),
+                    );
+                    store.insert(key, item);
+                }
+            }
+        }
+        Ok(TransactWriteOutcome::default())
+    }
+
     async fn update_insert_only_raw(
         &self,
         shape: &TableShape<'_>,
@@ -795,11 +856,10 @@ async fn unknown_table_is_resource_not_found() {
 #[tokio::test]
 async fn unsupported_op_is_unknown_operation() {
     let app = app();
-    // `TransactWriteItems` is not yet implemented (lands in PLAN-8
-    // T3+). Once it lands, swap this for whatever is still
-    // unsupported at the time.
+    // `DescribeTable` is not implemented. Swap this for whatever is
+    // still unsupported as more ops land.
     let resp = app
-        .oneshot(ddb_request("TransactWriteItems", json!({})))
+        .oneshot(ddb_request("DescribeTable", json!({})))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -6561,4 +6621,296 @@ async fn transact_get_projection_nested_path_rejected() {
         .as_str()
         .unwrap()
         .ends_with("#ValidationException"));
+}
+
+// ===== TransactWriteItems T3 — Put-only =====================================
+
+#[tokio::test]
+async fn transact_write_put_only_round_trip() {
+    let app = app();
+    let body = json!({
+        "TransactItems": [
+            {"Put":{"TableName":"users","Item":{"id":{"S":"tw-u1"},"label":{"S":"alice"}}}},
+            {"Put":{"TableName":"users","Item":{"id":{"S":"tw-u2"},"label":{"S":"bob"}}}}
+        ]
+    });
+    let resp = app
+        .clone()
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let got = body_json(resp).await;
+    // DDB emits empty body on success.
+    assert_eq!(got, json!({}));
+
+    // Verify both rows present via GetItem.
+    for id in ["tw-u1", "tw-u2"] {
+        let resp = app
+            .clone()
+            .oneshot(ddb_request(
+                "GetItem",
+                json!({"TableName":"users","Key":{"id":{"S":id}}}),
+            ))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert!(body.get("Item").is_some(), "missing {id}");
+    }
+}
+
+#[tokio::test]
+async fn transact_write_conditional_put_succeeds() {
+    let app = app();
+    let body = json!({
+        "TransactItems": [{
+            "Put": {
+                "TableName":"users",
+                "Item":{"id":{"S":"tw-cond-ok"},"label":{"S":"L"}},
+                "ConditionExpression":"attribute_not_exists(id)"
+            }
+        }]
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn transact_write_conditional_put_fails_returns_cancelled() {
+    let app = app();
+    // Seed row.
+    put_item(&app, "users", json!({"id":{"S":"tw-cond-fail"}})).await;
+    // attribute_not_exists should fail.
+    let body = json!({
+        "TransactItems": [{
+            "Put": {
+                "TableName":"users",
+                "Item":{"id":{"S":"tw-cond-fail"},"label":{"S":"new"}},
+                "ConditionExpression":"attribute_not_exists(id)"
+            }
+        }]
+    });
+    let resp = app
+        .clone()
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#TransactionCanceledException"));
+    // CancellationReasons[0] should be ConditionalCheckFailed.
+    assert_eq!(
+        body["CancellationReasons"][0]["Code"].as_str().unwrap(),
+        "ConditionalCheckFailed"
+    );
+}
+
+#[tokio::test]
+async fn transact_write_one_failure_rolls_back_others() {
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"tw-already"}})).await;
+    // Two puts: first OK, second has a condition that will fail.
+    let body = json!({
+        "TransactItems": [
+            {"Put":{"TableName":"users","Item":{"id":{"S":"tw-side-effect"},"label":{"S":"x"}}}},
+            {"Put":{
+                "TableName":"users",
+                "Item":{"id":{"S":"tw-already"},"label":{"S":"y"}},
+                "ConditionExpression":"attribute_not_exists(id)"
+            }}
+        ]
+    });
+    let resp = app
+        .clone()
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    // CancellationReasons indexed by position: slot 0 = None, slot 1 = failure.
+    assert_eq!(body["CancellationReasons"][0]["Code"].as_str().unwrap(), "None");
+    assert_eq!(
+        body["CancellationReasons"][1]["Code"].as_str().unwrap(),
+        "ConditionalCheckFailed"
+    );
+
+    // Critical assertion: the would-have-been-Put at slot 0 must NOT
+    // have landed — atomicity.
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"tw-side-effect"}}}),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert!(body.get("Item").is_none(), "atomicity violation: {body}");
+}
+
+#[tokio::test]
+async fn transact_write_empty_request_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "TransactWriteItems",
+            json!({"TransactItems":[]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ValidationException"));
+}
+
+#[tokio::test]
+async fn transact_write_missing_table_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "TransactWriteItems",
+            json!({"TransactItems":[
+                {"Put":{"TableName":"nope","Item":{"id":{"S":"x"}}}}
+            ]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ResourceNotFoundException"));
+}
+
+#[tokio::test]
+async fn transact_write_duplicate_target_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "TransactWriteItems",
+            json!({"TransactItems":[
+                {"Put":{"TableName":"users","Item":{"id":{"S":"dup"}}}},
+                {"Put":{"TableName":"users","Item":{"id":{"S":"dup"},"label":{"S":"x"}}}}
+            ]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("multiple operations"));
+}
+
+#[tokio::test]
+async fn transact_write_client_request_token_accepted_and_dropped() {
+    // T8 will implement real idempotency; v1 accepts and discards.
+    let app = app();
+    let body = json!({
+        "TransactItems": [{
+            "Put":{"TableName":"users","Item":{"id":{"S":"tw-crt"}}}
+        }],
+        "ClientRequestToken": "abc-123"
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn transact_write_client_request_token_too_long_rejected() {
+    let app = app();
+    let body = json!({
+        "TransactItems": [{"Put":{"TableName":"users","Item":{"id":{"S":"x"}}}}],
+        "ClientRequestToken": "x".repeat(37)
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn transact_write_unknown_field_in_put_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "TransactWriteItems",
+            json!({"TransactItems":[
+                {"Put":{"TableName":"users","Item":{"id":{"S":"x"}},"Bogus":"q"}}
+            ]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#SerializationException"));
+}
+
+#[tokio::test]
+async fn transact_write_delete_rejected_until_t4() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "TransactWriteItems",
+            json!({"TransactItems":[
+                {"Delete":{"TableName":"users","Key":{"id":{"S":"x"}}}}
+            ]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ValidationException"));
+}
+
+#[tokio::test]
+async fn transact_write_composite_table_put() {
+    let app = app();
+    let body = json!({
+        "TransactItems": [{
+            "Put":{
+                "TableName":"device_events",
+                "Item":{"device_id":{"S":"tw-d1"},"ts":{"N":"42"},"label":{"S":"E"}}
+            }
+        }]
+    });
+    let resp = app
+        .clone()
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Verify via GetItem.
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({
+                "TableName":"device_events",
+                "Key":{"device_id":{"S":"tw-d1"},"ts":{"N":"42"}}
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["Item"]["label"]["S"], "E");
 }

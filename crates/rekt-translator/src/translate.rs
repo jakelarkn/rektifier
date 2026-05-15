@@ -14,7 +14,8 @@ use crate::projection::resolve_select_and_projection;
 use crate::plan::{
     BatchGetItemPlan, BatchGetPerTable, BatchWriteItemPlan, BatchWritePerTable, ConditionPlan,
     DeleteItemPlan, GetItemPlan, PutItemPlan, QueryPlan, ReturnValuesMode, ScanPlan,
-    TransactGetItemsPlan, TransactGetPlanItem, UpdateItemPlan,
+    TransactGetItemsPlan, TransactGetPlanItem, TransactWriteItemsPlan, TransactWriteKind,
+    TransactWritePlanItem, UpdateItemPlan,
 };
 use crate::schema::TableSchema;
 use rekt_expressions::{
@@ -22,7 +23,8 @@ use rekt_expressions::{
 };
 use rekt_protocol::{
     AttributeValue, BatchGetItemRequest, BatchWriteItemRequest, DeleteItemRequest, GetItemRequest,
-    PutItemRequest, QueryRequest, ScanRequest, TransactGetItemsRequest, UpdateItemRequest,
+    PutItemRequest, QueryRequest, ScanRequest, TransactGetItemsRequest, TransactWriteItemsRequest,
+    UpdateItemRequest,
 };
 use rekt_storage::{KeyValue, WriteOp};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -549,6 +551,122 @@ pub fn translate_transact_get_items(
     }
 
     Ok(TransactGetItemsPlan { items })
+}
+
+/// TransactWriteItems — atomic cross-table write. T3 implements
+/// `Put` only; T4 lifts Delete + ConditionCheck; T5 lifts Update.
+///
+/// Position-preserving (D8): the returned `items[i]` corresponds to
+/// the request's `transact_items[i]`. Same-target dedupe across the
+/// whole request keyed by `(table, pk, sk)` per D6.
+///
+/// `ClientRequestToken` is validated (≤36 bytes) and otherwise
+/// discarded — v1 has no idempotency store (D10; T8 implements).
+#[tracing::instrument(level = "debug", skip_all, name = "translate.transact_write_items")]
+pub fn translate_transact_write_items(
+    req: &TransactWriteItemsRequest,
+    schemas: &HashMap<String, TableSchema>,
+    max_items: u32,
+) -> Result<TransactWriteItemsPlan, TranslateError> {
+    if req.transact_items.is_empty() {
+        return Err(TranslateError::EmptyTransactRequest);
+    }
+    let total = req.transact_items.len();
+    if total > max_items as usize {
+        return Err(TranslateError::TooManyTransactItems {
+            got: total as u32,
+            max: max_items,
+        });
+    }
+    // ClientRequestToken length cap. DDB rejects > 36 chars with
+    // ValidationException; we match.
+    if let Some(t) = req.client_request_token.as_deref() {
+        if t.len() > 36 {
+            return Err(TranslateError::InvalidConditionExpression(
+                "ClientRequestToken must be <= 36 chars".into(),
+            ));
+        }
+    }
+
+    let mut items: Vec<TransactWritePlanItem> = Vec::with_capacity(total);
+    let mut seen: HashSet<(String, KeyValue, Option<KeyValue>)> = HashSet::with_capacity(total);
+
+    for ti in &req.transact_items {
+        // Exactly-one rule: precisely one of Put/Delete/Update/ConditionCheck.
+        let set_count = [
+            ti.put.is_some(),
+            ti.delete.is_some(),
+            ti.update.is_some(),
+            ti.condition_check.is_some(),
+        ]
+        .iter()
+        .filter(|x| **x)
+        .count();
+        if set_count != 1 {
+            return Err(TranslateError::MalformedTransactItem {
+                expected: "Put | Delete | Update | ConditionCheck",
+            });
+        }
+
+        if let Some(put) = ti.put.as_ref() {
+            let schema = schemas.get(&put.table_name).ok_or_else(|| {
+                TranslateError::ResourceNotFoundForTransact {
+                    table: put.table_name.clone(),
+                }
+            })?;
+            let (pk, sk) = extract_key_pair(&put.item, schema)?;
+            let target = (put.table_name.clone(), pk.clone(), sk.clone());
+            if !seen.insert(target) {
+                return Err(TranslateError::DuplicateTransactTarget);
+            }
+            let empty_names: BTreeMap<String, String> = BTreeMap::new();
+            let empty_values: BTreeMap<String, AttributeValue> = BTreeMap::new();
+            let names = put.expression_attribute_names.as_ref().unwrap_or(&empty_names);
+            let values = put
+                .expression_attribute_values
+                .as_ref()
+                .unwrap_or(&empty_values);
+            let condition = translate_condition(
+                put.condition_expression.as_deref(),
+                names,
+                values,
+                schema,
+            )?;
+            let return_old_on_failure = parse_return_old_on_failure(
+                put.return_values_on_condition_check_failure.as_deref(),
+            )?;
+            let item_json = serde_json::to_value(&put.item)
+                .expect("AttributeValue Serialize is infallible");
+            items.push(TransactWritePlanItem {
+                table_name: put.table_name.clone(),
+                pk,
+                sk,
+                kind: TransactWriteKind::Put { item_json },
+                condition,
+                return_old_on_failure,
+            });
+        } else {
+            // Delete / Update / ConditionCheck land in T4/T5.
+            return Err(TranslateError::MalformedTransactItem {
+                expected: "Put (Delete / Update / ConditionCheck land in PLAN-8 T4/T5)",
+            });
+        }
+    }
+
+    Ok(TransactWriteItemsPlan { items })
+}
+
+/// Validate `ReturnValuesOnConditionCheckFailure`. DDB accepts `NONE`
+/// (default) or `ALL_OLD`; anything else is a ValidationException.
+fn parse_return_old_on_failure(raw: Option<&str>) -> Result<bool, TranslateError> {
+    match raw {
+        None | Some("NONE") => Ok(false),
+        Some("ALL_OLD") => Ok(true),
+        Some(other) => Err(TranslateError::UnsupportedReturnValuesForOp {
+            op: "TransactWriteItems",
+            got: other.to_string(),
+        }),
+    }
 }
 
 /// Shared `ReturnValues` resolver for PutItem and DeleteItem. DDB accepts

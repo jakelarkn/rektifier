@@ -203,6 +203,100 @@ pub(crate) async fn put_with_condition_raw(
     ))
 }
 
+/// Tx-scoped upsert. Runs the same CTE-based `put_sql` from
+/// [`crate::shape::ShapeSql`] against an existing `Transaction` and
+/// returns the pre-update row (or `None`). Used by `transact_write_raw`
+/// (T3) so the upsert participates in the caller's transaction; the
+/// trait-method `put_item_raw` keeps its existing direct-client path
+/// for the single-row hot path.
+pub(crate) async fn put_item_inside_tx(
+    backend: &PgBackend,
+    tx: &deadpool_postgres::Transaction<'_>,
+    shape: &TableShape<'_>,
+    pk: &KeyValue,
+    sk: Option<&KeyValue>,
+    item: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, BackendError> {
+    check_sk_shape(shape, sk)?;
+    let sql = backend.shape_sql(shape);
+    let stmt = tx
+        .prepare_typed_cached(&sql.put_sql, &sql.put_types)
+        .instrument(tracing::debug_span!("pg.prepare"))
+        .await
+        .map_err(|e| map_pg_err(shape.table, e))?;
+
+    let pk_bound = Bound(pk);
+    let item_json = Json(item);
+    let row = match sk {
+        None => {
+            tx.query_one(&stmt, &[&pk_bound, &item_json])
+                .instrument(tracing::debug_span!("pg.execute"))
+                .await
+        }
+        Some(sk_val) => {
+            let sk_bound = Bound(sk_val);
+            tx.query_one(&stmt, &[&pk_bound, &sk_bound, &item_json])
+                .instrument(tracing::debug_span!("pg.execute"))
+                .await
+        }
+    }
+    .map_err(|e| map_pg_err(shape.table, e))?;
+    let old_item: Option<Json<serde_json::Value>> = row.get(0);
+    Ok(old_item.map(|Json(v)| v))
+}
+
+/// Tx-scoped conditional upsert — single-pass: SELECT FOR UPDATE,
+/// evaluate condition, INSERT/UPDATE accordingly. Returns the
+/// pre-update row on success. On condition false, returns
+/// [`BackendError::ConditionalCheckFailed`] (caller drops the tx to
+/// roll back).
+///
+/// Unlike `put_with_condition_raw`, this helper does NOT retry on
+/// race-on-INSERT — under the caller's REPEATABLE READ tx, a
+/// concurrent INSERT after our snapshot raises SQLSTATE `40001`,
+/// which propagates and aborts the whole TransactWriteItems request
+/// (mapped to `TransactionConflict` in the cancellation reasons).
+pub(crate) async fn put_with_condition_inside_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    shape: &TableShape<'_>,
+    pk: &KeyValue,
+    sk: Option<&KeyValue>,
+    item: &serde_json::Value,
+    condition: &ConditionEvalFn<'_>,
+) -> Result<Option<serde_json::Value>, BackendError> {
+    check_sk_shape(shape, sk)?;
+    let prep = RmwSqlPrep::build(shape);
+
+    let select_stmt = tx
+        .prepare_typed_cached(&prep.select_sql, &prep.key_types)
+        .await
+        .map_err(|e| map_pg_err(shape.table, e))?;
+    let update_stmt = tx
+        .prepare_typed_cached(&prep.update_sql, &prep.update_types)
+        .await
+        .map_err(|e| map_pg_err(shape.table, e))?;
+    let insert_stmt = tx
+        .prepare_typed_cached(&prep.insert_sql, &[Type::JSONB])
+        .await
+        .map_err(|e| map_pg_err(shape.table, e))?;
+
+    let existing = prep.select_for_update(tx, &select_stmt, pk, sk).await?;
+    let exists = existing.is_some();
+    if !condition(existing.as_ref()) {
+        return Err(BackendError::ConditionalCheckFailed);
+    }
+    let new_json = Json(item);
+    if exists {
+        prep.exec_update(tx, &update_stmt, &new_json, pk, sk).await?;
+    } else {
+        tx.execute(&insert_stmt, &[&new_json])
+            .instrument(tracing::debug_span!("pg.insert_on_conflict"))
+            .await
+            .map_err(|e| map_pg_err(shape.table, e))?;
+    }
+    Ok(existing)
+}
+
 #[tracing::instrument(level = "debug", skip_all, name = "pg.delete_with_condition_raw", fields(table = %shape.table))]
 pub(crate) async fn delete_with_condition_raw(
     backend: &PgBackend,

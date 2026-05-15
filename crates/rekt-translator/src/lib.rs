@@ -49,13 +49,14 @@ pub use plan::{
     touched_paths, BatchGetItemPlan, BatchGetPerTable, BatchWriteItemPlan, BatchWritePerTable,
     ConditionPlan, ConditionRouting, DeleteItemPlan, GetItemPlan, PutItemPlan, QueryPlan,
     ReturnValuesMode, ScanPlan, SimpleSqlUpdatePrimitives, SimpleUpdatePrimitives,
-    TransactGetItemsPlan, TransactGetPlanItem, UpdateItemPlan,
+    TransactGetItemsPlan, TransactGetPlanItem, TransactWriteItemsPlan, TransactWriteKind,
+    TransactWritePlanItem, UpdateItemPlan,
 };
 pub use schema::TableSchema;
 pub use translate::{
     translate_batch_get_item, translate_batch_write_item, translate_delete_item,
     translate_get_item, translate_put_item, translate_query, translate_scan,
-    translate_transact_get_items, translate_update_item,
+    translate_transact_get_items, translate_transact_write_items, translate_update_item,
 };
 #[cfg(test)]
 mod tests {
@@ -3102,5 +3103,164 @@ mod tests {
         let proj = plan.items[0].projection.as_ref().expect("projection set");
         assert!(proj.contains("id"));
         assert!(proj.contains("label"));
+    }
+
+    // ===== TransactWriteItems (T3) ============================================
+
+    fn tw_put(table: &str, item: Item) -> rekt_protocol::TransactWriteItem {
+        rekt_protocol::TransactWriteItem {
+            put: Some(rekt_protocol::TransactPut {
+                table_name: table.into(),
+                item,
+                ..Default::default()
+            }),
+            delete: None,
+            update: None,
+            condition_check: None,
+        }
+    }
+
+    fn tw_req(items: Vec<rekt_protocol::TransactWriteItem>) -> rekt_protocol::TransactWriteItemsRequest {
+        rekt_protocol::TransactWriteItemsRequest {
+            transact_items: items,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn transact_write_put_only_ok() {
+        let req = tw_req(vec![
+            tw_put("users", item_of(&[("id", AttributeValue::S("a".into()))])),
+            tw_put("users", item_of(&[("id", AttributeValue::S("b".into()))])),
+        ]);
+        let plan = translate_transact_write_items(&req, &schemas_map(), 100).unwrap();
+        assert_eq!(plan.items.len(), 2);
+        assert_eq!(plan.items[0].table_name, "users");
+        assert_eq!(plan.items[0].pk, KeyValue::S("a".into()));
+        assert!(matches!(plan.items[0].kind, TransactWriteKind::Put { .. }));
+        assert!(plan.items[0].condition.is_none());
+    }
+
+    #[test]
+    fn transact_write_put_with_condition_parses() {
+        let mut item =
+            tw_put("users", item_of(&[("id", AttributeValue::S("a".into()))]));
+        item.put.as_mut().unwrap().condition_expression =
+            Some("attribute_not_exists(id)".into());
+        let req = tw_req(vec![item]);
+        let plan = translate_transact_write_items(&req, &schemas_map(), 100).unwrap();
+        assert!(plan.items[0].condition.is_some());
+    }
+
+    #[test]
+    fn transact_write_empty_request_rejected() {
+        let req = tw_req(vec![]);
+        let err = translate_transact_write_items(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::EmptyTransactRequest));
+    }
+
+    #[test]
+    fn transact_write_too_many_items_rejected() {
+        let items: Vec<_> = (0..6)
+            .map(|n| tw_put("users", item_of(&[("id", AttributeValue::S(format!("u{n}")))])))
+            .collect();
+        let req = tw_req(items);
+        let err = translate_transact_write_items(&req, &schemas_map(), 5).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::TooManyTransactItems { got: 6, max: 5 }
+        ));
+    }
+
+    #[test]
+    fn transact_write_unknown_table_rejected() {
+        let req = tw_req(vec![tw_put(
+            "nope",
+            item_of(&[("id", AttributeValue::S("a".into()))]),
+        )]);
+        let err = translate_transact_write_items(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::ResourceNotFoundForTransact { .. }));
+    }
+
+    #[test]
+    fn transact_write_duplicate_target_rejected() {
+        let same = || item_of(&[("id", AttributeValue::S("dup".into()))]);
+        let req = tw_req(vec![tw_put("users", same()), tw_put("users", same())]);
+        let err = translate_transact_write_items(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::DuplicateTransactTarget));
+    }
+
+    #[test]
+    fn transact_write_no_inner_set_rejected() {
+        let req = tw_req(vec![rekt_protocol::TransactWriteItem::default()]);
+        let err = translate_transact_write_items(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::MalformedTransactItem { .. }));
+    }
+
+    #[test]
+    fn transact_write_delete_rejected_until_t4() {
+        // PLAN-8 T3 only implements Put. Delete/Update/ConditionCheck reject.
+        let req = tw_req(vec![rekt_protocol::TransactWriteItem {
+            delete: Some(rekt_protocol::TransactDelete {
+                table_name: "users".into(),
+                key: item_of(&[("id", AttributeValue::S("a".into()))]),
+                ..Default::default()
+            }),
+            put: None,
+            update: None,
+            condition_check: None,
+        }]);
+        let err = translate_transact_write_items(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::MalformedTransactItem { .. }));
+    }
+
+    #[test]
+    fn transact_write_return_values_unsupported_rejected() {
+        let mut item =
+            tw_put("users", item_of(&[("id", AttributeValue::S("a".into()))]));
+        item.put.as_mut().unwrap().return_values_on_condition_check_failure =
+            Some("BOGUS".into());
+        let req = tw_req(vec![item]);
+        let err = translate_transact_write_items(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::UnsupportedReturnValuesForOp { .. }));
+    }
+
+    #[test]
+    fn transact_write_return_values_all_old_accepted() {
+        let mut item =
+            tw_put("users", item_of(&[("id", AttributeValue::S("a".into()))]));
+        item.put.as_mut().unwrap().return_values_on_condition_check_failure =
+            Some("ALL_OLD".into());
+        let req = tw_req(vec![item]);
+        let plan = translate_transact_write_items(&req, &schemas_map(), 100).unwrap();
+        assert!(plan.items[0].return_old_on_failure);
+    }
+
+    #[test]
+    fn transact_write_client_request_token_too_long_rejected() {
+        let mut req = tw_req(vec![tw_put(
+            "users",
+            item_of(&[("id", AttributeValue::S("a".into()))]),
+        )]);
+        req.client_request_token = Some("x".repeat(37));
+        let err = translate_transact_write_items(&req, &schemas_map(), 100).unwrap_err();
+        // Lands as InvalidConditionExpression in v1 (no dedicated variant).
+        assert!(matches!(
+            err,
+            TranslateError::InvalidConditionExpression(_)
+        ));
+    }
+
+    #[test]
+    fn transact_write_position_preserved() {
+        let req = tw_req(vec![
+            tw_put("users", item_of(&[("id", AttributeValue::S("third".into()))])),
+            tw_put("users", item_of(&[("id", AttributeValue::S("first".into()))])),
+            tw_put("users", item_of(&[("id", AttributeValue::S("second".into()))])),
+        ]);
+        let plan = translate_transact_write_items(&req, &schemas_map(), 100).unwrap();
+        assert_eq!(plan.items[0].pk, KeyValue::S("third".into()));
+        assert_eq!(plan.items[1].pk, KeyValue::S("first".into()));
+        assert_eq!(plan.items[2].pk, KeyValue::S("second".into()));
     }
 }

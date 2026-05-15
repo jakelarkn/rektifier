@@ -114,8 +114,35 @@ pub enum BackendError {
         message: String,
     },
 
+    /// One or more `TransactWriteItems` ops failed (the typical case
+    /// is a per-item `ConditionExpression` evaluating to false, but
+    /// any per-op error inside the cross-table transaction surfaces
+    /// here). `reasons` is parallel to the request's `TransactItems`
+    /// — one entry per slot, with `code: "None"` for the slots that
+    /// would have succeeded and a specific code (e.g.
+    /// `"ConditionalCheckFailed"`, `"TransactionConflict"`) for the
+    /// failing slot(s).
+    ///
+    /// Maps to DDB's `TransactionCanceledException` at the HTTP
+    /// boundary.
+    #[error("transaction cancelled")]
+    TransactionCancelled { reasons: Vec<TransactCancelReason> },
+
     #[error("storage error: {0}")]
     Other(String),
+}
+
+/// One slot in DDB's `CancellationReasons[]`. The backend populates
+/// the slice in request order (position-preserving — D9 in PLAN-8);
+/// successful slots carry `code: "None"`, the failing slot(s) carry a
+/// specific code and (when the request asked for it via
+/// `ReturnValuesOnConditionCheckFailure="ALL_OLD"`) the pre-image of
+/// that row.
+#[derive(Debug, Clone)]
+pub struct TransactCancelReason {
+    pub code: &'static str,
+    pub message: Option<String>,
+    pub item: Option<serde_json::Value>,
 }
 
 #[async_trait]
@@ -434,7 +461,59 @@ pub trait Backend: Send + Sync + 'static {
         &self,
         items: &[TransactGetOp<'_>],
     ) -> Result<TransactGetOutcome, BackendError>;
+
+    /// TransactWriteItems — atomic cross-table write. Opens a single
+    /// PG transaction at `REPEATABLE READ` and dispatches each
+    /// `TransactWriteOp` to the right SQL primitive. First per-op
+    /// failure aborts the whole transaction; the backend returns
+    /// `BackendError::TransactionCancelled` with one
+    /// `TransactCancelReason` per input position. Successful slots
+    /// carry `code: "None"`; failing slot carries
+    /// `"ConditionalCheckFailed"` / `"TransactionConflict"` / etc.
+    /// (D9 in PLAN-8).
+    ///
+    /// v1 supports the `Put` variant only (T3); T4 adds Delete +
+    /// ConditionCheck; T5 adds Update. Unsupported variants surface
+    /// as `BackendError::Other` with a clear message — the translator
+    /// is expected to reject them before reaching here.
+    async fn transact_write_raw(
+        &self,
+        items: Vec<TransactWriteOp<'_>>,
+    ) -> Result<TransactWriteOutcome, BackendError>;
 }
+
+/// One write inside a `TransactWriteItems` request. Each variant
+/// carries pre-extracted keys (translator validated them) and any
+/// per-item condition as a `ConditionEvalFn` closure (translator
+/// already parsed the AST and wrapped `evaluate_condition`). T3
+/// implements `Put`; T4 adds `Delete` + `ConditionCheck`; T5 adds
+/// `Update`.
+pub enum TransactWriteOp<'a> {
+    Put {
+        shape: TableShape<'a>,
+        pk: KeyValue,
+        sk: Option<KeyValue>,
+        item: serde_json::Value,
+        /// Optional per-item ConditionExpression. `None` is an
+        /// unconditional upsert; `Some(eval)` runs SELECT FOR UPDATE
+        /// inside the shared tx and evaluates the closure.
+        condition: Option<ConditionEvalFn<'a>>,
+        /// If `true` and a condition is set and it fails, the
+        /// pre-image of the (would-have-been-touched) row is
+        /// captured into the corresponding `CancellationReasons[i]`
+        /// slot. Matches DDB's `ReturnValuesOnConditionCheckFailure`
+        /// (D11 in PLAN-8).
+        return_old_on_failure: bool,
+    },
+    // Delete / ConditionCheck land in T4; Update in T5.
+}
+
+/// Success outcome of a `transact_write_raw` call. Carries no data
+/// in v1 — failures use `BackendError::TransactionCancelled`. The
+/// struct exists so T8's `unprocessed`-like fields can be added
+/// without widening the trait.
+#[derive(Debug, Clone, Default)]
+pub struct TransactWriteOutcome {}
 
 /// One read inside a `TransactGetItems` request. Carries the table
 /// shape (caller-owned, lent for the duration of the call) plus the

@@ -4841,3 +4841,64 @@ fn diff_transact_get_projection_prunes_attributes() {
 
     delete_both("users", "{\"id\":{\"S\":\"tg-pj\"}}");
 }
+
+// ===== TransactWriteItems T3 — Put-only =====================================
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_transact_write_put_only_round_trip() {
+    ensure_users_table();
+    let items = "[\
+        {\"Put\":{\"TableName\":\"users\",\"Item\":{\"id\":{\"S\":\"tw-d-a\"},\"label\":{\"S\":\"alice\"}}}},\
+        {\"Put\":{\"TableName\":\"users\",\"Item\":{\"id\":{\"S\":\"tw-d-b\"},\"label\":{\"S\":\"bob\"}}}}\
+    ]";
+    let _ = aws(REF, &["dynamodb","transact-write-items","--transact-items",items]);
+    let _ = aws(OURS, &["dynamodb","transact-write-items","--transact-items",items]);
+
+    // Verify both rows present via GetItem on each side.
+    for id in ["tw-d-a", "tw-d-b"] {
+        let key = format!("{{\"id\":{{\"S\":\"{id}\"}}}}");
+        let r_ref = aws(REF, &["dynamodb","get-item","--table-name","users","--key",&key]);
+        let r_ours = aws(OURS, &["dynamodb","get-item","--table-name","users","--key",&key]);
+        assert_eq!(r_ref["Item"], r_ours["Item"], "row {id} diverged");
+    }
+
+    delete_both("users", "{\"id\":{\"S\":\"tw-d-a\"}}");
+    delete_both("users", "{\"id\":{\"S\":\"tw-d-b\"}}");
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_transact_write_conditional_put_failure_atomicity() {
+    ensure_users_table();
+    // Seed the row whose ConditionExpression will fail.
+    let seed = "{\"id\":{\"S\":\"tw-d-exists\"},\"label\":{\"S\":\"old\"}}";
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",seed]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",seed]);
+
+    let items = "[\
+        {\"Put\":{\"TableName\":\"users\",\"Item\":{\"id\":{\"S\":\"tw-d-fresh\"},\"label\":{\"S\":\"new\"}}}},\
+        {\"Put\":{\"TableName\":\"users\",\"Item\":{\"id\":{\"S\":\"tw-d-exists\"}},\
+                  \"ConditionExpression\":\"attribute_not_exists(id)\"}}\
+    ]";
+    // Both endpoints reject; rektifier's wire shape must match DDB-local's.
+    let ref_err = aws_expecting_failure(REF, &["dynamodb","transact-write-items","--transact-items",items]);
+    let ours_err = aws_expecting_failure(OURS, &["dynamodb","transact-write-items","--transact-items",items]);
+    assert!(
+        ref_err.contains("TransactionCanceled") || ref_err.contains("TransactionCancelledException"),
+        "ref didn't reject as TransactionCanceledException: {ref_err}"
+    );
+    assert!(
+        ours_err.contains("TransactionCanceled") || ours_err.contains("TransactionCancelledException"),
+        "ours didn't reject as TransactionCanceledException: {ours_err}"
+    );
+
+    // Atomicity: tw-d-fresh must NOT exist on either side.
+    let k_fresh = "{\"id\":{\"S\":\"tw-d-fresh\"}}";
+    let r_ref = aws(REF, &["dynamodb","get-item","--table-name","users","--key",k_fresh]);
+    let r_ours = aws(OURS, &["dynamodb","get-item","--table-name","users","--key",k_fresh]);
+    assert!(r_ref.get("Item").is_none(), "ref leaked atomicity: {r_ref}");
+    assert!(r_ours.get("Item").is_none(), "ours leaked atomicity: {r_ours}");
+
+    delete_both("users", "{\"id\":{\"S\":\"tw-d-exists\"}}");
+}

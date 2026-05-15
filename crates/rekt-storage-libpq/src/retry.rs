@@ -78,6 +78,7 @@ pub(crate) fn is_retryable(err: &BackendError) -> bool {
         | BackendError::KeyTypeMismatch { .. }
         | BackendError::MissingSortKey { .. }
         | BackendError::UnexpectedSortKey { .. }
+        | BackendError::TransactionCancelled { .. }
         | BackendError::Other(_) => false,
     }
 }

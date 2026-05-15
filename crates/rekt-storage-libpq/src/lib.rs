@@ -37,6 +37,7 @@ mod retry;
 mod scan;
 mod shape;
 mod transact_get;
+mod transact_write;
 mod types;
 mod update;
 
@@ -50,7 +51,7 @@ use rekt_expressions::Condition;
 use rekt_storage::{
     Backend, BackendError, BatchGetOutcome, BatchWriteOutcome, ConditionEvalFn, FilterEvalFn,
     GeneralUpdateFn, KeyValue, QueryOutcome, ScanOutcome, SkCondition, TableShape, TransactGetOp,
-    TransactGetOutcome, UpdateOutcome, WriteOp,
+    TransactGetOutcome, TransactWriteOp, TransactWriteOutcome, UpdateOutcome, WriteOp,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -423,6 +424,17 @@ impl Backend for PgBackend {
             transact_get::transact_get_raw(self, items)
         })
         .await
+    }
+
+    async fn transact_write_raw(
+        &self,
+        items: Vec<TransactWriteOp<'_>>,
+    ) -> Result<TransactWriteOutcome, BackendError> {
+        // Closure-bearing per-op conditions — does NOT auto-retry on
+        // transient PG errors. SQLSTATE 40001/40P01 propagate as
+        // TransactionCancelled with `Code: "TransactionConflict"` so
+        // the SDK retry loop handles them (matches DDB).
+        transact_write::transact_write_raw(self, items).await
     }
 }
 #[cfg(test)]
@@ -4652,6 +4664,214 @@ mod tests {
             .batch_execute("DROP TABLE rekt_t_tg_xa; DROP TABLE rekt_t_tg_xb;")
             .await
             .unwrap();
+    }
+
+    // ===== TransactWriteItems (T3) ===========================================
+    //
+    // Live-PG validation of `transact_write_raw` Put-only path:
+    // single-table, multi-row, conditional, atomicity-on-failure.
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn transact_write_put_only_hash() {
+        use rekt_storage::TransactWriteOp;
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_tw_hash;
+                 CREATE TABLE rekt_t_tw_hash (
+                   data jsonb NOT NULL,
+                   id   text  GENERATED ALWAYS AS (data#>>'{id,S}') STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_tw_hash",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        let ops = vec![
+            TransactWriteOp::Put {
+                shape: shape.clone(),
+                pk: KeyValue::S("a".into()),
+                sk: None,
+                item: serde_json::json!({"id":{"S":"a"},"label":{"S":"alice"}}),
+                condition: None,
+                return_old_on_failure: false,
+            },
+            TransactWriteOp::Put {
+                shape: shape.clone(),
+                pk: KeyValue::S("b".into()),
+                sk: None,
+                item: serde_json::json!({"id":{"S":"b"},"label":{"S":"bob"}}),
+                condition: None,
+                return_old_on_failure: false,
+            },
+        ];
+        backend.transact_write_raw(ops).await.unwrap();
+
+        // Verify both rows landed.
+        let got_a = backend
+            .get_item_raw(&shape, &KeyValue::S("a".into()), None)
+            .await
+            .unwrap();
+        assert!(got_a.is_some());
+        let got_b = backend
+            .get_item_raw(&shape, &KeyValue::S("b".into()), None)
+            .await
+            .unwrap();
+        assert!(got_b.is_some());
+
+        client.batch_execute("DROP TABLE rekt_t_tw_hash;").await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn transact_write_conditional_put_fails_rolls_back_siblings() {
+        use rekt_storage::TransactWriteOp;
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_tw_cond;
+                 CREATE TABLE rekt_t_tw_cond (
+                   data jsonb NOT NULL,
+                   id   text  GENERATED ALWAYS AS (data#>>'{id,S}') STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_tw_cond",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        // Seed a row whose condition will fail.
+        pg_put(
+            &backend,
+            &shape,
+            &serde_json::json!({"id":{"S":"present"},"v":{"N":"1"}}),
+        )
+        .await;
+
+        // Two-op tx: first is a benign Put on a fresh key, second has
+        // attribute_not_exists(id) which fails because "present" exists.
+        // Atomicity demands the first Put NOT persist.
+        use rekt_expressions::{parse_condition_expression, substitute_condition};
+        let cond_ast = parse_condition_expression("attribute_not_exists(id)").unwrap();
+        let cond = substitute_condition(
+            cond_ast,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::<String, rekt_protocol::AttributeValue>::new(),
+        )
+        .unwrap();
+        let cond_eval: rekt_storage::ConditionEvalFn<'_> = Box::new(move |existing| {
+            rekt_translator::evaluate_condition(existing, &cond)
+        });
+
+        let ops = vec![
+            TransactWriteOp::Put {
+                shape: shape.clone(),
+                pk: KeyValue::S("racer-fresh".into()),
+                sk: None,
+                item: serde_json::json!({"id":{"S":"racer-fresh"},"v":{"N":"99"}}),
+                condition: None,
+                return_old_on_failure: false,
+            },
+            TransactWriteOp::Put {
+                shape: shape.clone(),
+                pk: KeyValue::S("present".into()),
+                sk: None,
+                item: serde_json::json!({"id":{"S":"present"},"v":{"N":"999"}}),
+                condition: Some(cond_eval),
+                return_old_on_failure: false,
+            },
+        ];
+        let err = backend.transact_write_raw(ops).await.unwrap_err();
+        match err {
+            BackendError::TransactionCancelled { reasons } => {
+                assert_eq!(reasons.len(), 2);
+                assert_eq!(reasons[0].code, "None");
+                assert_eq!(reasons[1].code, "ConditionalCheckFailed");
+            }
+            other => panic!("expected TransactionCancelled, got {other:?}"),
+        }
+
+        // Atomicity: racer-fresh must NOT exist (the would-be-Put at
+        // slot 0 was rolled back when slot 1 failed).
+        let got = backend
+            .get_item_raw(&shape, &KeyValue::S("racer-fresh".into()), None)
+            .await
+            .unwrap();
+        assert!(got.is_none(), "atomicity violation: {got:?}");
+
+        // The pre-existing "present" row should be unchanged.
+        let got = backend
+            .get_item_raw(&shape, &KeyValue::S("present".into()), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got["v"]["N"].as_str().unwrap(), "1");
+
+        client.batch_execute("DROP TABLE rekt_t_tw_cond;").await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn transact_write_composite_put() {
+        use rekt_storage::TransactWriteOp;
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_tw_comp;
+                 CREATE TABLE rekt_t_tw_comp (
+                   data jsonb NOT NULL,
+                   device_id text    GENERATED ALWAYS AS (data#>>'{device_id,S}') STORED,
+                   ts        numeric GENERATED ALWAYS AS ((data#>>'{ts,N}')::numeric) STORED,
+                   PRIMARY KEY (device_id, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_tw_comp",
+            pk_col: "device_id",
+            pk_type: KeyType::S,
+            sk_col: Some("ts"),
+            sk_type: Some(KeyType::N),
+            jsonb_col: "data",
+        };
+        let ops = vec![TransactWriteOp::Put {
+            shape: shape.clone(),
+            pk: KeyValue::S("d1".into()),
+            sk: Some(KeyValue::N("42".into())),
+            item: serde_json::json!({
+                "device_id":{"S":"d1"},
+                "ts":{"N":"42"},
+                "label":{"S":"E42"}
+            }),
+            condition: None,
+            return_old_on_failure: false,
+        }];
+        backend.transact_write_raw(ops).await.unwrap();
+
+        let got = backend
+            .get_item_raw(&shape, &KeyValue::S("d1".into()), Some(&KeyValue::N("42".into())))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got["label"]["S"].as_str().unwrap(), "E42");
+
+        client.batch_execute("DROP TABLE rekt_t_tw_comp;").await.unwrap();
     }
 
     #[tokio::test]
