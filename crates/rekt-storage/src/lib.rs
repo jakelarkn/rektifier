@@ -28,7 +28,7 @@ pub enum KeyType {
 }
 
 /// Typed key value, ready to bind to a PG parameter.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum KeyValue {
     /// PG column `text`. Stored as-is.
     S(String),
@@ -354,6 +354,38 @@ pub trait Backend: Send + Sync + 'static {
         limit: Option<u32>,
         exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
     ) -> Result<ScanOutcome, BackendError>;
+
+    /// BatchGetItem — multi-key SELECT against a single table.
+    ///
+    /// Emits one SQL statement, regardless of `keys.len()`. Hash-only
+    /// tables use `WHERE pk_col = ANY($1::<pk_type>[])`; composite-key
+    /// tables use `WHERE (pk_col, sk_col) IN (VALUES ($1, $2), ($3,
+    /// $4), ...)`. Missing rows are silently absent from the returned
+    /// vec — DDB returns hits, not "miss" sentinels.
+    ///
+    /// `keys` is caller-deduplicated; the translator rejects duplicates
+    /// before this method is reached, so the SQL emitter doesn't need
+    /// to compensate. Caller must not depend on response order (no
+    /// `ORDER BY` is emitted — D9 in `PLAN-6`).
+    async fn batch_get_raw(
+        &self,
+        shape: &TableShape<'_>,
+        keys: &[(KeyValue, Option<KeyValue>)],
+    ) -> Result<BatchGetOutcome, BackendError>;
+}
+
+/// Result of a `batch_get_raw` call. v1 consumes only `items.len()`
+/// and the items themselves; the struct exists so B7 can add
+/// per-call metrics (e.g. `scanned_count` for PG-level row counts)
+/// or partial-failure markers (e.g. `unprocessed` for the
+/// `UnprocessedKeys` response field) without widening the trait.
+#[derive(Debug, Clone, Default)]
+pub struct BatchGetOutcome {
+    pub items: Vec<serde_json::Value>,
+    // Future fields (unused in v1, retained as comments so the shape
+    // is visible at the trait surface):
+    //   pub scanned_count: u32,
+    //   pub unprocessed: Vec<(KeyValue, Option<KeyValue>)>,
 }
 
 /// Result of a `scan_raw` call. Structurally identical to

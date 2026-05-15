@@ -27,18 +27,18 @@ use axum::routing::post;
 use axum::Router;
 use bytes::Bytes;
 use rekt_protocol::{
-    DeleteItemRequest, DeleteItemResponse, GetItemRequest, GetItemResponse, Item, PutItemRequest,
-    PutItemResponse, QueryRequest, QueryResponse, ScanRequest, ScanResponse, UpdateItemRequest,
-    UpdateItemResponse,
+    BatchGetItemRequest, BatchGetItemResponse, DeleteItemRequest, DeleteItemResponse,
+    GetItemRequest, GetItemResponse, Item, PutItemRequest, PutItemResponse, QueryRequest,
+    QueryResponse, ScanRequest, ScanResponse, UpdateItemRequest, UpdateItemResponse,
 };
 use rekt_sigv4::{SigV4Error, Verifier};
 use rekt_storage::{Backend, BackendError, UpdateDecision, UpdateOutcome};
 use rekt_translator::{
     apply_update_expression, encode_lek, evaluate_condition, materialize_insert_only_update,
     materialize_simple_sql_update, materialize_simple_update, touched_paths,
-    translate_delete_item, translate_get_item, translate_put_item, translate_query,
-    translate_scan, translate_update_item, ConditionRouting, ReturnValuesMode, TableSchema,
-    TranslateError,
+    translate_batch_get_item, translate_delete_item, translate_get_item, translate_put_item,
+    translate_query, translate_scan, translate_update_item, ConditionRouting, ReturnValuesMode,
+    TableSchema, TranslateError,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -59,6 +59,32 @@ pub struct AppState {
     pub verifier: Arc<dyn Verifier>,
     pub backend: Arc<dyn Backend>,
     pub schemas: Arc<HashMap<String, TableSchema>>,
+    /// Per-call quantity caps on the batch ops. Defaults to DDB
+    /// values (100 / 25); operator can override via `[batch_limits]`
+    /// in `rektifier.toml`. See `COMPATIBILITY_NOTES.md`.
+    pub batch_limits: BatchLimits,
+}
+
+/// Server-side projection of `rekt_config::BatchLimits`. Carried in
+/// `AppState` and threaded into per-call translators that need it
+/// (currently `translate_batch_get_item`; `translate_batch_write_item`
+/// will plug in at B4).
+#[derive(Debug, Clone, Copy)]
+pub struct BatchLimits {
+    pub batch_get_max_keys: u32,
+    pub batch_write_max_requests: u32,
+}
+
+impl Default for BatchLimits {
+    /// DDB defaults — matches `rekt_config::BatchLimits::ddb_defaults()`.
+    /// Useful in tests that construct an `AppState` without going
+    /// through `rektifier.toml`.
+    fn default() -> Self {
+        Self {
+            batch_get_max_keys: 100,
+            batch_write_max_requests: 25,
+        }
+    }
 }
 
 /// Build the axum router. Apply the body-size limit at the outermost layer
@@ -154,7 +180,17 @@ impl IntoResponse for ApiError {
 
 impl From<TranslateError> for ApiError {
     fn from(e: TranslateError) -> Self {
-        ApiError::Validation(e.to_string())
+        match e {
+            // BatchGetItem can name many tables; the per-table missing
+            // lookup happens inside the translator (the dispatcher
+            // can't pre-resolve a single schema). Map back to the
+            // ResourceNotFoundException wire-shape DDB uses for the
+            // single-row ops' equivalent error.
+            TranslateError::ResourceNotFoundForBatch { table } => {
+                ApiError::ResourceNotFound(format!("Table not found: {table}"))
+            }
+            other => ApiError::Validation(other.to_string()),
+        }
     }
 }
 
@@ -228,6 +264,7 @@ async fn dispatch(State(state): State<AppState>, req: Request) -> Result<Respons
         "UpdateItem" => handle_update_item(&state, &body).await,
         "Query" => handle_query(&state, &body).await,
         "Scan" => handle_scan(&state, &body).await,
+        "BatchGetItem" => handle_batch_get_item(&state, &body).await,
         _ => Err(ApiError::UnknownOperation(format!(
             "operation `{op}` not implemented"
         ))),
@@ -639,6 +676,71 @@ async fn handle_scan(state: &AppState, body: &Bytes) -> Result<Response, ApiErro
         count: outcome.count,
         scanned_count: outcome.scanned_count,
         last_evaluated_key,
+    }))
+}
+
+#[tracing::instrument(
+    level = "debug",
+    skip_all,
+    name = "server.batch_get_item",
+    fields(tables = tracing::field::Empty, total_keys = tracing::field::Empty)
+)]
+async fn handle_batch_get_item(state: &AppState, body: &Bytes) -> Result<Response, ApiError> {
+    let req: BatchGetItemRequest = serde_json::from_slice(body).map_err(|e| {
+        ApiError::Serialization(format!("invalid BatchGetItem body: {e}"))
+    })?;
+
+    let plan = translate_batch_get_item(
+        &req,
+        state.schemas.as_ref(),
+        state.batch_limits.batch_get_max_keys,
+    )?;
+
+    tracing::Span::current().record("tables", plan.per_table.len());
+    let total_keys: usize = plan.per_table.iter().map(|t| t.keys.len()).sum();
+    tracing::Span::current().record("total_keys", total_keys);
+
+    // Per-table serial fan-out (D1 in PLAN-6). Each table issues one
+    // multi-key SQL statement. Missing rows are silently absent from
+    // the response.
+    let mut responses: HashMap<String, Vec<Item>> = HashMap::with_capacity(plan.per_table.len());
+    for table_plan in &plan.per_table {
+        let schema = state
+            .schemas
+            .get(&table_plan.table_name)
+            .ok_or_else(|| {
+                // Translator already validated this; this branch only
+                // fires if the schemas map mutates between translate
+                // and dispatch — not possible in v1, defensive guard.
+                ApiError::ResourceNotFound(format!(
+                    "Table not found: {}",
+                    table_plan.table_name
+                ))
+            })?;
+
+        let outcome = state
+            .backend
+            .batch_get_raw(&schema.shape(), &table_plan.keys)
+            .await?;
+
+        let items: Vec<Item> = outcome
+            .items
+            .into_iter()
+            .map(|v| {
+                serde_json::from_value(v).map_err(|e| {
+                    ApiError::Internal(format!(
+                        "stored item is not valid DynamoDB-JSON: {e}"
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        responses.insert(table_plan.table_name.clone(), items);
+    }
+
+    Ok(json_ok(&BatchGetItemResponse {
+        responses,
+        // Always `{}` in v1 — D11 in PLAN-6.
+        unprocessed_keys: HashMap::new(),
     }))
 }
 

@@ -1,9 +1,11 @@
 # Rektifier — Compatibility Notes
 
 Documented behavioral divergences from Amazon DynamoDB, scoped to the
-APIs rektifier currently implements end-to-end (PutItem, GetItem,
-DeleteItem, UpdateItem). APIs not yet implemented (Query, Scan,
-BatchGetItem, BatchWriteItem, TransactGetItems, TransactWriteItems,
+APIs rektifier implements end-to-end (PutItem, GetItem, DeleteItem,
+UpdateItem, Query, Scan) plus the BatchGetItem / BatchWriteItem
+section, which pre-documents divergences for the in-progress
+PLAN-6 work so the parity contract is locked when the implementation
+lands. APIs not yet planned (TransactGetItems, TransactWriteItems,
 CreateTable/DescribeTable/DeleteTable/ListTables, Streams) are tracked
 in `docs/plan/PLAN-2-feature-completeness.md` rather than here.
 
@@ -303,6 +305,98 @@ against rektifier.
 
 **Closure plan:** tracked in `PLAN-2` "Table lifecycle" — requires
 the metadata-table refactor deferred at Step 4.5 of PLAN-0.
+
+---
+
+## BatchGetItem / BatchWriteItem
+
+These entries describe known divergences planned for the in-progress
+Batch ops implementation (`docs/plan/PLAN-6-batch-ops.md`). Until
+B1 lands the wire surface, the ops themselves return
+`UnknownOperationException`; these entries pre-document the chosen
+behavior so the parity contract is locked when the SQL emission is
+written.
+
+### Multi-table batches are serial — Observable
+
+Rektifier processes each table in a `BatchGetItem` / `BatchWriteItem`
+request serially (one table's SQL completes before the next starts).
+DDB itself fans out across partitions, so a multi-table batch
+against DDB completes in roughly max-per-table time; against
+rektifier it completes in roughly sum-per-table time.
+
+**Affected ops:** BatchGetItem, BatchWriteItem.
+
+**Practical impact:** in our experience, "batch" requests almost
+always target a single table (bulk write to one table, multi-key
+read from one table). Single-table batches pay no penalty. Real
+multi-table fan-out is uncommon, and the divergence is in
+wall-clock latency only — items and side effects are identical.
+
+**Closure plan:** PLAN-6 phase B7 — `futures::join_all` across
+tables in the dispatcher. The trait shape is already per-table, so
+the change is dispatcher-local.
+
+### `AttributesToGet` (legacy projection format) is rejected — Strict
+
+DDB still accepts `AttributesToGet: [String]` on BatchGetItem as a
+legacy alternative to `ProjectionExpression`. Rektifier rejects it
+at translate time with `ValidationException: AttributesToGet not
+supported; use ProjectionExpression` — consistent with how
+GetItem, Query, and Scan handle the same field.
+
+**Migration risk:** SDK code written against DDB that uses the
+legacy field will fail fast against rektifier. SDKs themselves
+default to `ProjectionExpression` in current versions, so this is
+mostly a hazard for older / hand-rolled clients.
+
+**Closure plan:** not planned. The two projection formats are
+redundant; supporting one is the simpler product call.
+
+### `UnprocessedKeys` / `UnprocessedItems` are always empty — Inert
+
+DDB returns these to signal "we didn't get to these items, retry
+them." Rektifier has no equivalent throttle / partial-failure
+surface — errors are all-or-nothing per table; an SQL-level
+failure on one table fails the whole request with a typed error
+response.
+
+The fields are always present in the response (`{}`), well-formed,
+and never carry entries.
+
+**Affected ops:** BatchGetItem (`UnprocessedKeys`), BatchWriteItem
+(`UnprocessedItems`).
+
+**Migration risk:** code that *handles* `UnprocessedKeys` /
+`UnprocessedItems` correctly works identically against rektifier
+(the retry path is just unreachable). Code that *forgets* to handle
+them works against rektifier and may fail intermittently against
+DDB.
+
+**Closure plan:** PLAN-6 phase B7 — when rektifier grows real
+per-request size budgeting or a throttle surface, populate the
+fields accordingly.
+
+### Quantity limits (100 keys / 25 writes) are configurable — Lenient when raised
+
+DDB hard-caps `BatchGetItem` at 100 keys total and `BatchWriteItem`
+at 25 requests total. Rektifier defaults to the same caps but
+operators can override via `rektifier.toml`:
+
+```toml
+[limits]
+batch_get_max_keys = 100      # DDB default; raise at your own risk
+batch_write_max_requests = 25 # DDB default; raise at your own risk
+```
+
+**Migration risk:** operators who *raise* the cap have moved away
+from DDB parity. Code written against a raised rektifier cap will
+fail when moved to DDB with the same `ValidationException` DDB
+emits at >100 / >25. Operators who lower the cap stay strictly
+under DDB and pay no migration cost.
+
+**Closure plan:** none — the operator-tunable limit is the
+feature, not a bug. The default matches DDB.
 
 ---
 

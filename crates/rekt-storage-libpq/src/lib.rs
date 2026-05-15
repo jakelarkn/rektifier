@@ -28,6 +28,7 @@
 //! - [`put_delete`] — bodies for `put_item_raw`, `get_item_raw`,
 //!   `delete_item_raw`, and the two `_with_condition_raw` siblings.
 
+mod batch_get;
 mod condition_sql;
 mod put_delete;
 mod query;
@@ -40,8 +41,8 @@ use async_trait::async_trait;
 use deadpool_postgres::{Manager, Pool};
 use rekt_expressions::Condition;
 use rekt_storage::{
-    Backend, BackendError, ConditionEvalFn, FilterEvalFn, GeneralUpdateFn, KeyValue, QueryOutcome,
-    ScanOutcome, SkCondition, TableShape, UpdateOutcome,
+    Backend, BackendError, BatchGetOutcome, ConditionEvalFn, FilterEvalFn, GeneralUpdateFn,
+    KeyValue, QueryOutcome, ScanOutcome, SkCondition, TableShape, UpdateOutcome,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -214,6 +215,14 @@ impl Backend for PgBackend {
         exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
     ) -> Result<ScanOutcome, BackendError> {
         scan::scan_raw(self, shape, filter, limit, exclusive_start_key).await
+    }
+
+    async fn batch_get_raw(
+        &self,
+        shape: &TableShape<'_>,
+        keys: &[(KeyValue, Option<KeyValue>)],
+    ) -> Result<BatchGetOutcome, BackendError> {
+        batch_get::batch_get_raw(self, shape, keys).await
     }
 }
 #[cfg(test)]
@@ -3447,5 +3456,227 @@ mod tests {
             .batch_execute("DROP TABLE rekt_t_q_sb;")
             .await
             .unwrap();
+    }
+
+    // ===== BatchGetItem (B1) =================================================
+    //
+    // Live-PG validation of `batch_get_raw`'s two SQL shapes:
+    //   - Hash-only:  `WHERE pk = ANY($1::type[])`
+    //   - Composite:  `WHERE (pk, sk) IN (VALUES …)`
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn batch_get_hash_string_pk() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_bg_hash_s;
+                 CREATE TABLE rekt_t_bg_hash_s (
+                   data jsonb NOT NULL,
+                   id   text  GENERATED ALWAYS AS (data#>>'{id,S}') STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_bg_hash_s",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        for n in ["a", "b", "c"] {
+            let item = serde_json::json!({"id":{"S":n},"label":{"S":format!("L-{n}")}});
+            pg_put(&backend, &shape, &item).await;
+        }
+
+        // 3 hits + 2 misses; misses are silently dropped.
+        let keys = vec![
+            (KeyValue::S("a".into()), None),
+            (KeyValue::S("miss-1".into()), None),
+            (KeyValue::S("b".into()), None),
+            (KeyValue::S("miss-2".into()), None),
+            (KeyValue::S("c".into()), None),
+        ];
+        let outcome = backend.batch_get_raw(&shape, &keys).await.unwrap();
+        assert_eq!(outcome.items.len(), 3);
+        let mut got_ids: Vec<&str> = outcome
+            .items
+            .iter()
+            .map(|i| i["id"]["S"].as_str().unwrap())
+            .collect();
+        got_ids.sort();
+        assert_eq!(got_ids, vec!["a", "b", "c"]);
+
+        // Empty input → empty output, no SQL syntax error.
+        let outcome = backend.batch_get_raw(&shape, &[]).await.unwrap();
+        assert_eq!(outcome.items.len(), 0);
+
+        client
+            .batch_execute("DROP TABLE rekt_t_bg_hash_s;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn batch_get_hash_numeric_pk() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_bg_hash_n;
+                 CREATE TABLE rekt_t_bg_hash_n (
+                   data jsonb NOT NULL,
+                   id   numeric GENERATED ALWAYS AS ((data#>>'{id,N}')::numeric) STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_bg_hash_n",
+            pk_col: "id",
+            pk_type: KeyType::N,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        for n in ["1", "2", "3"] {
+            pg_put(&backend, &shape, &serde_json::json!({"id":{"N":n}})).await;
+        }
+        let keys = vec![
+            (KeyValue::N("1".into()), None),
+            (KeyValue::N("3".into()), None),
+            (KeyValue::N("999".into()), None), // miss
+        ];
+        let outcome = backend.batch_get_raw(&shape, &keys).await.unwrap();
+        assert_eq!(outcome.items.len(), 2);
+
+        client
+            .batch_execute("DROP TABLE rekt_t_bg_hash_n;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn batch_get_hash_binary_pk() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_bg_hash_b;
+                 CREATE TABLE rekt_t_bg_hash_b (
+                   data jsonb NOT NULL,
+                   hash bytea GENERATED ALWAYS AS (decode(data#>>'{hash,B}', 'base64')) STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_bg_hash_b",
+            pk_col: "hash",
+            pk_type: KeyType::B,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        // Insert items with B keys via DDB-base64-wire form.
+        use base64::Engine;
+        for raw in [b"\x00\x01" as &[u8], b"\x00\x02", b"\x00\x03"] {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({"hash":{"B":b64}}),
+            )
+            .await;
+        }
+        let keys = vec![
+            (KeyValue::B(Bytes::from_static(b"\x00\x01")), None),
+            (KeyValue::B(Bytes::from_static(b"\x00\x03")), None),
+            (KeyValue::B(Bytes::from_static(b"\x00\x99")), None), // miss
+        ];
+        let outcome = backend.batch_get_raw(&shape, &keys).await.unwrap();
+        assert_eq!(outcome.items.len(), 2);
+
+        client
+            .batch_execute("DROP TABLE rekt_t_bg_hash_b;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn batch_get_composite_pk_sk() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_bg_comp;
+                 CREATE TABLE rekt_t_bg_comp (
+                   data      jsonb   NOT NULL,
+                   device_id text    GENERATED ALWAYS AS (data#>>'{device_id,S}') STORED,
+                   ts        numeric GENERATED ALWAYS AS ((data#>>'{ts,N}')::numeric) STORED,
+                   PRIMARY KEY (device_id, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_bg_comp",
+            pk_col: "device_id",
+            pk_type: KeyType::S,
+            sk_col: Some("ts"),
+            sk_type: Some(KeyType::N),
+            jsonb_col: "data",
+        };
+        // Two partitions, three SK each.
+        for dev in ["d1", "d2"] {
+            for ts in ["10", "20", "30"] {
+                pg_put(
+                    &backend,
+                    &shape,
+                    &serde_json::json!({"device_id":{"S":dev},"ts":{"N":ts}}),
+                )
+                .await;
+            }
+        }
+        // Cherry-pick across partitions; include a miss.
+        let keys = vec![
+            (KeyValue::S("d1".into()), Some(KeyValue::N("10".into()))),
+            (KeyValue::S("d1".into()), Some(KeyValue::N("30".into()))),
+            (KeyValue::S("d2".into()), Some(KeyValue::N("20".into()))),
+            (KeyValue::S("d2".into()), Some(KeyValue::N("999".into()))), // miss
+        ];
+        let outcome = backend.batch_get_raw(&shape, &keys).await.unwrap();
+        assert_eq!(outcome.items.len(), 3);
+
+        client
+            .batch_execute("DROP TABLE rekt_t_bg_comp;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn batch_get_unknown_table_surfaces_table_not_found() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let shape = TableShape {
+            table: "rekt_t_bg_no_such_table_xyz",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        let keys = vec![(KeyValue::S("x".into()), None)];
+        let err = backend.batch_get_raw(&shape, &keys).await.unwrap_err();
+        match err {
+            BackendError::TableNotFound { .. } => {}
+            other => panic!("expected TableNotFound, got {other:?}"),
+        }
     }
 }

@@ -223,3 +223,46 @@ pub struct ScanResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_evaluated_key: Option<Item>,
 }
+
+/// Per-table read spec inside a `BatchGetItem` request. `Keys` is the
+/// only required field; `ProjectionExpression` / `ConsistentRead` /
+/// `AttributesToGet` are accepted on the wire and validated by the
+/// translator (v1: AttributesToGet rejected; the others land in B3).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct KeysAndAttributes {
+    pub keys: Vec<Item>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consistent_read: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_expression: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression_attribute_names: Option<std::collections::BTreeMap<String, String>>,
+    /// Legacy projection format. Rektifier rejects it — see `D8` in
+    /// `PLAN-6` and the matching entry in `COMPATIBILITY_NOTES.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attributes_to_get: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct BatchGetItemRequest {
+    pub request_items: std::collections::HashMap<String, KeysAndAttributes>,
+    /// Accepted-and-dropped per `COMPATIBILITY_NOTES.md` "Cross-cutting"
+    /// stance on metering fields.
+    #[serde(default)]
+    pub return_consumed_capacity: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct BatchGetItemResponse {
+    /// Per-table items; outer map key is the DDB table name. The map
+    /// is always present (`{}` when empty) — never omitted, never null
+    /// (D10). Per-table item lists are emitted whether empty or not.
+    pub responses: std::collections::HashMap<String, Vec<Item>>,
+    /// Always `{}` in v1 — rektifier has no throttle / partial-failure
+    /// surface (D11). Field is present so SDK retry loops have a
+    /// well-shaped value to interrogate.
+    pub unprocessed_keys: std::collections::HashMap<String, KeysAndAttributes>,
+}

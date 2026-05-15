@@ -204,6 +204,29 @@ pub struct SimpleUpdatePrimitives {
     pub removes: Vec<String>,
 }
 
+/// BatchGetItem plan: per-table groups of resolved keys.
+///
+/// Order of `per_table` is whatever the serde `HashMap` iterator
+/// yields — we do *not* sort. The dispatcher iterates this in
+/// whatever order it gets and emits the response in the same order
+/// (D9 in `PLAN-6`).
+#[derive(Debug, Clone, Default)]
+pub struct BatchGetItemPlan {
+    pub per_table: Vec<BatchGetPerTable>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchGetPerTable {
+    /// DDB-side table name. The dispatcher carries this back into the
+    /// `Responses` map without modification.
+    pub table_name: String,
+    /// Pre-validated, pre-deduped key tuples. `sk` is `Some` iff the
+    /// table is composite. Order matches the request's `Keys` array
+    /// minus any caller-supplied duplicates (rejected before reaching
+    /// the plan).
+    pub keys: Vec<(KeyValue, Option<KeyValue>)>,
+}
+
 /// Storage-ready primitives for an UpdateItem with a `SimpleSql`-
 /// classified ConditionExpression. The condition is *not* compiled
 /// here — the backend's SQL compiler does that — but the SET/REMOVE

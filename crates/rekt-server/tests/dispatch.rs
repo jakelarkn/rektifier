@@ -8,8 +8,9 @@ use rekt_expressions::Condition;
 use rekt_server::{router, AppState};
 use rekt_sigv4::{PermissiveVerifier, Verifier};
 use rekt_storage::{
-    Backend, BackendError, ConditionEvalFn, FilterEvalFn, GeneralUpdateFn, KeyType, KeyValue,
-    QueryOutcome, ScanOutcome, SkCondition, TableShape, UpdateDecision, UpdateOutcome,
+    Backend, BackendError, BatchGetOutcome, ConditionEvalFn, FilterEvalFn, GeneralUpdateFn,
+    KeyType, KeyValue, QueryOutcome, ScanOutcome, SkCondition, TableShape, UpdateDecision,
+    UpdateOutcome,
 };
 use rekt_translator::{evaluate_condition, TableSchema};
 use serde_json::{json, Value};
@@ -481,6 +482,24 @@ impl Backend for MockBackend {
         })
     }
 
+    async fn batch_get_raw(
+        &self,
+        shape: &TableShape<'_>,
+        keys: &[(KeyValue, Option<KeyValue>)],
+    ) -> Result<BatchGetOutcome, BackendError> {
+        let store = self.store.lock().unwrap();
+        let mut items = Vec::with_capacity(keys.len());
+        for (pk, sk) in keys {
+            let pk_s = kv_to_string(pk);
+            let sk_s = sk.as_ref().map(kv_to_string).unwrap_or_default();
+            let key = (shape.table.to_string(), pk_s, sk_s);
+            if let Some(v) = store.get(&key) {
+                items.push(v.clone());
+            }
+        }
+        Ok(BatchGetOutcome { items })
+    }
+
     async fn update_insert_only_raw(
         &self,
         shape: &TableShape<'_>,
@@ -575,6 +594,7 @@ fn app() -> axum::Router {
         verifier: Arc::new(PermissiveVerifier) as Arc<dyn Verifier>,
         backend: Arc::new(MockBackend::default()) as Arc<dyn Backend>,
         schemas: Arc::new(schemas()),
+        batch_limits: rekt_server::BatchLimits::default(),
     };
     router(state)
 }
@@ -667,8 +687,11 @@ async fn unknown_table_is_resource_not_found() {
 #[tokio::test]
 async fn unsupported_op_is_unknown_operation() {
     let app = app();
+    // `TransactGetItems` is not yet implemented (see PLAN-2 "Batch +
+    // transactional ops"). Once it lands, swap this for whatever is
+    // still unsupported at the time.
     let resp = app
-        .oneshot(ddb_request("BatchGetItem", json!({})))
+        .oneshot(ddb_request("TransactGetItems", json!({})))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -4447,4 +4470,330 @@ async fn scan_projection_prunes_attributes() {
             "projected scan items must contain only `label`, got {keys:?}"
         );
     }
+}
+
+// ===== BatchGetItem (B1) ======================================================
+
+/// Read a parsed Item out of a `Responses[table]` array by matching its PK
+/// to the requested one. Order is undefined per D9, so all assertions
+/// look up by key rather than by index.
+fn find_in_responses<'a>(
+    resp: &'a Value,
+    table: &str,
+    pk_attr: &str,
+    pk_value: &str,
+) -> Option<&'a Value> {
+    resp["Responses"][table]
+        .as_array()?
+        .iter()
+        .find(|i| i[pk_attr]["S"].as_str() == Some(pk_value))
+}
+
+#[tokio::test]
+async fn batch_get_single_table_returns_existing_items() {
+    let app = app();
+    for n in ["b1-a", "b1-b", "b1-c"] {
+        put_item(
+            &app,
+            "users",
+            json!({"id":{"S":n},"label":{"S":format!("L-{n}")}}),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{
+                "users":{"Keys":[
+                    {"id":{"S":"b1-a"}},
+                    {"id":{"S":"b1-b"}},
+                    {"id":{"S":"b1-c"}}
+                ]}
+            }}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["Responses"]["users"].as_array().unwrap().len(), 3);
+    for n in ["b1-a", "b1-b", "b1-c"] {
+        let item = find_in_responses(&body, "users", "id", n)
+            .unwrap_or_else(|| panic!("missing item {n} in response"));
+        assert_eq!(item["label"]["S"].as_str(), Some(format!("L-{n}")).as_deref());
+    }
+    // UnprocessedKeys: D11 says always `{}` and present (not omitted).
+    assert_eq!(body["UnprocessedKeys"], json!({}));
+}
+
+#[tokio::test]
+async fn batch_get_missing_keys_are_silently_omitted() {
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"hit"},"label":{"S":"yes"}})).await;
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"users":{"Keys":[
+                {"id":{"S":"hit"}},
+                {"id":{"S":"miss-1"}},
+                {"id":{"S":"miss-2"}}
+            ]}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let items = body["Responses"]["users"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"]["S"].as_str(), Some("hit"));
+}
+
+#[tokio::test]
+async fn batch_get_empty_table_returns_empty_array_not_omitted() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"users":{"Keys":[
+                {"id":{"S":"definitely-not-there"}}
+            ]}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    // D10: empty per-table response is still present as `[]`.
+    assert!(body["Responses"]["users"].is_array());
+    assert_eq!(body["Responses"]["users"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn batch_get_composite_key_table_works() {
+    let app = app();
+    for ts in ["10", "20", "30"] {
+        put_item(
+            &app,
+            "device_events",
+            json!({"device_id":{"S":"comp"},"ts":{"N":ts},"val":{"S":format!("v{ts}")}}),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"device_events":{"Keys":[
+                {"device_id":{"S":"comp"},"ts":{"N":"10"}},
+                {"device_id":{"S":"comp"},"ts":{"N":"30"}}
+            ]}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let items = body["Responses"]["device_events"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    let mut got_ts: Vec<&str> = items
+        .iter()
+        .map(|i| i["ts"]["N"].as_str().unwrap())
+        .collect();
+    got_ts.sort();
+    assert_eq!(got_ts, vec!["10", "30"]);
+}
+
+#[tokio::test]
+async fn batch_get_rejects_empty_request_items() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let ty = body["__type"].as_str().unwrap();
+    assert!(
+        ty.ends_with("#ValidationException"),
+        "expected ValidationException, got {ty}"
+    );
+    assert!(body["message"].as_str().unwrap().contains("RequestItems"));
+}
+
+#[tokio::test]
+async fn batch_get_rejects_empty_keys_array() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"users":{"Keys":[]}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"].as_str().unwrap().ends_with("#ValidationException"));
+}
+
+#[tokio::test]
+async fn batch_get_rejects_duplicate_keys() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"users":{"Keys":[
+                {"id":{"S":"dup"}},
+                {"id":{"S":"dup"}}
+            ]}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"].as_str().unwrap().ends_with("#ValidationException"));
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("duplicate"));
+}
+
+#[tokio::test]
+async fn batch_get_rejects_extra_attr_in_key() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"users":{"Keys":[
+                {"id":{"S":"x"},"unexpected":{"S":"oops"}}
+            ]}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"].as_str().unwrap().ends_with("#ValidationException"));
+}
+
+#[tokio::test]
+async fn batch_get_rejects_wrong_key_type() {
+    let app = app();
+    // `users.id` is S; passing N should be rejected.
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"users":{"Keys":[
+                {"id":{"N":"42"}}
+            ]}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"].as_str().unwrap().ends_with("#ValidationException"));
+}
+
+#[tokio::test]
+async fn batch_get_unknown_table_is_resource_not_found() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"nope":{"Keys":[{"id":{"S":"x"}}]}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let ty = body["__type"].as_str().unwrap();
+    assert!(
+        ty.ends_with("#ResourceNotFoundException"),
+        "expected ResourceNotFoundException, got {ty}"
+    );
+}
+
+#[tokio::test]
+async fn batch_get_rejects_attributes_to_get() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"users":{
+                "Keys":[{"id":{"S":"x"}}],
+                "AttributesToGet":["label"]
+            }}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let msg = body["message"].as_str().unwrap();
+    assert!(msg.contains("AttributesToGet"), "got message: {msg}");
+}
+
+#[tokio::test]
+async fn batch_get_too_many_keys_is_rejected() {
+    let app = app();
+    let mut keys = Vec::new();
+    for n in 0..101u32 {
+        keys.push(json!({"id":{"S":format!("k-{n}")}}));
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"users":{"Keys": keys}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let msg = body["message"].as_str().unwrap();
+    assert!(msg.contains("Too many items"), "got message: {msg}");
+}
+
+#[tokio::test]
+async fn batch_get_100_keys_is_accepted() {
+    let app = app();
+    // Seed and request exactly 100 keys: the configured DDB default.
+    for n in 0..100u32 {
+        put_item(
+            &app,
+            "users",
+            json!({"id":{"S":format!("k-{n}")},"label":{"S":format!("L{n}")}}),
+        )
+        .await;
+    }
+    let mut keys = Vec::new();
+    for n in 0..100u32 {
+        keys.push(json!({"id":{"S":format!("k-{n}")}}));
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"users":{"Keys": keys}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["Responses"]["users"].as_array().unwrap().len(), 100);
+}
+
+#[tokio::test]
+async fn batch_get_ignores_per_table_consistent_read_in_b1() {
+    // ConsistentRead is silently honored (D7); B3 surfaces it via
+    // tracing. v1: the wire field deserializes, the request succeeds.
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"cr"},"label":{"S":"x"}})).await;
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"users":{
+                "Keys":[{"id":{"S":"cr"}}],
+                "ConsistentRead":true
+            }}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["Responses"]["users"].as_array().unwrap().len(), 1);
 }

@@ -237,6 +237,47 @@ pub enum TranslateError {
         "Invalid ProjectionExpression: Attribute name is a reserved keyword; reserved keyword: {word}"
     )]
     ReservedWordInProjectionExpression { word: String },
+
+    // ----- BatchGetItem -----
+    /// `RequestItems` was absent or `{}`. DDB returns a
+    /// ValidationException; we match.
+    #[error(
+        "BatchGetItem cannot have an empty value for the RequestItems parameter"
+    )]
+    EmptyBatchGetRequest,
+
+    /// A per-table `Keys` array was empty (`[]`). DDB rejects.
+    #[error("BatchGetItem RequestItems[{table}].Keys must not be empty")]
+    EmptyKeysInBatchGet { table: String },
+
+    /// Sum of keys across all per-table entries exceeded the configured
+    /// cap (DDB default 100). Cap is operator-tunable via
+    /// `[batch_limits].batch_get_max_keys`.
+    #[error(
+        "Too many items requested for the BatchGetItem call: {got} (max {max})"
+    )]
+    TooManyKeysInBatchGet { got: u32, max: u32 },
+
+    /// The same (pk[, sk]) appeared twice inside one table's `Keys`
+    /// array. DDB rejects; matches wording.
+    #[error("Provided list of item keys contains duplicates")]
+    DuplicateKeyInBatch,
+
+    /// Caller used the legacy `AttributesToGet` projection field.
+    /// Rektifier supports only `ProjectionExpression`; see D8 in
+    /// `PLAN-6` and the matching `COMPATIBILITY_NOTES.md` entry.
+    #[error("AttributesToGet not supported; use ProjectionExpression")]
+    AttributesToGetNotSupported,
+
+    /// BatchGetItem named a table that isn't declared in the config.
+    /// DDB raises `ResourceNotFoundException` for the same case; the
+    /// server maps this variant to the same HTTP error shape.
+    ///
+    /// Lives on the translator boundary (rather than the dispatcher)
+    /// because a single BatchGetItem request can name many tables, so
+    /// the schema lookup is part of the translator's per-table loop.
+    #[error("Table not found: {table}")]
+    ResourceNotFoundForBatch { table: String },
 }
 
 impl From<ParseError> for TranslateError {

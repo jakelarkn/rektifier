@@ -46,14 +46,14 @@ pub use materialize::{
     materialize_insert_only_update, materialize_simple_sql_update, materialize_simple_update,
 };
 pub use plan::{
-    touched_paths, ConditionPlan, ConditionRouting, DeleteItemPlan, GetItemPlan, PutItemPlan,
-    QueryPlan, ReturnValuesMode, ScanPlan, SimpleSqlUpdatePrimitives, SimpleUpdatePrimitives,
-    UpdateItemPlan,
+    touched_paths, BatchGetItemPlan, BatchGetPerTable, ConditionPlan, ConditionRouting,
+    DeleteItemPlan, GetItemPlan, PutItemPlan, QueryPlan, ReturnValuesMode, ScanPlan,
+    SimpleSqlUpdatePrimitives, SimpleUpdatePrimitives, UpdateItemPlan,
 };
 pub use schema::TableSchema;
 pub use translate::{
-    translate_delete_item, translate_get_item, translate_put_item, translate_query,
-    translate_scan, translate_update_item,
+    translate_batch_get_item, translate_delete_item, translate_get_item, translate_put_item,
+    translate_query, translate_scan, translate_update_item,
 };
 #[cfg(test)]
 mod tests {
@@ -2473,5 +2473,223 @@ mod tests {
         let plan = translate_scan(&req, &schema_hash_s()).unwrap();
         let proj = plan.projection.expect("projection set");
         assert_eq!(proj.len(), 3);
+    }
+
+    // ===== BatchGetItem (B1) =================================================
+
+    fn schemas_map() -> std::collections::HashMap<String, TableSchema> {
+        let mut m = std::collections::HashMap::new();
+        for s in [
+            schema_hash_s(),
+            schema_composite_s_n(),
+            schema_hash_b(),
+            schema_composite_s_s(),
+        ] {
+            m.insert(s.name.clone(), s);
+        }
+        m
+    }
+
+    fn bg_req(items: Vec<(&str, Vec<Item>)>) -> rekt_protocol::BatchGetItemRequest {
+        let mut ri = std::collections::HashMap::new();
+        for (table, keys) in items {
+            ri.insert(
+                table.to_string(),
+                rekt_protocol::KeysAndAttributes {
+                    keys,
+                    ..Default::default()
+                },
+            );
+        }
+        rekt_protocol::BatchGetItemRequest {
+            request_items: ri,
+            return_consumed_capacity: None,
+        }
+    }
+
+    #[test]
+    fn batch_get_hash_table_ok() {
+        let req = bg_req(vec![(
+            "users",
+            vec![
+                item_of(&[("id", AttributeValue::S("a".into()))]),
+                item_of(&[("id", AttributeValue::S("b".into()))]),
+            ],
+        )]);
+        let plan = translate_batch_get_item(&req, &schemas_map(), 100).unwrap();
+        assert_eq!(plan.per_table.len(), 1);
+        assert_eq!(plan.per_table[0].keys.len(), 2);
+        assert_eq!(plan.per_table[0].keys[0].0, KeyValue::S("a".into()));
+        assert!(plan.per_table[0].keys[0].1.is_none());
+    }
+
+    #[test]
+    fn batch_get_composite_table_extracts_sk() {
+        let req = bg_req(vec![(
+            "events",
+            vec![
+                item_of(&[
+                    ("device_id", AttributeValue::S("d".into())),
+                    ("ts", AttributeValue::N("1".into())),
+                ]),
+                item_of(&[
+                    ("device_id", AttributeValue::S("d".into())),
+                    ("ts", AttributeValue::N("2".into())),
+                ]),
+            ],
+        )]);
+        let plan = translate_batch_get_item(&req, &schemas_map(), 100).unwrap();
+        let keys = &plan.per_table[0].keys;
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].1, Some(KeyValue::N("1".into())));
+        assert_eq!(keys[1].1, Some(KeyValue::N("2".into())));
+    }
+
+    #[test]
+    fn batch_get_empty_request_items_rejected() {
+        let req = bg_req(vec![]);
+        let err = translate_batch_get_item(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::EmptyBatchGetRequest));
+    }
+
+    #[test]
+    fn batch_get_empty_keys_array_rejected() {
+        let req = bg_req(vec![("users", vec![])]);
+        let err = translate_batch_get_item(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::EmptyKeysInBatchGet { .. }));
+    }
+
+    #[test]
+    fn batch_get_unknown_table_rejected() {
+        let req = bg_req(vec![(
+            "nope",
+            vec![item_of(&[("id", AttributeValue::S("x".into()))])],
+        )]);
+        let err = translate_batch_get_item(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::ResourceNotFoundForBatch { .. }));
+    }
+
+    #[test]
+    fn batch_get_dup_keys_rejected() {
+        let req = bg_req(vec![(
+            "users",
+            vec![
+                item_of(&[("id", AttributeValue::S("x".into()))]),
+                item_of(&[("id", AttributeValue::S("x".into()))]),
+            ],
+        )]);
+        let err = translate_batch_get_item(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::DuplicateKeyInBatch));
+    }
+
+    #[test]
+    fn batch_get_dup_composite_keys_rejected() {
+        // Two entries with identical (pk, sk).
+        let same = || {
+            item_of(&[
+                ("device_id", AttributeValue::S("d".into())),
+                ("ts", AttributeValue::N("5".into())),
+            ])
+        };
+        let req = bg_req(vec![("events", vec![same(), same()])]);
+        let err = translate_batch_get_item(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::DuplicateKeyInBatch));
+    }
+
+    #[test]
+    fn batch_get_total_cap_summed_across_tables() {
+        // 60 keys in users + 60 in events = 120 > 100. Sum-not-per-table.
+        let mut users_keys = Vec::with_capacity(60);
+        for n in 0..60 {
+            users_keys.push(item_of(&[(
+                "id",
+                AttributeValue::S(format!("u{n}")),
+            )]));
+        }
+        let mut event_keys = Vec::with_capacity(60);
+        for n in 0..60 {
+            event_keys.push(item_of(&[
+                ("device_id", AttributeValue::S(format!("d{n}"))),
+                ("ts", AttributeValue::N("1".into())),
+            ]));
+        }
+        let req = bg_req(vec![("users", users_keys), ("events", event_keys)]);
+        let err = translate_batch_get_item(&req, &schemas_map(), 100).unwrap_err();
+        match err {
+            TranslateError::TooManyKeysInBatchGet { got, max } => {
+                assert_eq!(got, 120);
+                assert_eq!(max, 100);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_get_custom_max_keys_lower() {
+        // With max=5, asking for 6 should be rejected.
+        let keys: Vec<Item> = (0..6)
+            .map(|n| item_of(&[("id", AttributeValue::S(format!("u{n}")))]))
+            .collect();
+        let req = bg_req(vec![("users", keys)]);
+        let err = translate_batch_get_item(&req, &schemas_map(), 5).unwrap_err();
+        assert!(matches!(err, TranslateError::TooManyKeysInBatchGet { got: 6, max: 5 }));
+    }
+
+    #[test]
+    fn batch_get_wrong_key_type_rejected() {
+        // `users.id` is S; pass N.
+        let req = bg_req(vec![(
+            "users",
+            vec![item_of(&[("id", AttributeValue::N("42".into()))])],
+        )]);
+        let err = translate_batch_get_item(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::PartitionKeyTypeMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn batch_get_extra_attr_rejected() {
+        let req = bg_req(vec![(
+            "users",
+            vec![item_of(&[
+                ("id", AttributeValue::S("x".into())),
+                ("extra", AttributeValue::S("oops".into())),
+            ])],
+        )]);
+        let err = translate_batch_get_item(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::ExtraKeyAttribute { .. }));
+    }
+
+    #[test]
+    fn batch_get_attributes_to_get_rejected() {
+        let mut req = bg_req(vec![(
+            "users",
+            vec![item_of(&[("id", AttributeValue::S("x".into()))])],
+        )]);
+        req.request_items
+            .get_mut("users")
+            .unwrap()
+            .attributes_to_get = Some(vec!["label".into()]);
+        let err = translate_batch_get_item(&req, &schemas_map(), 100).unwrap_err();
+        assert!(matches!(err, TranslateError::AttributesToGetNotSupported));
+    }
+
+    #[test]
+    fn batch_get_binary_pk_table_ok() {
+        let req = bg_req(vec![(
+            "blobs",
+            vec![item_of(&[(
+                "hash",
+                AttributeValue::B(Bytes::from_static(b"abc")),
+            )])],
+        )]);
+        let plan = translate_batch_get_item(&req, &schemas_map(), 100).unwrap();
+        assert_eq!(plan.per_table[0].keys.len(), 1);
+        match &plan.per_table[0].keys[0].0 {
+            KeyValue::B(b) => assert_eq!(b.as_ref(), b"abc"),
+            other => panic!("expected B key, got {other:?}"),
+        }
     }
 }

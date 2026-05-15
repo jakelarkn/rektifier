@@ -55,6 +55,7 @@ async fn main() -> Result<()> {
         verifier: Arc::new(PermissiveVerifier),
         backend: Arc::new(backend),
         schemas: Arc::new(schemas),
+        batch_limits: rek_batch_limits(&config),
     };
 
     let listener = tokio::net::TcpListener::bind(config.server.listen_addr)
@@ -117,6 +118,13 @@ fn build_pool(database_url: &str) -> Result<Pool> {
         .build()
         .context("deadpool Pool::builder")?;
     Ok(pool)
+}
+
+fn rek_batch_limits(config: &Config) -> rekt_server::BatchLimits {
+    rekt_server::BatchLimits {
+        batch_get_max_keys: config.batch_limits.batch_get_max_keys,
+        batch_write_max_requests: config.batch_limits.batch_write_max_requests,
+    }
 }
 
 fn build_schema_map(config: &Config) -> HashMap<String, TableSchema> {

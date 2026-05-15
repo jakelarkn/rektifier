@@ -3884,3 +3884,160 @@ fn diff_scan_messages_round_trip() {
         delete_both_composite("messages", "thread", pk, "ts", &format!("{{\"S\":\"{ts}\"}}"));
     }
 }
+
+// ===== BatchGetItem (B1) ======================================================
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_get_single_table_hash_only() {
+    ensure_users_table();
+    // Seed three rows on both endpoints.
+    let ids = ["bg-a", "bg-b", "bg-c"];
+    for id in ids {
+        let item = format!("{{\"id\":{{\"S\":\"{id}\"}},\"label\":{{\"S\":\"L-{id}\"}}}}");
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",&item]);
+    }
+    let req_items = "{\"users\":{\"Keys\":[\
+        {\"id\":{\"S\":\"bg-a\"}},\
+        {\"id\":{\"S\":\"bg-b\"}},\
+        {\"id\":{\"S\":\"bg-c\"}}\
+    ]}}";
+    let r_ref = aws(REF, &["dynamodb","batch-get-item","--request-items",req_items]);
+    let r_ours = aws(OURS, &["dynamodb","batch-get-item","--request-items",req_items]);
+    // Responses[table] is an unordered array per DDB (and per D9); sort
+    // both sides before comparing.
+    let mut ref_items = r_ref["Responses"]["users"].as_array().unwrap().clone();
+    let mut our_items = r_ours["Responses"]["users"].as_array().unwrap().clone();
+    sort_items_by_keys(&mut ref_items, "id", None);
+    sort_items_by_keys(&mut our_items, "id", None);
+    assert_eq!(ref_items, our_items, "BatchGetItem items diverged");
+
+    for id in ids {
+        delete_both("users", &format!("{{\"id\":{{\"S\":\"{id}\"}}}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_get_missing_keys_silently_omitted() {
+    ensure_users_table();
+    let item = "{\"id\":{\"S\":\"bg-only-hit\"},\"label\":{\"S\":\"present\"}}";
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",item]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",item]);
+
+    // Mix one hit + two misses; both endpoints should return just the hit.
+    let req_items = "{\"users\":{\"Keys\":[\
+        {\"id\":{\"S\":\"bg-only-hit\"}},\
+        {\"id\":{\"S\":\"bg-miss-1\"}},\
+        {\"id\":{\"S\":\"bg-miss-2\"}}\
+    ]}}";
+    let r_ref = aws(REF, &["dynamodb","batch-get-item","--request-items",req_items]);
+    let r_ours = aws(OURS, &["dynamodb","batch-get-item","--request-items",req_items]);
+    let mut ref_items = r_ref["Responses"]["users"].as_array().unwrap().clone();
+    let mut our_items = r_ours["Responses"]["users"].as_array().unwrap().clone();
+    sort_items_by_keys(&mut ref_items, "id", None);
+    sort_items_by_keys(&mut our_items, "id", None);
+    assert_eq!(ref_items, our_items);
+    assert_eq!(ref_items.len(), 1);
+
+    delete_both("users", "{\"id\":{\"S\":\"bg-only-hit\"}}");
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_get_all_misses_returns_empty_array() {
+    ensure_users_table();
+    let req_items = "{\"users\":{\"Keys\":[\
+        {\"id\":{\"S\":\"bg-miss-only-a\"}},\
+        {\"id\":{\"S\":\"bg-miss-only-b\"}}\
+    ]}}";
+    let r_ref = aws(REF, &["dynamodb","batch-get-item","--request-items",req_items]);
+    let r_ours = aws(OURS, &["dynamodb","batch-get-item","--request-items",req_items]);
+    // D10: empty per-table response is still present as `[]` on both sides.
+    assert!(r_ref["Responses"]["users"].is_array());
+    assert!(r_ours["Responses"]["users"].is_array());
+    assert_eq!(r_ref["Responses"]["users"].as_array().unwrap().len(), 0);
+    assert_eq!(r_ours["Responses"]["users"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_get_composite_key_table() {
+    ensure_device_events_table();
+    let pk = "bg-comp-pk";
+    for ts in ["100","200","300"] {
+        let item = format!(
+            "{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"{ts}\"}},\"flag\":{{\"S\":\"on\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+    }
+    let req_items = format!(
+        "{{\"device_events\":{{\"Keys\":[\
+            {{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"100\"}}}},\
+            {{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"300\"}}}}\
+        ]}}}}"
+    );
+    let r_ref = aws(REF, &["dynamodb","batch-get-item","--request-items",&req_items]);
+    let r_ours = aws(OURS, &["dynamodb","batch-get-item","--request-items",&req_items]);
+    let mut ref_items = r_ref["Responses"]["device_events"].as_array().unwrap().clone();
+    let mut our_items = r_ours["Responses"]["device_events"].as_array().unwrap().clone();
+    sort_items_by_keys(&mut ref_items, "device_id", Some("ts"));
+    sort_items_by_keys(&mut our_items, "device_id", Some("ts"));
+    assert_eq!(ref_items, our_items);
+
+    for ts in ["100","200","300"] {
+        delete_both_composite("device_events","device_id",pk,"ts",&format!("{{\"N\":\"{ts}\"}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_get_unprocessed_keys_always_empty() {
+    ensure_users_table();
+    let item = "{\"id\":{\"S\":\"bg-uk\"}}";
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",item]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",item]);
+
+    let req_items = "{\"users\":{\"Keys\":[{\"id\":{\"S\":\"bg-uk\"}}]}}";
+    let r_ref = aws(REF, &["dynamodb","batch-get-item","--request-items",req_items]);
+    let r_ours = aws(OURS, &["dynamodb","batch-get-item","--request-items",req_items]);
+    // D11: both endpoints emit `UnprocessedKeys: {}` on success.
+    assert_eq!(r_ref["UnprocessedKeys"], json!({}));
+    assert_eq!(r_ours["UnprocessedKeys"], json!({}));
+
+    delete_both("users", "{\"id\":{\"S\":\"bg-uk\"}}");
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_get_duplicate_keys_both_reject() {
+    ensure_users_table();
+    let req_items = "{\"users\":{\"Keys\":[\
+        {\"id\":{\"S\":\"bg-dup\"}},\
+        {\"id\":{\"S\":\"bg-dup\"}}\
+    ]}}";
+    // Don't pin the message wording — DDB-local's vs ours diverge in
+    // detail but both must reject as a 4xx ValidationException.
+    let err_ref = aws_expecting_failure(REF, &["dynamodb","batch-get-item","--request-items",req_items]);
+    let err_ours = aws_expecting_failure(OURS, &["dynamodb","batch-get-item","--request-items",req_items]);
+    assert!(err_ref.to_lowercase().contains("dup") || err_ref.contains("duplicate"),
+        "DDB ref didn't mention duplicates: {err_ref}");
+    assert!(err_ours.contains("duplicate") || err_ours.contains("Duplicate"),
+        "rektifier didn't mention duplicates: {err_ours}");
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_get_missing_table_both_reject() {
+    let req_items = "{\"this-table-does-not-exist\":{\"Keys\":[{\"id\":{\"S\":\"x\"}}]}}";
+    let err_ref = aws_expecting_failure(REF, &["dynamodb","batch-get-item","--request-items",req_items]);
+    let err_ours = aws_expecting_failure(OURS, &["dynamodb","batch-get-item","--request-items",req_items]);
+    // Both should surface ResourceNotFoundException-ish wire shape.
+    let both_404ish = |s: &str| {
+        s.contains("ResourceNotFound") || s.contains("not found") || s.contains("Cannot do operations")
+    };
+    assert!(both_404ish(&err_ref), "ref didn't reject missing table: {err_ref}");
+    assert!(both_404ish(&err_ours), "ours didn't reject missing table: {err_ours}");
+}

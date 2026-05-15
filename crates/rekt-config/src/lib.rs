@@ -44,6 +44,12 @@ const DDB_DEFAULT_SORT_KEY_BYTES: u64 = 1_024; // 1 KB
 const DDB_DEFAULT_ATTRIBUTE_NAME_BYTES: u64 = 65_536; // 64 KB
 const DDB_DEFAULT_NESTING_DEPTH: u32 = 32;
 
+// DDB-spec defaults for batch-op quantity caps. Configurable via
+// `[batch_limits]`; raising past these moves away from DDB parity
+// (see `COMPATIBILITY_NOTES.md`).
+const DDB_DEFAULT_BATCH_GET_MAX_KEYS: u32 = 100;
+const DDB_DEFAULT_BATCH_WRITE_MAX_REQUESTS: u32 = 25;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("failed to read config file: {0}")]
@@ -70,6 +76,25 @@ impl ConfigError {
 pub struct Config {
     pub server: ServerConfig,
     pub tables: Vec<TableConfig>,
+    pub batch_limits: BatchLimits,
+}
+
+/// Server-level quantity caps on the batch ops. Defaults match DDB
+/// exactly; raising past the default means rektifier accepts requests
+/// DDB would reject (Lenient divergence — see `COMPATIBILITY_NOTES.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchLimits {
+    pub batch_get_max_keys: u32,
+    pub batch_write_max_requests: u32,
+}
+
+impl BatchLimits {
+    pub fn ddb_defaults() -> Self {
+        Self {
+            batch_get_max_keys: DDB_DEFAULT_BATCH_GET_MAX_KEYS,
+            batch_write_max_requests: DDB_DEFAULT_BATCH_WRITE_MAX_REQUESTS,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -142,7 +167,18 @@ struct RawConfig {
     #[serde(default)]
     limits: Option<RawLimits>,
     #[serde(default)]
+    batch_limits: Option<RawBatchLimits>,
+    #[serde(default)]
     tables: Vec<RawTable>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBatchLimits {
+    #[serde(default)]
+    batch_get_max_keys: Option<u32>,
+    #[serde(default)]
+    batch_write_max_requests: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -330,12 +366,37 @@ impl RawConfig {
             });
         }
 
+        let batch_limits = match self.batch_limits {
+            None => BatchLimits::ddb_defaults(),
+            Some(raw) => {
+                let mut bl = BatchLimits::ddb_defaults();
+                if let Some(n) = raw.batch_get_max_keys {
+                    if n == 0 {
+                        return Err(ConfigError::validation(
+                            "batch_limits.batch_get_max_keys must be > 0",
+                        ));
+                    }
+                    bl.batch_get_max_keys = n;
+                }
+                if let Some(n) = raw.batch_write_max_requests {
+                    if n == 0 {
+                        return Err(ConfigError::validation(
+                            "batch_limits.batch_write_max_requests must be > 0",
+                        ));
+                    }
+                    bl.batch_write_max_requests = n;
+                }
+                bl
+            }
+        };
+
         Ok(Config {
             server: ServerConfig {
                 listen_addr,
                 database_url: self.server.database_url,
             },
             tables,
+            batch_limits,
         })
     }
 }

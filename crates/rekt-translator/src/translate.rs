@@ -12,18 +12,19 @@ use crate::keys::{extract_key, reject_extra_key_attrs, KeyRole};
 use crate::paging::{decode_esk, decode_scan_esk, validate_limit};
 use crate::projection::resolve_select_and_projection;
 use crate::plan::{
-    ConditionPlan, DeleteItemPlan, GetItemPlan, PutItemPlan, QueryPlan, ReturnValuesMode,
-    ScanPlan, UpdateItemPlan,
+    BatchGetItemPlan, BatchGetPerTable, ConditionPlan, DeleteItemPlan, GetItemPlan, PutItemPlan,
+    QueryPlan, ReturnValuesMode, ScanPlan, UpdateItemPlan,
 };
 use crate::schema::TableSchema;
 use rekt_expressions::{
     parse_condition_expression, parse_update_expression, substitute_condition, substitute_update,
 };
 use rekt_protocol::{
-    AttributeValue, DeleteItemRequest, GetItemRequest, PutItemRequest, QueryRequest, ScanRequest,
-    UpdateItemRequest,
+    AttributeValue, BatchGetItemRequest, DeleteItemRequest, GetItemRequest, PutItemRequest,
+    QueryRequest, ScanRequest, UpdateItemRequest,
 };
-use std::collections::BTreeMap;
+use rekt_storage::KeyValue;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[tracing::instrument(level = "debug", skip_all, name = "translate.put_item", fields(table = %schema.name))]
 pub fn translate_put_item(
@@ -334,6 +335,82 @@ pub fn translate_scan(
         select_count_only,
         projection,
     })
+}
+
+/// BatchGetItem — per-table key validation + cross-table cap enforcement.
+///
+/// Unlike the single-row entry points, this function does its own
+/// schema lookup (the request can name many tables, so the server
+/// can't pre-resolve "the" schema). Missing tables surface as
+/// `ResourceNotFoundForBatch` — same wire-shape as DDB's per-batch
+/// `ResourceNotFoundException`.
+///
+/// `max_keys` is the configured per-call cap (DDB default 100); the
+/// translator enforces the sum across all tables, not per-table.
+#[tracing::instrument(level = "debug", skip_all, name = "translate.batch_get_item")]
+pub fn translate_batch_get_item(
+    req: &BatchGetItemRequest,
+    schemas: &HashMap<String, TableSchema>,
+    max_keys: u32,
+) -> Result<BatchGetItemPlan, TranslateError> {
+    if req.request_items.is_empty() {
+        return Err(TranslateError::EmptyBatchGetRequest);
+    }
+
+    // Sum across tables first so a request like {"t1": 80, "t2": 30}
+    // is rejected before any per-key validation cost.
+    let total: usize = req.request_items.values().map(|v| v.keys.len()).sum();
+    if total > max_keys as usize {
+        return Err(TranslateError::TooManyKeysInBatchGet {
+            got: total as u32,
+            max: max_keys,
+        });
+    }
+
+    let mut per_table: Vec<BatchGetPerTable> = Vec::with_capacity(req.request_items.len());
+    for (table_name, ka) in &req.request_items {
+        let schema = schemas
+            .get(table_name)
+            .ok_or_else(|| TranslateError::ResourceNotFoundForBatch {
+                table: table_name.clone(),
+            })?;
+
+        if ka.attributes_to_get.is_some() {
+            return Err(TranslateError::AttributesToGetNotSupported);
+        }
+        if ka.keys.is_empty() {
+            return Err(TranslateError::EmptyKeysInBatchGet {
+                table: table_name.clone(),
+            });
+        }
+
+        // ProjectionExpression / ConsistentRead are part of B3, not B1.
+        // Silently ignored for now; the wire-shape acceptance is what
+        // matters here (the field deserializes successfully).
+
+        let mut keys: Vec<(KeyValue, Option<KeyValue>)> = Vec::with_capacity(ka.keys.len());
+        let mut seen: HashSet<(KeyValue, Option<KeyValue>)> =
+            HashSet::with_capacity(ka.keys.len());
+        for key_item in &ka.keys {
+            let pk = extract_key(key_item, &schema.pk_attr, schema.pk_type, KeyRole::Pk)?;
+            let sk = match (&schema.sk_attr, schema.sk_type) {
+                (Some(attr), Some(t)) => Some(extract_key(key_item, attr, t, KeyRole::Sk)?),
+                _ => None,
+            };
+            reject_extra_key_attrs(key_item, schema)?;
+            let tuple = (pk, sk);
+            if !seen.insert(tuple.clone()) {
+                return Err(TranslateError::DuplicateKeyInBatch);
+            }
+            keys.push(tuple);
+        }
+        per_table.push(BatchGetPerTable {
+            table_name: table_name.clone(),
+            keys,
+        });
+    }
+
+    Ok(BatchGetItemPlan { per_table })
 }
 
 /// Shared `ReturnValues` resolver for PutItem and DeleteItem. DDB accepts
