@@ -225,6 +225,14 @@ pub struct BatchGetPerTable {
     /// minus any caller-supplied duplicates (rejected before reaching
     /// the plan).
     pub keys: Vec<(KeyValue, Option<KeyValue>)>,
+    /// `ProjectionExpression` (B3): top-level attribute names to
+    /// retain in each returned item. `None` means "all attributes".
+    /// Same shape and pruning helper as Query/Scan.
+    pub projection: Option<std::collections::BTreeSet<String>>,
+    /// `ConsistentRead` (B3): silently honored, surfaced in tracing.
+    /// Carried through so the dispatcher can record a per-table
+    /// tracing field; no behavioral effect (D7).
+    pub consistent_read: bool,
 }
 
 /// Storage-ready primitives for an UpdateItem with a `SimpleSql`-

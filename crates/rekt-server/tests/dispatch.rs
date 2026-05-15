@@ -4952,3 +4952,205 @@ async fn batch_get_same_key_across_tables_is_allowed() {
         1
     );
 }
+
+// ===== BatchGetItem projection + ConsistentRead (B3) =========================
+
+#[tokio::test]
+async fn batch_get_with_projection_prunes_items() {
+    let app = app();
+    for n in ["pj-a", "pj-b"] {
+        put_item(
+            &app,
+            "users",
+            json!({"id":{"S":n},"label":{"S":format!("L-{n}")},"tier":{"S":"admin"}}),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"users":{
+                "Keys":[{"id":{"S":"pj-a"}},{"id":{"S":"pj-b"}}],
+                "ProjectionExpression":"label"
+            }}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let items = body["Responses"]["users"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    for it in items {
+        let keys: Vec<&str> = it.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        assert_eq!(keys, vec!["label"], "expected only `label` attribute, got {keys:?}");
+    }
+}
+
+#[tokio::test]
+async fn batch_get_with_projection_including_pk_and_other_attrs() {
+    let app = app();
+    put_item(
+        &app,
+        "users",
+        json!({"id":{"S":"pj-multi"},"label":{"S":"L"},"tier":{"S":"x"},"flag":{"S":"on"}}),
+    )
+    .await;
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"users":{
+                "Keys":[{"id":{"S":"pj-multi"}}],
+                "ProjectionExpression":"id, label, tier"
+            }}}),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let it = &body["Responses"]["users"][0];
+    let mut keys: Vec<&str> = it.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+    keys.sort();
+    assert_eq!(keys, vec!["id", "label", "tier"]);
+    assert!(it["flag"].is_null(), "flag should have been pruned");
+}
+
+#[tokio::test]
+async fn batch_get_projection_with_ean_alias_for_reserved_word() {
+    // `name` is a DDB reserved word; must use EAN alias.
+    let app = app();
+    put_item(
+        &app,
+        "users",
+        json!({"id":{"S":"pj-rw"},"label":{"S":"L"}}),
+    )
+    .await;
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"users":{
+                "Keys":[{"id":{"S":"pj-rw"}}],
+                "ProjectionExpression":"#n, id",
+                "ExpressionAttributeNames":{"#n":"label"}
+            }}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let it = &body["Responses"]["users"][0];
+    let mut keys: Vec<&str> = it.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+    keys.sort();
+    assert_eq!(keys, vec!["id", "label"]);
+}
+
+#[tokio::test]
+async fn batch_get_projection_of_missing_attr_silently_absent() {
+    // Asking for an attr the item doesn't have: silently dropped on
+    // that item (no error). Matches DDB.
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"pj-miss"},"label":{"S":"L"}})).await;
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"users":{
+                "Keys":[{"id":{"S":"pj-miss"}}],
+                "ProjectionExpression":"label, nothere"
+            }}}),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let it = &body["Responses"]["users"][0];
+    let keys: Vec<&str> = it.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+    assert_eq!(keys, vec!["label"]);
+}
+
+#[tokio::test]
+async fn batch_get_consistent_read_silently_accepted() {
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"cr-2"},"label":{"S":"x"}})).await;
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"users":{
+                "Keys":[{"id":{"S":"cr-2"}}],
+                "ConsistentRead":true
+            }}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["Responses"]["users"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn batch_get_per_table_consistent_read_differs_across_tables() {
+    // ConsistentRead is a per-table flag in DDB; rektifier just
+    // surfaces it via tracing per-table. Smoke-test that mixing
+    // per-table values doesn't cross-contaminate.
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"cr-mix"},"label":{"S":"u"}})).await;
+    put_item(
+        &app,
+        "device_events",
+        json!({"device_id":{"S":"d"},"ts":{"N":"1"},"flag":{"S":"on"}}),
+    )
+    .await;
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{
+                "users":{
+                    "Keys":[{"id":{"S":"cr-mix"}}],
+                    "ConsistentRead":true
+                },
+                "device_events":{
+                    "Keys":[{"device_id":{"S":"d"},"ts":{"N":"1"}}],
+                    "ConsistentRead":false
+                }
+            }}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn batch_get_invalid_projection_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"users":{
+                "Keys":[{"id":{"S":"x"}}],
+                "ProjectionExpression":"label, , bad"
+            }}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"].as_str().unwrap().ends_with("#ValidationException"));
+}
+
+#[tokio::test]
+async fn batch_get_reserved_word_in_bare_projection_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"users":{
+                "Keys":[{"id":{"S":"x"}}],
+                "ProjectionExpression":"name"
+            }}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let msg = body["message"].as_str().unwrap();
+    assert!(
+        msg.contains("reserved keyword") || msg.contains("Reserved"),
+        "expected reserved-word rejection, got: {msg}"
+    );
+}

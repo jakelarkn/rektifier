@@ -4119,3 +4119,62 @@ fn diff_batch_get_multi_table_one_empty() {
 
     delete_both("users", "{\"id\":{\"S\":\"bg-mt-one\"}}");
 }
+
+// ===== BatchGetItem projection (B3) ==========================================
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_get_with_projection() {
+    ensure_users_table();
+    for id in ["bg-pj-a", "bg-pj-b"] {
+        let item = format!(
+            "{{\"id\":{{\"S\":\"{id}\"}},\"label\":{{\"S\":\"L-{id}\"}},\"tier\":{{\"S\":\"x\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",&item]);
+    }
+    let req_items = "{\"users\":{\"Keys\":[\
+        {\"id\":{\"S\":\"bg-pj-a\"}},\
+        {\"id\":{\"S\":\"bg-pj-b\"}}\
+    ],\"ProjectionExpression\":\"label\"}}";
+    let r_ref = aws(REF, &["dynamodb","batch-get-item","--request-items",req_items]);
+    let r_ours = aws(OURS, &["dynamodb","batch-get-item","--request-items",req_items]);
+
+    // Pruning shouldn't carry the PK forward (since `id` isn't in the
+    // projection). Both endpoints must emit items containing only
+    // `label`. Order-agnostic.
+    let mut ref_items = r_ref["Responses"]["users"].as_array().unwrap().clone();
+    let mut our_items = r_ours["Responses"]["users"].as_array().unwrap().clone();
+    // Sort by `label` since `id` is pruned.
+    let by_label = |a: &Value, b: &Value| {
+        a["label"]["S"].as_str().unwrap().cmp(b["label"]["S"].as_str().unwrap())
+    };
+    ref_items.sort_by(by_label);
+    our_items.sort_by(by_label);
+    assert_eq!(ref_items, our_items);
+    for it in &our_items {
+        let keys: Vec<&str> = it.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        assert_eq!(keys, vec!["label"]);
+    }
+
+    for id in ["bg-pj-a", "bg-pj-b"] {
+        delete_both("users", &format!("{{\"id\":{{\"S\":\"{id}\"}}}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_get_consistent_read_silently_accepted() {
+    ensure_users_table();
+    let item = "{\"id\":{\"S\":\"bg-cr\"},\"label\":{\"S\":\"x\"}}";
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",item]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",item]);
+    let req_items = "{\"users\":{\"Keys\":[{\"id\":{\"S\":\"bg-cr\"}}],\"ConsistentRead\":true}}";
+    let r_ref = aws(REF, &["dynamodb","batch-get-item","--request-items",req_items]);
+    let r_ours = aws(OURS, &["dynamodb","batch-get-item","--request-items",req_items]);
+    assert_eq!(
+        r_ref["Responses"]["users"].as_array().unwrap().len(),
+        r_ours["Responses"]["users"].as_array().unwrap().len()
+    );
+    delete_both("users", "{\"id\":{\"S\":\"bg-cr\"}}");
+}

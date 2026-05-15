@@ -384,9 +384,15 @@ pub fn translate_batch_get_item(
             });
         }
 
-        // ProjectionExpression / ConsistentRead are part of B3, not B1.
-        // Silently ignored for now; the wire-shape acceptance is what
-        // matters here (the field deserializes successfully).
+        // B3: ProjectionExpression is parsed via the same helper Query
+        // / Scan use; ConsistentRead is carried through for the
+        // dispatcher's per-table tracing field but has no behavioral
+        // effect (D7).
+        let empty_names: BTreeMap<String, String> = BTreeMap::new();
+        let names = ka.expression_attribute_names.as_ref().unwrap_or(&empty_names);
+        let projection =
+            crate::projection::parse_projection(ka.projection_expression.as_deref(), names)?;
+        let consistent_read = ka.consistent_read.unwrap_or(false);
 
         let mut keys: Vec<(KeyValue, Option<KeyValue>)> = Vec::with_capacity(ka.keys.len());
         let mut seen: HashSet<(KeyValue, Option<KeyValue>)> =
@@ -407,6 +413,8 @@ pub fn translate_batch_get_item(
         per_table.push(BatchGetPerTable {
             table_name: table_name.clone(),
             keys,
+            projection,
+            consistent_read,
         });
     }
 

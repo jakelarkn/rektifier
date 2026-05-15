@@ -702,7 +702,9 @@ async fn handle_batch_get_item(state: &AppState, body: &Bytes) -> Result<Respons
 
     // Per-table serial fan-out (D1 in PLAN-6). Each table issues one
     // multi-key SQL statement. Missing rows are silently absent from
-    // the response.
+    // the response. ProjectionExpression / ConsistentRead are applied
+    // per-table (B3): the former via the shared `items_to_response`
+    // pruning helper, the latter as a tracing field only (D7).
     let mut responses: HashMap<String, Vec<Item>> = HashMap::with_capacity(plan.per_table.len());
     for table_plan in &plan.per_table {
         let schema = state
@@ -718,22 +720,27 @@ async fn handle_batch_get_item(state: &AppState, body: &Bytes) -> Result<Respons
                 ))
             })?;
 
+        if table_plan.consistent_read {
+            tracing::debug!(
+                table = %table_plan.table_name,
+                consistent_read = true,
+                "BatchGetItem per-table ConsistentRead silently honored"
+            );
+        }
+
         let outcome = state
             .backend
             .batch_get_raw(&schema.shape(), &table_plan.keys)
             .await?;
 
-        let items: Vec<Item> = outcome
-            .items
-            .into_iter()
-            .map(|v| {
-                serde_json::from_value(v).map_err(|e| {
-                    ApiError::Internal(format!(
-                        "stored item is not valid DynamoDB-JSON: {e}"
-                    ))
-                })
-            })
-            .collect::<Result<_, _>>()?;
+        // Reuse the same projection-pruning path Query/Scan use, so a
+        // future enhancement (nested-path projection from PLAN-2
+        // Phase 8) automatically lifts here too.
+        let items = items_to_response(
+            outcome.items,
+            false, /* count_only — BatchGetItem has no Select=COUNT */
+            table_plan.projection.as_ref(),
+        )?;
         responses.insert(table_plan.table_name.clone(), items);
     }
 
