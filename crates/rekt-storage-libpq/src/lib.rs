@@ -309,6 +309,40 @@ mod tests {
         assert_eq!(quote_ident("we\"ird"), "\"we\"\"ird\"");
     }
 
+    /// Obs-5: `shape_sql` recovers when its `RwLock` is poisoned.
+    ///
+    /// Before this fix, `.read().unwrap()` / `.write().unwrap()` would
+    /// re-panic on the next request after any thread panicked while
+    /// holding the lock, effectively killing the process under load.
+    /// Now we explicitly recover from `PoisonError`.
+    #[test]
+    fn shape_sql_recovers_from_poisoned_lock() {
+        let backend = std::sync::Arc::new(
+            PgBackend::connect("postgres://nobody@127.0.0.1:1/none").unwrap(),
+        );
+        let backend_clone = backend.clone();
+        // Poison the cache by panicking inside a write guard scope.
+        let _ = std::thread::spawn(move || {
+            let _guard = backend_clone.sql_cache.write().unwrap();
+            panic!("forced poison for Obs-5 test");
+        })
+        .join();
+        // Lock is now poisoned. shape_sql must still work.
+        let shape = TableShape {
+            table: "rekt_t_obs5",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        let s = backend.shape_sql(&shape);
+        // Sanity: the cached entry was produced and is reusable.
+        assert!(s.get_sql.contains("rekt_t_obs5"));
+        let s2 = backend.shape_sql(&shape);
+        assert!(std::sync::Arc::ptr_eq(&s, &s2));
+    }
+
     fn database_url() -> String {
         std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://rektifier:rektifier@localhost:5432/rektifier".into())

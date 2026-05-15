@@ -96,12 +96,35 @@ impl ShapeSql {
 impl PgBackend {
     /// Get or lazily-build the cached SQL for `shape`. Read-locks for the
     /// common (hit) case; takes the write lock only on first touch per table.
+    ///
+    /// Recovers transparently from `PoisonError` — the cache contents
+    /// are append-only `Arc<ShapeSql>` values, so a poisoned lock can't
+    /// have corrupted the data. Before Obs-5 we `.unwrap()`'d the
+    /// guards, which meant a panic-while-holding-the-lock (anywhere
+    /// inside `ShapeSql::build`, in theory) would permanently take
+    /// down every subsequent request with a downstream panic. Now we
+    /// just `into_inner()` the poison and proceed.
     pub(crate) fn shape_sql(&self, shape: &TableShape<'_>) -> Arc<ShapeSql> {
-        if let Some(s) = self.sql_cache.read().unwrap().get(shape.table) {
-            return Arc::clone(s);
+        {
+            let r = self
+                .sql_cache
+                .read()
+                .unwrap_or_else(|e| {
+                    tracing::warn!("shape_sql cache read lock was poisoned; recovering");
+                    e.into_inner()
+                });
+            if let Some(s) = r.get(shape.table) {
+                return Arc::clone(s);
+            }
         }
         let built = Arc::new(ShapeSql::build(shape));
-        let mut w = self.sql_cache.write().unwrap();
+        let mut w = self
+            .sql_cache
+            .write()
+            .unwrap_or_else(|e| {
+                tracing::warn!("shape_sql cache write lock was poisoned; recovering");
+                e.into_inner()
+            });
         // Double-check: another thread may have inserted while we were
         // acquiring the write lock.
         Arc::clone(
