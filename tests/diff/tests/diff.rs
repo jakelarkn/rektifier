@@ -4041,3 +4041,81 @@ fn diff_batch_get_missing_table_both_reject() {
     assert!(both_404ish(&err_ref), "ref didn't reject missing table: {err_ref}");
     assert!(both_404ish(&err_ours), "ours didn't reject missing table: {err_ours}");
 }
+
+// ===== BatchGetItem multi-table (B2) =========================================
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_get_multi_table() {
+    ensure_users_table();
+    ensure_device_events_table();
+    // Seed both tables on both endpoints.
+    for id in ["bg-mt-a", "bg-mt-b"] {
+        let item = format!("{{\"id\":{{\"S\":\"{id}\"}},\"label\":{{\"S\":\"L-{id}\"}}}}");
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",&item]);
+    }
+    let pk = "bg-mt-dev";
+    for ts in ["10","20"] {
+        let item = format!(
+            "{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"{ts}\"}},\"flag\":{{\"S\":\"on\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+    }
+    let req_items = "{\"users\":{\"Keys\":[\
+        {\"id\":{\"S\":\"bg-mt-a\"}},\
+        {\"id\":{\"S\":\"bg-mt-b\"}}\
+    ]},\"device_events\":{\"Keys\":[\
+        {\"device_id\":{\"S\":\"bg-mt-dev\"},\"ts\":{\"N\":\"10\"}},\
+        {\"device_id\":{\"S\":\"bg-mt-dev\"},\"ts\":{\"N\":\"20\"}}\
+    ]}}";
+    let r_ref = aws(REF, &["dynamodb","batch-get-item","--request-items",req_items]);
+    let r_ours = aws(OURS, &["dynamodb","batch-get-item","--request-items",req_items]);
+
+    // Compare each table independently (per-table set equality).
+    let mut ref_users = r_ref["Responses"]["users"].as_array().unwrap().clone();
+    let mut our_users = r_ours["Responses"]["users"].as_array().unwrap().clone();
+    sort_items_by_keys(&mut ref_users, "id", None);
+    sort_items_by_keys(&mut our_users, "id", None);
+    assert_eq!(ref_users, our_users);
+
+    let mut ref_events = r_ref["Responses"]["device_events"].as_array().unwrap().clone();
+    let mut our_events = r_ours["Responses"]["device_events"].as_array().unwrap().clone();
+    sort_items_by_keys(&mut ref_events, "device_id", Some("ts"));
+    sort_items_by_keys(&mut our_events, "device_id", Some("ts"));
+    assert_eq!(ref_events, our_events);
+
+    for id in ["bg-mt-a", "bg-mt-b"] {
+        delete_both("users", &format!("{{\"id\":{{\"S\":\"{id}\"}}}}"));
+    }
+    for ts in ["10","20"] {
+        delete_both_composite("device_events","device_id",pk,"ts",&format!("{{\"N\":\"{ts}\"}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_get_multi_table_one_empty() {
+    ensure_users_table();
+    ensure_device_events_table();
+    let item = "{\"id\":{\"S\":\"bg-mt-one\"},\"label\":{\"S\":\"only\"}}";
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",item]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",item]);
+    // device_events keys all miss; expect a present, empty array.
+    let req_items = "{\"users\":{\"Keys\":[{\"id\":{\"S\":\"bg-mt-one\"}}]},\
+        \"device_events\":{\"Keys\":[\
+            {\"device_id\":{\"S\":\"nope\"},\"ts\":{\"N\":\"1\"}}\
+        ]}}";
+    let r_ref = aws(REF, &["dynamodb","batch-get-item","--request-items",req_items]);
+    let r_ours = aws(OURS, &["dynamodb","batch-get-item","--request-items",req_items]);
+
+    // Both endpoints should emit Responses.device_events as an empty
+    // array (not omit). D10 parity check.
+    assert!(r_ref["Responses"]["device_events"].is_array());
+    assert!(r_ours["Responses"]["device_events"].is_array());
+    assert_eq!(r_ref["Responses"]["device_events"].as_array().unwrap().len(), 0);
+    assert_eq!(r_ours["Responses"]["device_events"].as_array().unwrap().len(), 0);
+
+    delete_both("users", "{\"id\":{\"S\":\"bg-mt-one\"}}");
+}

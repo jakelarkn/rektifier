@@ -4797,3 +4797,158 @@ async fn batch_get_ignores_per_table_consistent_read_in_b1() {
     let body = body_json(resp).await;
     assert_eq!(body["Responses"]["users"].as_array().unwrap().len(), 1);
 }
+
+// ===== BatchGetItem multi-table (B2) =========================================
+
+#[tokio::test]
+async fn batch_get_multi_table_returns_per_table_responses() {
+    let app = app();
+    // Seed users + device_events in parallel.
+    put_item(&app, "users", json!({"id":{"S":"mt-u1"},"label":{"S":"U1"}})).await;
+    put_item(&app, "users", json!({"id":{"S":"mt-u2"},"label":{"S":"U2"}})).await;
+    put_item(
+        &app,
+        "device_events",
+        json!({"device_id":{"S":"mt-d"},"ts":{"N":"1"},"flag":{"S":"on"}}),
+    )
+    .await;
+    put_item(
+        &app,
+        "device_events",
+        json!({"device_id":{"S":"mt-d"},"ts":{"N":"2"},"flag":{"S":"off"}}),
+    )
+    .await;
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{
+                "users":{"Keys":[
+                    {"id":{"S":"mt-u1"}},
+                    {"id":{"S":"mt-u2"}}
+                ]},
+                "device_events":{"Keys":[
+                    {"device_id":{"S":"mt-d"},"ts":{"N":"1"}},
+                    {"device_id":{"S":"mt-d"},"ts":{"N":"2"}}
+                ]}
+            }}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["Responses"]["users"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        body["Responses"]["device_events"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(body["UnprocessedKeys"], json!({}));
+}
+
+#[tokio::test]
+async fn batch_get_multi_table_one_empty_still_present() {
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"mt-u-only"},"label":{"S":"x"}})).await;
+    // device_events keys all miss — its array should still be present
+    // as [], per D10.
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{
+                "users":{"Keys":[{"id":{"S":"mt-u-only"}}]},
+                "device_events":{"Keys":[
+                    {"device_id":{"S":"nope"},"ts":{"N":"42"}}
+                ]}
+            }}),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["Responses"]["users"].as_array().unwrap().len(), 1);
+    assert!(body["Responses"]["device_events"].is_array());
+    assert_eq!(
+        body["Responses"]["device_events"].as_array().unwrap().len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn batch_get_multi_table_unknown_table_fails_whole_request() {
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"mt-fail"},"label":{"S":"x"}})).await;
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{
+                "users":{"Keys":[{"id":{"S":"mt-fail"}}]},
+                "no-such-table":{"Keys":[{"id":{"S":"x"}}]}
+            }}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let ty = body["__type"].as_str().unwrap();
+    assert!(
+        ty.ends_with("#ResourceNotFoundException"),
+        "expected ResourceNotFoundException, got {ty}"
+    );
+}
+
+#[tokio::test]
+async fn batch_get_duplicate_keys_in_one_table_doesnt_affect_other() {
+    // Duplicate inside `users` should reject the whole request, even
+    // though `device_events` is well-formed. Translator returns the
+    // first error it finds (HashMap iteration is unordered, so we
+    // just check the error class — not which table got blamed).
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{
+                "users":{"Keys":[
+                    {"id":{"S":"dup"}},
+                    {"id":{"S":"dup"}}
+                ]},
+                "device_events":{"Keys":[
+                    {"device_id":{"S":"d"},"ts":{"N":"1"}}
+                ]}
+            }}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"].as_str().unwrap().ends_with("#ValidationException"));
+}
+
+#[tokio::test]
+async fn batch_get_same_key_across_tables_is_allowed() {
+    // The duplicate-key rule is per-table. (pk="x") in users plus
+    // (device_id="x", ts=1) in device_events is fine — different keys
+    // in different tables.
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"x"},"label":{"S":"u"}})).await;
+    put_item(
+        &app,
+        "device_events",
+        json!({"device_id":{"S":"x"},"ts":{"N":"1"},"flag":{"S":"on"}}),
+    )
+    .await;
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{
+                "users":{"Keys":[{"id":{"S":"x"}}]},
+                "device_events":{"Keys":[{"device_id":{"S":"x"},"ts":{"N":"1"}}]}
+            }}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["Responses"]["users"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        body["Responses"]["device_events"].as_array().unwrap().len(),
+        1
+    );
+}
