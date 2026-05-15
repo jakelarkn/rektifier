@@ -5606,3 +5606,123 @@ async fn batch_write_multi_table_total_cap_summed() {
     let body = body_json(resp).await;
     assert!(body["message"].as_str().unwrap().contains("Too many"));
 }
+
+// ===== BatchWriteItem validation polish (B6) ==================================
+
+#[tokio::test]
+async fn batch_write_rejects_condition_expression_in_put_request() {
+    // D6: PutRequest only carries Item. DDB rejects extra fields;
+    // we match via serde(deny_unknown_fields), surfacing as
+    // SerializationException.
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{"users":[
+                {"PutRequest":{
+                    "Item":{"id":{"S":"x"}},
+                    "ConditionExpression":"attribute_not_exists(id)"
+                }}
+            ]}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let ty = body["__type"].as_str().unwrap();
+    assert!(
+        ty.ends_with("#SerializationException") || ty.ends_with("#ValidationException"),
+        "expected Ser/ValidationException, got {ty}"
+    );
+}
+
+#[tokio::test]
+async fn batch_write_rejects_return_values_in_put_request() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{"users":[
+                {"PutRequest":{
+                    "Item":{"id":{"S":"x"}},
+                    "ReturnValues":"ALL_OLD"
+                }}
+            ]}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn batch_write_rejects_extra_field_in_delete_request() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{"users":[
+                {"DeleteRequest":{
+                    "Key":{"id":{"S":"x"}},
+                    "ConditionExpression":"attribute_exists(id)"
+                }}
+            ]}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn batch_write_accepts_return_consumed_capacity_envelope() {
+    // ReturnConsumedCapacity at the *envelope* level is accepted-and-
+    // dropped (we have no metering). Should not error.
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({
+                "RequestItems":{"users":[
+                    {"PutRequest":{"Item":{"id":{"S":"bw-rcc"}}}}
+                ]},
+                "ReturnConsumedCapacity":"TOTAL"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn batch_write_accepts_return_item_collection_metrics_envelope() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({
+                "RequestItems":{"users":[
+                    {"PutRequest":{"Item":{"id":{"S":"bw-ricm"}}}}
+                ]},
+                "ReturnItemCollectionMetrics":"SIZE"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn batch_get_accepts_return_consumed_capacity_envelope() {
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"bg-rcc"},"label":{"S":"x"}})).await;
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({
+                "RequestItems":{"users":{"Keys":[{"id":{"S":"bg-rcc"}}]}},
+                "ReturnConsumedCapacity":"TOTAL"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

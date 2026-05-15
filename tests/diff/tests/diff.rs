@@ -4332,3 +4332,62 @@ fn diff_batch_write_delete_of_missing_row_is_noop() {
     assert_eq!(r_ref["UnprocessedItems"], json!({}));
     assert_eq!(r_ours["UnprocessedItems"], json!({}));
 }
+
+// ===== BatchWriteItem strict-field rejection (B6) =============================
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_write_extra_field_in_put_request_both_reject() {
+    // PutRequest with ConditionExpression: DDB rejects; we reject via
+    // serde(deny_unknown_fields). Both must fail with 4xx (D6 strict
+    // stance). Don't pin the exact wire-shape — DDB-local emits a
+    // ValidationException; we emit a SerializationException since
+    // the field never deserializes.
+    let req_items = "{\"users\":[\
+        {\"PutRequest\":{\"Item\":{\"id\":{\"S\":\"x\"}},\"ConditionExpression\":\"attribute_not_exists(id)\"}}\
+    ]}";
+    let err_ref = aws_expecting_failure(REF, &["dynamodb","batch-write-item","--request-items",req_items]);
+    let err_ours = aws_expecting_failure(OURS, &["dynamodb","batch-write-item","--request-items",req_items]);
+    // Both must indicate rejection — we don't pin wording. AWS CLI v2
+    // actually rejects client-side ("Unknown parameter") before the
+    // request goes over the wire, which is fine — the contract is
+    // "this field doesn't belong here." Rektifier rejects on the wire
+    // via serde(deny_unknown_fields).
+    let is_rejection = |s: &str| {
+        s.contains("ValidationException")
+            || s.contains("SerializationException")
+            || s.contains("Unrecognized")
+            || s.contains("Unknown parameter")
+            || s.contains("unknown field")
+    };
+    assert!(
+        is_rejection(&err_ref),
+        "ref didn't reject ConditionExpression in PutRequest: {err_ref}"
+    );
+    assert!(
+        is_rejection(&err_ours),
+        "ours didn't reject ConditionExpression in PutRequest: {err_ours}"
+    );
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_write_return_consumed_capacity_envelope_accepted() {
+    // Envelope-level ReturnConsumedCapacity is accepted on both sides
+    // (we drop it; DDB returns metering). The call should succeed.
+    ensure_users_table();
+    let r_ref = aws(REF, &[
+        "dynamodb","batch-write-item",
+        "--request-items","{\"users\":[{\"PutRequest\":{\"Item\":{\"id\":{\"S\":\"bw-d-rcc\"}}}}]}",
+        "--return-consumed-capacity","TOTAL",
+    ]);
+    let r_ours = aws(OURS, &[
+        "dynamodb","batch-write-item",
+        "--request-items","{\"users\":[{\"PutRequest\":{\"Item\":{\"id\":{\"S\":\"bw-d-rcc\"}}}}]}",
+        "--return-consumed-capacity","TOTAL",
+    ]);
+    assert_eq!(r_ref["UnprocessedItems"], json!({}));
+    assert_eq!(r_ours["UnprocessedItems"], json!({}));
+    // We don't compare ConsumedCapacity (rektifier doesn't emit it).
+    delete_both("users", "{\"id\":{\"S\":\"bw-d-rcc\"}}");
+}

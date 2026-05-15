@@ -2693,4 +2693,259 @@ mod tests {
             other => panic!("expected B key, got {other:?}"),
         }
     }
+
+    // ===== BatchWriteItem (B4–B6) ============================================
+
+    fn put_req(item: Item) -> rekt_protocol::WriteRequest {
+        rekt_protocol::WriteRequest {
+            put_request: Some(rekt_protocol::PutRequest { item }),
+            delete_request: None,
+        }
+    }
+
+    fn del_req(key: Item) -> rekt_protocol::WriteRequest {
+        rekt_protocol::WriteRequest {
+            put_request: None,
+            delete_request: Some(rekt_protocol::DeleteRequest { key }),
+        }
+    }
+
+    fn bw_req(
+        items: Vec<(&str, Vec<rekt_protocol::WriteRequest>)>,
+    ) -> rekt_protocol::BatchWriteItemRequest {
+        let mut ri = std::collections::HashMap::new();
+        for (table, writes) in items {
+            ri.insert(table.to_string(), writes);
+        }
+        rekt_protocol::BatchWriteItemRequest {
+            request_items: ri,
+            return_consumed_capacity: None,
+            return_item_collection_metrics: None,
+        }
+    }
+
+    #[test]
+    fn batch_write_put_only_ok() {
+        let req = bw_req(vec![(
+            "users",
+            vec![
+                put_req(item_of(&[("id", AttributeValue::S("a".into()))])),
+                put_req(item_of(&[("id", AttributeValue::S("b".into()))])),
+            ],
+        )]);
+        let plan = translate_batch_write_item(&req, &schemas_map(), 25).unwrap();
+        assert_eq!(plan.per_table[0].ops.len(), 2);
+        for op in &plan.per_table[0].ops {
+            assert!(matches!(op, rekt_storage::WriteOp::Put { .. }));
+        }
+    }
+
+    #[test]
+    fn batch_write_delete_only_ok() {
+        let req = bw_req(vec![(
+            "users",
+            vec![del_req(item_of(&[("id", AttributeValue::S("a".into()))]))],
+        )]);
+        let plan = translate_batch_write_item(&req, &schemas_map(), 25).unwrap();
+        assert!(matches!(
+            plan.per_table[0].ops[0],
+            rekt_storage::WriteOp::Delete { .. }
+        ));
+    }
+
+    #[test]
+    fn batch_write_mixed_put_delete_ok() {
+        let req = bw_req(vec![(
+            "users",
+            vec![
+                put_req(item_of(&[("id", AttributeValue::S("p".into()))])),
+                del_req(item_of(&[("id", AttributeValue::S("d".into()))])),
+            ],
+        )]);
+        let plan = translate_batch_write_item(&req, &schemas_map(), 25).unwrap();
+        assert_eq!(plan.per_table[0].ops.len(), 2);
+    }
+
+    #[test]
+    fn batch_write_composite_put_extracts_sk() {
+        let req = bw_req(vec![(
+            "events",
+            vec![put_req(item_of(&[
+                ("device_id", AttributeValue::S("d".into())),
+                ("ts", AttributeValue::N("1".into())),
+            ]))],
+        )]);
+        let plan = translate_batch_write_item(&req, &schemas_map(), 25).unwrap();
+        match &plan.per_table[0].ops[0] {
+            rekt_storage::WriteOp::Put { pk, sk, .. } => {
+                assert_eq!(*pk, KeyValue::S("d".into()));
+                assert_eq!(*sk, Some(KeyValue::N("1".into())));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn batch_write_empty_request_items_rejected() {
+        let req = bw_req(vec![]);
+        let err = translate_batch_write_item(&req, &schemas_map(), 25).unwrap_err();
+        assert!(matches!(err, TranslateError::EmptyBatchWriteRequest));
+    }
+
+    #[test]
+    fn batch_write_empty_per_table_vec_rejected() {
+        let req = bw_req(vec![("users", vec![])]);
+        let err = translate_batch_write_item(&req, &schemas_map(), 25).unwrap_err();
+        assert!(matches!(err, TranslateError::EmptyWritesInBatch { .. }));
+    }
+
+    #[test]
+    fn batch_write_unknown_table_rejected() {
+        let req = bw_req(vec![("nope", vec![put_req(item_of(&[
+            ("id", AttributeValue::S("x".into())),
+        ]))])]);
+        let err = translate_batch_write_item(&req, &schemas_map(), 25).unwrap_err();
+        assert!(matches!(err, TranslateError::ResourceNotFoundForBatch { .. }));
+    }
+
+    #[test]
+    fn batch_write_dup_put_keys_rejected() {
+        let req = bw_req(vec![(
+            "users",
+            vec![
+                put_req(item_of(&[("id", AttributeValue::S("x".into()))])),
+                put_req(item_of(&[("id", AttributeValue::S("x".into()))])),
+            ],
+        )]);
+        let err = translate_batch_write_item(&req, &schemas_map(), 25).unwrap_err();
+        assert!(matches!(err, TranslateError::DuplicateKeyInBatch));
+    }
+
+    #[test]
+    fn batch_write_put_plus_delete_same_key_rejected() {
+        // Per-table HashSet spans Put + Delete combined.
+        let req = bw_req(vec![(
+            "users",
+            vec![
+                put_req(item_of(&[("id", AttributeValue::S("x".into()))])),
+                del_req(item_of(&[("id", AttributeValue::S("x".into()))])),
+            ],
+        )]);
+        let err = translate_batch_write_item(&req, &schemas_map(), 25).unwrap_err();
+        assert!(matches!(err, TranslateError::DuplicateKeyInBatch));
+    }
+
+    #[test]
+    fn batch_write_malformed_neither_set_rejected() {
+        let req = bw_req(vec![(
+            "users",
+            vec![rekt_protocol::WriteRequest {
+                put_request: None,
+                delete_request: None,
+            }],
+        )]);
+        let err = translate_batch_write_item(&req, &schemas_map(), 25).unwrap_err();
+        assert!(matches!(err, TranslateError::MalformedWriteRequest));
+    }
+
+    #[test]
+    fn batch_write_malformed_both_set_rejected() {
+        let req = bw_req(vec![(
+            "users",
+            vec![rekt_protocol::WriteRequest {
+                put_request: Some(rekt_protocol::PutRequest {
+                    item: item_of(&[("id", AttributeValue::S("a".into()))]),
+                }),
+                delete_request: Some(rekt_protocol::DeleteRequest {
+                    key: item_of(&[("id", AttributeValue::S("b".into()))]),
+                }),
+            }],
+        )]);
+        let err = translate_batch_write_item(&req, &schemas_map(), 25).unwrap_err();
+        assert!(matches!(err, TranslateError::MalformedWriteRequest));
+    }
+
+    #[test]
+    fn batch_write_total_cap_summed_across_tables() {
+        let mut us = Vec::new();
+        let mut es = Vec::new();
+        for n in 0..13 {
+            us.push(put_req(item_of(&[
+                ("id", AttributeValue::S(format!("u{n}"))),
+            ])));
+            es.push(put_req(item_of(&[
+                ("device_id", AttributeValue::S(format!("d{n}"))),
+                ("ts", AttributeValue::N("1".into())),
+            ])));
+        }
+        let req = bw_req(vec![("users", us), ("events", es)]);
+        let err = translate_batch_write_item(&req, &schemas_map(), 25).unwrap_err();
+        match err {
+            TranslateError::TooManyWritesInBatch { got, max } => {
+                assert_eq!(got, 26);
+                assert_eq!(max, 25);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_write_put_missing_pk_attr_rejected() {
+        let req = bw_req(vec![(
+            "users",
+            vec![put_req(item_of(&[
+                ("label", AttributeValue::S("no-pk".into())),
+            ]))],
+        )]);
+        let err = translate_batch_write_item(&req, &schemas_map(), 25).unwrap_err();
+        assert!(matches!(err, TranslateError::MissingPartitionKey { .. }));
+    }
+
+    #[test]
+    fn batch_write_put_wrong_pk_type_rejected() {
+        let req = bw_req(vec![(
+            "users",
+            vec![put_req(item_of(&[
+                ("id", AttributeValue::N("42".into())),
+            ]))],
+        )]);
+        let err = translate_batch_write_item(&req, &schemas_map(), 25).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::PartitionKeyTypeMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn batch_write_delete_extra_attr_in_key_rejected() {
+        let req = bw_req(vec![(
+            "users",
+            vec![del_req(item_of(&[
+                ("id", AttributeValue::S("x".into())),
+                ("extra", AttributeValue::S("oops".into())),
+            ]))],
+        )]);
+        let err = translate_batch_write_item(&req, &schemas_map(), 25).unwrap_err();
+        assert!(matches!(err, TranslateError::ExtraKeyAttribute { .. }));
+    }
+
+    #[test]
+    fn batch_write_custom_max_writes_lower() {
+        let req = bw_req(vec![(
+            "users",
+            (0..6)
+                .map(|n| {
+                    put_req(item_of(&[(
+                        "id",
+                        AttributeValue::S(format!("u{n}")),
+                    )]))
+                })
+                .collect(),
+        )]);
+        let err = translate_batch_write_item(&req, &schemas_map(), 5).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::TooManyWritesInBatch { got: 6, max: 5 }
+        ));
+    }
 }

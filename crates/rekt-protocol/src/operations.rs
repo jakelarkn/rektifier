@@ -258,9 +258,12 @@ pub struct BatchGetItemRequest {
 /// is externally-tagged: each entry is either `{"PutRequest": {...}}`
 /// or `{"DeleteRequest": {...}}`. We mirror that with two `Option`
 /// fields and validate "exactly one set" in the translator
-/// (`MalformedWriteRequest`).
+/// (`MalformedWriteRequest`). `deny_unknown_fields` matches DDB's
+/// strict stance (D6 in PLAN-6) — a `WriteRequest` carrying anything
+/// else (e.g. an SDK that wedges a `ConditionExpression` in here)
+/// must fail.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct WriteRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub put_request: Option<PutRequest>,
@@ -268,14 +271,17 @@ pub struct WriteRequest {
     pub delete_request: Option<DeleteRequest>,
 }
 
+/// `PutRequest` only carries `Item` — DDB rejects anything else (no
+/// `ConditionExpression`, no `ReturnValues`). D6.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct PutRequest {
     pub item: Item,
 }
 
+/// `DeleteRequest` only carries `Key` — same strict rule as `PutRequest`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct DeleteRequest {
     pub key: Item,
 }
