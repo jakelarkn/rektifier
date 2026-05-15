@@ -615,10 +615,44 @@ fn schemas() -> HashMap<String, TableSchema> {
         sk_type: Some(KeyType::S),
         jsonb_col: "data".into(),
     };
+    // N-PK, B-PK, and S+B composite — matches rektifier.toml.example
+    // so dispatch tests can exercise the same key-type matrix the
+    // diff harness does. The MockBackend stringifies KeyValues so
+    // every key type round-trips through the same in-memory path.
+    let counters = TableSchema {
+        name: "counters".into(),
+        pg_table: "counters".into(),
+        pk_attr: "id".into(),
+        pk_type: KeyType::N,
+        sk_attr: None,
+        sk_type: None,
+        jsonb_col: "data".into(),
+    };
+    let blobs = TableSchema {
+        name: "blobs".into(),
+        pg_table: "blobs".into(),
+        pk_attr: "binmark".into(),
+        pk_type: KeyType::B,
+        sk_attr: None,
+        sk_type: None,
+        jsonb_col: "data".into(),
+    };
+    let binsorted = TableSchema {
+        name: "binsorted".into(),
+        pg_table: "binsorted".into(),
+        pk_attr: "id".into(),
+        pk_type: KeyType::S,
+        sk_attr: Some("binmark".into()),
+        sk_type: Some(KeyType::B),
+        jsonb_col: "data".into(),
+    };
     let mut m = HashMap::new();
     m.insert(users.name.clone(), users);
     m.insert(events.name.clone(), events);
     m.insert(messages.name.clone(), messages);
+    m.insert(counters.name.clone(), counters);
+    m.insert(blobs.name.clone(), blobs);
+    m.insert(binsorted.name.clone(), binsorted);
     m
 }
 
@@ -5721,6 +5755,159 @@ async fn batch_get_accepts_return_consumed_capacity_envelope() {
                 "RequestItems":{"users":{"Keys":[{"id":{"S":"bg-rcc"}}]}},
                 "ReturnConsumedCapacity":"TOTAL"
             }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ===== Batch op coverage closure (high + medium gaps) ========================
+//
+// Audit follow-up — closes the per-key-type-matrix gap (N-PK / B-PK
+// at dispatch layer) and the B-typed SK in BatchGetItem gap that
+// PG-live + diff couldn't catch alone. Per-attribute-variant
+// round-trips and PG-level boundary tests live in the libpq + diff
+// surfaces; this file focuses on dispatch-layer key-type coverage.
+
+#[tokio::test]
+async fn batch_get_numeric_pk_via_counters() {
+    let app = app();
+    for n in ["1", "2", "3"] {
+        put_item(
+            &app,
+            "counters",
+            json!({"id":{"N":n},"tally":{"N":n}}),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"counters":{"Keys":[
+                {"id":{"N":"1"}},
+                {"id":{"N":"3"}},
+                {"id":{"N":"999"}}
+            ]}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let items = body["Responses"]["counters"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "expected 2 hits, got {items:?}");
+}
+
+#[tokio::test]
+async fn batch_get_binary_pk_via_blobs() {
+    let app = app();
+    // DDB-JSON binary values are base64-encoded on the wire.
+    for b64 in ["YQ==", "Yg==", "Yw=="] {
+        put_item(
+            &app,
+            "blobs",
+            json!({"binmark":{"B":b64},"label":{"S":format!("L-{b64}")}}),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"blobs":{"Keys":[
+                {"binmark":{"B":"YQ=="}},
+                {"binmark":{"B":"Yw=="}},
+                {"binmark":{"B":"enp6"}}
+            ]}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["Responses"]["blobs"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn batch_get_binary_sk_via_binsorted() {
+    let app = app();
+    // S PK + B SK — the composite SQL path's binary SK binding is
+    // unexercised elsewhere at the dispatch layer.
+    for b64 in ["AAE=", "AAI=", "AAM="] {
+        put_item(
+            &app,
+            "binsorted",
+            json!({"id":{"S":"part-1"},"binmark":{"B":b64}}),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{"binsorted":{"Keys":[
+                {"id":{"S":"part-1"},"binmark":{"B":"AAE="}},
+                {"id":{"S":"part-1"},"binmark":{"B":"AAM="}}
+            ]}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["Responses"]["binsorted"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn batch_write_numeric_pk_via_counters() {
+    let app = app();
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{"counters":[
+                {"PutRequest":{"Item":{"id":{"N":"42"},"tally":{"N":"100"}}}},
+                {"PutRequest":{"Item":{"id":{"N":"43"},"tally":{"N":"200"}}}}
+            ]}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Verify both rows persisted.
+    let got = get_item_value(&app, "counters", json!({"id":{"N":"42"}})).await;
+    assert_eq!(got["Item"]["tally"]["N"].as_str(), Some("100"));
+    let got2 = get_item_value(&app, "counters", json!({"id":{"N":"43"}})).await;
+    assert_eq!(got2["Item"]["tally"]["N"].as_str(), Some("200"));
+}
+
+#[tokio::test]
+async fn batch_write_binary_pk_via_blobs() {
+    let app = app();
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{"blobs":[
+                {"PutRequest":{"Item":{"binmark":{"B":"YnctYg=="},"label":{"S":"x"}}}}
+            ]}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let got = get_item_value(&app, "blobs", json!({"binmark":{"B":"YnctYg=="}})).await;
+    assert_eq!(got["Item"]["label"]["S"].as_str(), Some("x"));
+}
+
+#[tokio::test]
+async fn batch_write_binary_sk_via_binsorted() {
+    let app = app();
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{"binsorted":[
+                {"PutRequest":{"Item":{
+                    "id":{"S":"bw-bsk"},"binmark":{"B":"AAEC"},"label":{"S":"x"}
+                }}},
+                {"DeleteRequest":{"Key":{
+                    "id":{"S":"bw-bsk"},"binmark":{"B":"AAED"}
+                }}}
+            ]}}),
         ))
         .await
         .unwrap();

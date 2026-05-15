@@ -4391,3 +4391,281 @@ fn diff_batch_write_return_consumed_capacity_envelope_accepted() {
     // We don't compare ConsumedCapacity (rektifier doesn't emit it).
     delete_both("users", "{\"id\":{\"S\":\"bw-d-rcc\"}}");
 }
+
+// ===== Batch op coverage closure (high + medium gaps) =========================
+//
+// Audit follow-up — closes the per-AttributeValue-variant round-trip
+// gap (high) and the per-key-type-matrix gap at the diff layer
+// (medium) so the full DDB-parity contract is locked for batch ops.
+
+/// HIGH: Round-trip every AttributeValue variant through
+/// BatchWriteItem → BatchGetItem and assert deep equality vs
+/// DDB-local. The single-row PutItem/GetItem path already covers
+/// this; this test confirms the batch wire shape doesn't normalize
+/// or drop any variant.
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_round_trip_all_attribute_value_variants() {
+    ensure_users_table();
+    let pk = "bg-variants-all";
+    // 10 attribute variants in one item: S, N, B, BOOL, NULL, L, M,
+    // SS, NS, BS. Names are non-reserved per CLAUDE.md.
+    let item = format!(
+        "{{\"id\":{{\"S\":\"{pk}\"}},\
+         \"label\":{{\"S\":\"hello\"}},\
+         \"tally\":{{\"N\":\"42.5\"}},\
+         \"binmark\":{{\"B\":\"AAEC\"}},\
+         \"flag\":{{\"BOOL\":true}},\
+         \"goner\":{{\"NULL\":true}},\
+         \"entries\":{{\"L\":[{{\"S\":\"a\"}},{{\"N\":\"1\"}}]}},\
+         \"summed\":{{\"M\":{{\"k\":{{\"S\":\"v\"}}}}}},\
+         \"tags\":{{\"SS\":[\"a\",\"b\"]}},\
+         \"score\":{{\"NS\":[\"1\",\"2\"]}},\
+         \"replica\":{{\"BS\":[\"AAE=\"]}}}}"
+    );
+    let write = format!(
+        "{{\"users\":[{{\"PutRequest\":{{\"Item\":{item}}}}}]}}"
+    );
+    let _ = aws(REF, &["dynamodb","batch-write-item","--request-items",&write]);
+    let _ = aws(OURS, &["dynamodb","batch-write-item","--request-items",&write]);
+
+    let read = format!("{{\"users\":{{\"Keys\":[{{\"id\":{{\"S\":\"{pk}\"}}}}]}}}}");
+    let r_ref = aws(REF, &["dynamodb","batch-get-item","--request-items",&read]);
+    let r_ours = aws(OURS, &["dynamodb","batch-get-item","--request-items",&read]);
+
+    // Sets are unordered on the wire; normalize before comparing.
+    let mut ref_item = r_ref["Responses"]["users"][0].clone();
+    let mut our_item = r_ours["Responses"]["users"][0].clone();
+    sort_sets(&mut ref_item);
+    sort_sets(&mut our_item);
+    assert_eq!(
+        ref_item, our_item,
+        "BatchGet variant round-trip diverged\nref:  {ref_item}\nours: {our_item}"
+    );
+
+    delete_both("users", &format!("{{\"id\":{{\"S\":\"{pk}\"}}}}"));
+}
+
+/// HIGH: B-typed SK exercised through BatchGetItem. Composite S+B
+/// (`binsorted` table) — the per-row binary cast in the
+/// IN (VALUES ...) emitter has no other diff-level coverage.
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_get_binary_sk_via_binsorted() {
+    ensure_binsorted_table();
+    let pk = "bg-bsk";
+    for b64 in ["AAE=", "AAI=", "AAM="] {
+        let item = format!(
+            "{{\"id\":{{\"S\":\"{pk}\"}},\"binmark\":{{\"B\":\"{b64}\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","binsorted","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","binsorted","--item",&item]);
+    }
+    let req_items = format!(
+        "{{\"binsorted\":{{\"Keys\":[\
+            {{\"id\":{{\"S\":\"{pk}\"}},\"binmark\":{{\"B\":\"AAE=\"}}}},\
+            {{\"id\":{{\"S\":\"{pk}\"}},\"binmark\":{{\"B\":\"AAM=\"}}}}\
+        ]}}}}"
+    );
+    let r_ref = aws(REF, &["dynamodb","batch-get-item","--request-items",&req_items]);
+    let r_ours = aws(OURS, &["dynamodb","batch-get-item","--request-items",&req_items]);
+    let mut ref_items = r_ref["Responses"]["binsorted"].as_array().unwrap().clone();
+    let mut our_items = r_ours["Responses"]["binsorted"].as_array().unwrap().clone();
+    // Sort by binmark for stable comparison.
+    let by_bin = |a: &Value, b: &Value| {
+        a["binmark"]["B"].as_str().unwrap().cmp(b["binmark"]["B"].as_str().unwrap())
+    };
+    ref_items.sort_by(by_bin);
+    our_items.sort_by(by_bin);
+    assert_eq!(ref_items, our_items);
+    assert_eq!(ref_items.len(), 2);
+
+    for b64 in ["AAE=","AAI=","AAM="] {
+        delete_both_composite("binsorted","id",pk,"binmark",&format!("{{\"B\":\"{b64}\"}}"));
+    }
+}
+
+/// MEDIUM: N-PK BatchGetItem via the configured `counters` table —
+/// closes the diff-layer key-type-matrix asymmetry.
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_get_numeric_pk_via_counters() {
+    ensure_counters_table();
+    for n in ["10001", "10002", "10003"] {
+        let item = format!("{{\"id\":{{\"N\":\"{n}\"}}}}");
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","counters","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","counters","--item",&item]);
+    }
+    let req_items = "{\"counters\":{\"Keys\":[\
+        {\"id\":{\"N\":\"10001\"}},\
+        {\"id\":{\"N\":\"10003\"}},\
+        {\"id\":{\"N\":\"99999\"}}\
+    ]}}";
+    let r_ref = aws(REF, &["dynamodb","batch-get-item","--request-items",req_items]);
+    let r_ours = aws(OURS, &["dynamodb","batch-get-item","--request-items",req_items]);
+    let mut ref_items = r_ref["Responses"]["counters"].as_array().unwrap().clone();
+    let mut our_items = r_ours["Responses"]["counters"].as_array().unwrap().clone();
+    let by_id = |a: &Value, b: &Value| {
+        a["id"]["N"].as_str().unwrap().cmp(b["id"]["N"].as_str().unwrap())
+    };
+    ref_items.sort_by(by_id);
+    our_items.sort_by(by_id);
+    assert_eq!(ref_items, our_items);
+    assert_eq!(ref_items.len(), 2);
+
+    for n in ["10001","10002","10003"] {
+        delete_both("counters", &format!("{{\"id\":{{\"N\":\"{n}\"}}}}"));
+    }
+}
+
+/// MEDIUM: B-PK BatchGetItem via the configured `blobs` table.
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_get_binary_pk_via_blobs() {
+    ensure_blobs_table();
+    for b64 in ["YmctZA==", "YmctZQ==", "YmctZg=="] {
+        let item = format!("{{\"binmark\":{{\"B\":\"{b64}\"}}}}");
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","blobs","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","blobs","--item",&item]);
+    }
+    let req_items = "{\"blobs\":{\"Keys\":[\
+        {\"binmark\":{\"B\":\"YmctZA==\"}},\
+        {\"binmark\":{\"B\":\"YmctZg==\"}}\
+    ]}}";
+    let r_ref = aws(REF, &["dynamodb","batch-get-item","--request-items",req_items]);
+    let r_ours = aws(OURS, &["dynamodb","batch-get-item","--request-items",req_items]);
+    let mut ref_items = r_ref["Responses"]["blobs"].as_array().unwrap().clone();
+    let mut our_items = r_ours["Responses"]["blobs"].as_array().unwrap().clone();
+    let by_bin = |a: &Value, b: &Value| {
+        a["binmark"]["B"].as_str().unwrap().cmp(b["binmark"]["B"].as_str().unwrap())
+    };
+    ref_items.sort_by(by_bin);
+    our_items.sort_by(by_bin);
+    assert_eq!(ref_items, our_items);
+
+    for b64 in ["YmctZA==","YmctZQ==","YmctZg=="] {
+        delete_both("blobs", &format!("{{\"binmark\":{{\"B\":\"{b64}\"}}}}"));
+    }
+}
+
+/// MEDIUM: N-PK BatchWriteItem persists + reads back via the
+/// configured `counters` table — closes the write-side per-key-type
+/// asymmetry.
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_write_numeric_pk_via_counters() {
+    ensure_counters_table();
+    let req_items = "{\"counters\":[\
+        {\"PutRequest\":{\"Item\":{\"id\":{\"N\":\"20001\"},\"tally\":{\"N\":\"100\"}}}},\
+        {\"PutRequest\":{\"Item\":{\"id\":{\"N\":\"20002\"},\"tally\":{\"N\":\"200\"}}}}\
+    ]}";
+    let _ = aws(REF, &["dynamodb","batch-write-item","--request-items",req_items]);
+    let _ = aws(OURS, &["dynamodb","batch-write-item","--request-items",req_items]);
+    for n in ["20001","20002"] {
+        let key = format!("{{\"id\":{{\"N\":\"{n}\"}}}}");
+        let g_ref = aws(REF, &["dynamodb","get-item","--table-name","counters","--key",&key]);
+        let g_ours = aws(OURS, &["dynamodb","get-item","--table-name","counters","--key",&key]);
+        assert_eq!(g_ref, g_ours, "drift on id={n}");
+        delete_both("counters", &key);
+    }
+}
+
+/// MEDIUM: B-PK BatchWriteItem persists + reads back via the
+/// configured `blobs` table.
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_write_binary_pk_via_blobs() {
+    ensure_blobs_table();
+    let req_items = "{\"blobs\":[\
+        {\"PutRequest\":{\"Item\":{\"binmark\":{\"B\":\"YnctYjE=\"},\"label\":{\"S\":\"x\"}}}}\
+    ]}";
+    let _ = aws(REF, &["dynamodb","batch-write-item","--request-items",req_items]);
+    let _ = aws(OURS, &["dynamodb","batch-write-item","--request-items",req_items]);
+    let g_ref = aws(REF, &["dynamodb","get-item","--table-name","blobs","--key","{\"binmark\":{\"B\":\"YnctYjE=\"}}"]);
+    let g_ours = aws(OURS, &["dynamodb","get-item","--table-name","blobs","--key","{\"binmark\":{\"B\":\"YnctYjE=\"}}"]);
+    assert_eq!(g_ref, g_ours);
+    delete_both("blobs", "{\"binmark\":{\"B\":\"YnctYjE=\"}}");
+}
+
+/// MEDIUM: BatchWriteItem with B-typed SK via `binsorted`.
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_write_binary_sk_via_binsorted() {
+    ensure_binsorted_table();
+    let pk = "bw-d-bsk";
+    let req_items = format!(
+        "{{\"binsorted\":[\
+            {{\"PutRequest\":{{\"Item\":{{\"id\":{{\"S\":\"{pk}\"}},\"binmark\":{{\"B\":\"AAEC\"}}}}}}}},\
+            {{\"PutRequest\":{{\"Item\":{{\"id\":{{\"S\":\"{pk}\"}},\"binmark\":{{\"B\":\"AAED\"}}}}}}}}\
+        ]}}"
+    );
+    let _ = aws(REF, &["dynamodb","batch-write-item","--request-items",&req_items]);
+    let _ = aws(OURS, &["dynamodb","batch-write-item","--request-items",&req_items]);
+    for b64 in ["AAEC","AAED"] {
+        let key = format!("{{\"id\":{{\"S\":\"{pk}\"}},\"binmark\":{{\"B\":\"{b64}\"}}}}");
+        let g_ref = aws(REF, &["dynamodb","get-item","--table-name","binsorted","--key",&key]);
+        let g_ours = aws(OURS, &["dynamodb","get-item","--table-name","binsorted","--key",&key]);
+        assert_eq!(g_ref, g_ours);
+        delete_both_composite("binsorted","id",pk,"binmark",&format!("{{\"B\":\"{b64}\"}}"));
+    }
+}
+
+/// MEDIUM: multi-table BatchGet with an unknown table — both
+/// endpoints must reject the whole request (no partial response).
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_get_multi_table_unknown_table_both_reject() {
+    ensure_users_table();
+    let req_items = "{\"users\":[],\"no-such-table\":[]}";
+    // ^ empty arrays here are also invalid; build a valid request
+    // with one good table + one unknown table instead.
+    let _ = req_items;
+    let req_items_valid = "{\"users\":{\"Keys\":[{\"id\":{\"S\":\"x\"}}]},\
+        \"no-such-table\":{\"Keys\":[{\"id\":{\"S\":\"x\"}}]}}";
+    let err_ref = aws_expecting_failure(REF, &["dynamodb","batch-get-item","--request-items",req_items_valid]);
+    let err_ours = aws_expecting_failure(OURS, &["dynamodb","batch-get-item","--request-items",req_items_valid]);
+    let is_resource_404 = |s: &str| {
+        s.contains("ResourceNotFound") || s.contains("not found") || s.contains("Cannot do operations")
+    };
+    assert!(is_resource_404(&err_ref), "ref didn't 404: {err_ref}");
+    assert!(is_resource_404(&err_ours), "ours didn't 404: {err_ours}");
+}
+
+/// MEDIUM: pre-existing row survives a whole-request reject. Both
+/// endpoints must reject before any writes fire — assert via
+/// pre/post GetItem on a sentinel row.
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_batch_write_unknown_table_in_multi_table_doesnt_write_anything() {
+    ensure_users_table();
+    // Sentinel: pre-existing row that should be untouched on both
+    // endpoints regardless of what happens to the rejected batch.
+    let sentinel_item = "{\"id\":{\"S\":\"bw-d-sentinel\"},\"label\":{\"S\":\"alive\"}}";
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",sentinel_item]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",sentinel_item]);
+
+    // Try a multi-table BatchWrite with one good table + one bad
+    // table. Both endpoints reject; users.bw-d-attempted must NOT
+    // appear after the call.
+    let req_items = "{\"users\":[\
+        {\"PutRequest\":{\"Item\":{\"id\":{\"S\":\"bw-d-attempted\"},\"label\":{\"S\":\"nope\"}}}}\
+    ],\"no-such-table\":[\
+        {\"PutRequest\":{\"Item\":{\"id\":{\"S\":\"x\"}}}}\
+    ]}";
+    let _err_ref = aws_expecting_failure(REF, &["dynamodb","batch-write-item","--request-items",req_items]);
+    let _err_ours = aws_expecting_failure(OURS, &["dynamodb","batch-write-item","--request-items",req_items]);
+
+    // Sentinel still alive on both:
+    let g_ref = aws(REF, &["dynamodb","get-item","--table-name","users","--key","{\"id\":{\"S\":\"bw-d-sentinel\"}}"]);
+    let g_ours = aws(OURS, &["dynamodb","get-item","--table-name","users","--key","{\"id\":{\"S\":\"bw-d-sentinel\"}}"]);
+    assert_eq!(g_ref["Item"]["label"]["S"].as_str(), Some("alive"));
+    assert_eq!(g_ours["Item"]["label"]["S"].as_str(), Some("alive"));
+
+    // The attempted write must NOT have landed on either:
+    let a_ref = aws(REF, &["dynamodb","get-item","--table-name","users","--key","{\"id\":{\"S\":\"bw-d-attempted\"}}"]);
+    let a_ours = aws(OURS, &["dynamodb","get-item","--table-name","users","--key","{\"id\":{\"S\":\"bw-d-attempted\"}}"]);
+    assert!(a_ref.get("Item").is_none(), "ref shouldn't have written attempted: {a_ref}");
+    assert!(a_ours.get("Item").is_none(), "ours shouldn't have written attempted: {a_ours}");
+
+    delete_both("users", "{\"id\":{\"S\":\"bw-d-sentinel\"}}");
+}

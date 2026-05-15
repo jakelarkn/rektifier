@@ -3931,4 +3931,182 @@ mod tests {
             other => panic!("expected TableNotFound, got {other:?}"),
         }
     }
+
+    // ===== Batch op boundary coverage (high + medium gaps) ==================
+    //
+    // The dispatch-layer mock can run 100-key / 25-write batches in
+    // isolation, but the real SQL emitter's `IN (VALUES ...)` and
+    // multi-row `INSERT ... ON CONFLICT DO UPDATE` only see those
+    // shapes here. Catches bound-parameter / prepared-statement-cache
+    // edge cases that pure mock tests can't.
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn batch_get_100_keys_composite_at_cap() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_bg_100;
+                 CREATE TABLE rekt_t_bg_100 (
+                   data      jsonb   NOT NULL,
+                   device_id text    GENERATED ALWAYS AS (data#>>'{device_id,S}') STORED,
+                   ts        numeric GENERATED ALWAYS AS ((data#>>'{ts,N}')::numeric) STORED,
+                   PRIMARY KEY (device_id, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_bg_100",
+            pk_col: "device_id",
+            pk_type: KeyType::S,
+            sk_col: Some("ts"),
+            sk_type: Some(KeyType::N),
+            jsonb_col: "data",
+        };
+        // Seed 100 rows across two partitions.
+        for i in 0..100 {
+            let dev = if i < 50 { "p1" } else { "p2" };
+            let ts = (i % 50).to_string();
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({"device_id":{"S":dev},"ts":{"N":ts}}),
+            )
+            .await;
+        }
+        let keys: Vec<(KeyValue, Option<KeyValue>)> = (0..100)
+            .map(|i| {
+                let dev = if i < 50 { "p1" } else { "p2" };
+                let ts = (i % 50).to_string();
+                (KeyValue::S(dev.into()), Some(KeyValue::N(ts)))
+            })
+            .collect();
+        // 100 rows = 200 bound parameters. PG's default limit is
+        // 65535 (i16 max) so this is well within bounds, but the
+        // prepared-statement cache hasn't seen a 200-param entry
+        // for this shape before — exercises that path.
+        let outcome = backend.batch_get_raw(&shape, &keys).await.unwrap();
+        assert_eq!(outcome.items.len(), 100);
+
+        client
+            .batch_execute("DROP TABLE rekt_t_bg_100;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn batch_write_25_puts_composite_at_cap() {
+        use rekt_storage::WriteOp;
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_bw_25;
+                 CREATE TABLE rekt_t_bw_25 (
+                   data      jsonb   NOT NULL,
+                   device_id text    GENERATED ALWAYS AS (data#>>'{device_id,S}') STORED,
+                   ts        numeric GENERATED ALWAYS AS ((data#>>'{ts,N}')::numeric) STORED,
+                   PRIMARY KEY (device_id, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_bw_25",
+            pk_col: "device_id",
+            pk_type: KeyType::S,
+            sk_col: Some("ts"),
+            sk_type: Some(KeyType::N),
+            jsonb_col: "data",
+        };
+        let ops: Vec<WriteOp> = (0..25)
+            .map(|i| WriteOp::Put {
+                pk: KeyValue::S("p".into()),
+                sk: Some(KeyValue::N(i.to_string())),
+                item: serde_json::json!({"device_id":{"S":"p"},"ts":{"N":i.to_string()}}),
+            })
+            .collect();
+        backend.batch_write_raw(&shape, &ops).await.unwrap();
+        // Verify a sampling of rows persisted.
+        for i in [0, 12, 24] {
+            let got = backend
+                .get_item_raw(
+                    &shape,
+                    &KeyValue::S("p".into()),
+                    Some(&KeyValue::N(i.to_string())),
+                )
+                .await
+                .unwrap();
+            assert!(got.is_some(), "row ts={i} missing");
+        }
+
+        client
+            .batch_execute("DROP TABLE rekt_t_bw_25;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn batch_get_composite_binary_sk() {
+        // Composite S+B — exercises the per-row B cast in the
+        // IN (VALUES ...) emitter. Single-row Get covers binsorted
+        // shape via Q tests; batch's per-row binary bind is new.
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_bg_sb;
+                 CREATE TABLE rekt_t_bg_sb (
+                   data    jsonb NOT NULL,
+                   id      text  GENERATED ALWAYS AS (data#>>'{id,S}') STORED,
+                   binmark bytea GENERATED ALWAYS AS (decode(data#>>'{binmark,B}', 'base64')) STORED,
+                   PRIMARY KEY (id, binmark)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_bg_sb",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: Some("binmark"),
+            sk_type: Some(KeyType::B),
+            jsonb_col: "data",
+        };
+        use base64::Engine;
+        for raw in [b"\x00\x01" as &[u8], b"\x00\x02", b"\x00\x03"] {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({"id":{"S":"part"},"binmark":{"B":b64}}),
+            )
+            .await;
+        }
+        let keys = vec![
+            (
+                KeyValue::S("part".into()),
+                Some(KeyValue::B(Bytes::from_static(b"\x00\x01"))),
+            ),
+            (
+                KeyValue::S("part".into()),
+                Some(KeyValue::B(Bytes::from_static(b"\x00\x03"))),
+            ),
+            (
+                KeyValue::S("part".into()),
+                Some(KeyValue::B(Bytes::from_static(b"\x00\x99"))), // miss
+            ),
+        ];
+        let outcome = backend.batch_get_raw(&shape, &keys).await.unwrap();
+        assert_eq!(outcome.items.len(), 2);
+
+        client
+            .batch_execute("DROP TABLE rekt_t_bg_sb;")
+            .await
+            .unwrap();
+    }
 }
