@@ -103,15 +103,46 @@ pub(crate) fn check_sk_shape(
 
 pub(crate) fn map_pg_err(table: &str, e: tokio_postgres::Error) -> BackendError {
     if e.code() == Some(&SqlState::UNDEFINED_TABLE) {
+        // Operator-actionable: the configured table doesn't exist.
+        // Log at warn (not error) — this is reachable via a stale
+        // rektifier.toml against a freshly-recreated PG, which is a
+        // config issue not an internal failure.
+        tracing::warn!(
+            table = %table,
+            sqlstate = %SqlState::UNDEFINED_TABLE.code(),
+            "PG reports table does not exist"
+        );
         return BackendError::TableNotFound {
             name: table.to_string(),
         };
     }
     // `e.to_string()` collapses to "db error"; drill into the underlying
     // DbError for the actual PG message + SQLSTATE.
-    let detail = match e.as_db_error() {
-        Some(db) => format!("{} ({})", db.message(), db.code().code()),
-        None => e.to_string(),
-    };
-    BackendError::Other(detail)
+    match e.as_db_error() {
+        Some(db) => {
+            // Structured fields so operators can grep on SQLSTATE.
+            // `code()` returns a `&SqlState`; its `.code()` accessor
+            // yields the 5-char identifier.
+            tracing::error!(
+                table = %table,
+                sqlstate = %db.code().code(),
+                pg_message = %db.message(),
+                detail = ?db.detail(),
+                hint = ?db.hint(),
+                "PG error"
+            );
+            BackendError::Other(format!("{} ({})", db.message(), db.code().code()))
+        }
+        None => {
+            // No DbError — this is a transport / protocol error
+            // (connection reset, decode failure, etc). The full chain
+            // is the only useful context.
+            tracing::error!(
+                table = %table,
+                error = %e,
+                "PG transport error (no DbError)"
+            );
+            BackendError::Other(e.to_string())
+        }
+    }
 }

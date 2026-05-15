@@ -89,7 +89,18 @@ impl PgBackend {
             .get()
             .instrument(tracing::debug_span!("pg.pool_get"))
             .await
-            .map_err(|e| BackendError::Other(format!("pool get failed: {e}")))
+            .map_err(|e| {
+                // Pool-get failures are typically PG unreachable, pool
+                // exhaustion, or timeout (none of which we can
+                // discriminate at this layer until Obs-3 lands the
+                // explicit variants). Warn-level: operator-actionable
+                // and rate-limited by the pool's own internal retries.
+                tracing::warn!(
+                    error = %e,
+                    "PG pool get failed"
+                );
+                BackendError::Other(format!("pool get failed: {e}"))
+            })
     }
 }
 

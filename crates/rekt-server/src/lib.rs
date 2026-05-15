@@ -217,7 +217,19 @@ impl From<BackendError> for ApiError {
             BackendError::ConditionalCheckFailed => {
                 ApiError::ConditionalCheckFailed("The conditional request failed".into())
             }
-            BackendError::Other(m) => ApiError::Internal(m),
+            // Every Other -> ApiError::Internal becomes a 500. The PG
+            // layer already logged the detailed cause (table, SQLSTATE,
+            // pg_message) in `map_pg_err`; this site emits an
+            // error-level boundary log so operators reading the API
+            // log can correlate a 500 response with the PG-layer error
+            // that produced it.
+            BackendError::Other(m) => {
+                tracing::error!(
+                    backend_error = %m,
+                    "backend error surfaced as InternalServerError (500)"
+                );
+                ApiError::Internal(m)
+            }
         }
     }
 }
@@ -226,6 +238,25 @@ impl From<SigV4Error> for ApiError {
     fn from(e: SigV4Error) -> Self {
         ApiError::AccessDenied(e.to_string())
     }
+}
+
+/// Deserialize a request body and log warn-level on failure. Centralizes
+/// the "invalid <Op> body: <reason>" message + structured tracing field
+/// for every handler so a misbehaving SDK shows up in logs even when
+/// the response is just a 4xx SerializationException.
+fn parse_request<T: serde::de::DeserializeOwned>(
+    body: &Bytes,
+    op: &'static str,
+) -> Result<T, ApiError> {
+    serde_json::from_slice(body).map_err(|e| {
+        tracing::warn!(
+            op = op,
+            error = %e,
+            body_bytes = body.len(),
+            "request body parse failed"
+        );
+        ApiError::Serialization(format!("invalid {op} body: {e}"))
+    })
 }
 
 // ===== Dispatch ================================================================
@@ -239,7 +270,17 @@ async fn dispatch(State(state): State<AppState>, req: Request) -> Result<Respons
     let (parts, body) = req.into_parts();
     let body = axum::body::to_bytes(body, MAX_BODY_BYTES)
         .await
-        .map_err(|e| ApiError::Serialization(format!("body read failed: {e}")))?;
+        .map_err(|e| {
+            // Client cut the connection, exceeded MAX_BODY_BYTES, or
+            // an upstream proxy misbehaved. Warn-level — operator
+            // wants to see frequency in case a client regresses.
+            tracing::warn!(
+                error = %e,
+                max_body_bytes = MAX_BODY_BYTES,
+                "request body read failed"
+            );
+            ApiError::Serialization(format!("body read failed: {e}"))
+        })?;
 
     // 1. Verify the request. PermissiveVerifier is the MVP impl — see
     //    rekt-sigv4. We do this before peeking at any body content so the
@@ -275,8 +316,7 @@ async fn dispatch(State(state): State<AppState>, req: Request) -> Result<Respons
 
 #[tracing::instrument(level = "debug", skip_all, name = "server.put_item", fields(table = tracing::field::Empty))]
 async fn handle_put_item(state: &AppState, body: &Bytes) -> Result<Response, ApiError> {
-    let req: PutItemRequest = serde_json::from_slice(body)
-        .map_err(|e| ApiError::Serialization(format!("invalid PutItem body: {e}")))?;
+    let req: PutItemRequest = parse_request(body, "PutItem")?;
     tracing::Span::current().record("table", req.table_name.as_str());
 
     let schema = state.schemas.get(&req.table_name).ok_or_else(|| {
@@ -347,8 +387,7 @@ fn put_delete_attributes(
 
 #[tracing::instrument(level = "debug", skip_all, name = "server.get_item", fields(table = tracing::field::Empty))]
 async fn handle_get_item(state: &AppState, body: &Bytes) -> Result<Response, ApiError> {
-    let req: GetItemRequest = serde_json::from_slice(body)
-        .map_err(|e| ApiError::Serialization(format!("invalid GetItem body: {e}")))?;
+    let req: GetItemRequest = parse_request(body, "GetItem")?;
     tracing::Span::current().record("table", req.table_name.as_str());
 
     let schema = state.schemas.get(&req.table_name).ok_or_else(|| {
@@ -374,8 +413,7 @@ async fn handle_get_item(state: &AppState, body: &Bytes) -> Result<Response, Api
 
 #[tracing::instrument(level = "debug", skip_all, name = "server.delete_item", fields(table = tracing::field::Empty))]
 async fn handle_delete_item(state: &AppState, body: &Bytes) -> Result<Response, ApiError> {
-    let req: DeleteItemRequest = serde_json::from_slice(body)
-        .map_err(|e| ApiError::Serialization(format!("invalid DeleteItem body: {e}")))?;
+    let req: DeleteItemRequest = parse_request(body, "DeleteItem")?;
     tracing::Span::current().record("table", req.table_name.as_str());
 
     let schema = state.schemas.get(&req.table_name).ok_or_else(|| {
@@ -409,8 +447,7 @@ async fn handle_delete_item(state: &AppState, body: &Bytes) -> Result<Response, 
 
 #[tracing::instrument(level = "debug", skip_all, name = "server.update_item", fields(table = tracing::field::Empty))]
 async fn handle_update_item(state: &AppState, body: &Bytes) -> Result<Response, ApiError> {
-    let req: UpdateItemRequest = serde_json::from_slice(body)
-        .map_err(|e| ApiError::Serialization(format!("invalid UpdateItem body: {e}")))?;
+    let req: UpdateItemRequest = parse_request(body, "UpdateItem")?;
     tracing::Span::current().record("table", req.table_name.as_str());
 
     let schema = state.schemas.get(&req.table_name).ok_or_else(|| {
@@ -512,8 +549,7 @@ async fn handle_update_item(state: &AppState, body: &Bytes) -> Result<Response, 
     fields(table = tracing::field::Empty, consistent_read = tracing::field::Empty)
 )]
 async fn handle_query(state: &AppState, body: &Bytes) -> Result<Response, ApiError> {
-    let req: QueryRequest = serde_json::from_slice(body)
-        .map_err(|e| ApiError::Serialization(format!("invalid Query body: {e}")))?;
+    let req: QueryRequest = parse_request(body, "Query")?;
     tracing::Span::current().record("table", req.table_name.as_str());
     // ConsistentRead is silently honored — PG's snapshot isolation is
     // already at least as strong as DDB's strongly-consistent mode for
@@ -631,8 +667,7 @@ fn prune_to_projection(
     fields(table = tracing::field::Empty, consistent_read = tracing::field::Empty)
 )]
 async fn handle_scan(state: &AppState, body: &Bytes) -> Result<Response, ApiError> {
-    let req: ScanRequest = serde_json::from_slice(body)
-        .map_err(|e| ApiError::Serialization(format!("invalid Scan body: {e}")))?;
+    let req: ScanRequest = parse_request(body, "Scan")?;
     tracing::Span::current().record("table", req.table_name.as_str());
     if let Some(cr) = req.consistent_read {
         tracing::Span::current().record("consistent_read", cr);
@@ -688,9 +723,7 @@ async fn handle_scan(state: &AppState, body: &Bytes) -> Result<Response, ApiErro
     fields(tables = tracing::field::Empty, total_keys = tracing::field::Empty)
 )]
 async fn handle_batch_get_item(state: &AppState, body: &Bytes) -> Result<Response, ApiError> {
-    let req: BatchGetItemRequest = serde_json::from_slice(body).map_err(|e| {
-        ApiError::Serialization(format!("invalid BatchGetItem body: {e}"))
-    })?;
+    let req: BatchGetItemRequest = parse_request(body, "BatchGetItem")?;
 
     let plan = translate_batch_get_item(
         &req,
@@ -760,9 +793,7 @@ async fn handle_batch_get_item(state: &AppState, body: &Bytes) -> Result<Respons
     fields(tables = tracing::field::Empty, total_ops = tracing::field::Empty)
 )]
 async fn handle_batch_write_item(state: &AppState, body: &Bytes) -> Result<Response, ApiError> {
-    let req: BatchWriteItemRequest = serde_json::from_slice(body).map_err(|e| {
-        ApiError::Serialization(format!("invalid BatchWriteItem body: {e}"))
-    })?;
+    let req: BatchWriteItemRequest = parse_request(body, "BatchWriteItem")?;
 
     let plan = translate_batch_write_item(
         &req,
