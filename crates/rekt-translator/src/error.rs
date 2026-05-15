@@ -180,6 +180,23 @@ pub enum TranslateError {
         expected: rekt_storage::KeyType,
         got: &'static str,
     },
+
+    /// Caller-supplied `Limit` was 0 or above rektifier's per-call cap
+    /// (1000). DDB's real cap is 1 MB per page (variable item count);
+    /// see `COMPATIBILITY_NOTES.md`.
+    #[error("Invalid Limit: {got} (must be 1..=1000)")]
+    InvalidLimit { got: u32 },
+
+    /// `ExclusiveStartKey` couldn't be decoded as a valid cursor for
+    /// this table — missing/extra attrs, wrong types, etc.
+    #[error("Invalid ExclusiveStartKey: {reason}")]
+    InvalidExclusiveStartKey { reason: String },
+
+    /// `ExclusiveStartKey` carries a partition key that doesn't match
+    /// the query's PK. DDB requires the cursor to belong to the
+    /// queried partition.
+    #[error("ExclusiveStartKey partition key `{attr}` does not match the Query's KeyConditionExpression PK")]
+    ExclusiveStartKeyPkMismatch { attr: String },
 }
 
 impl From<ParseError> for TranslateError {

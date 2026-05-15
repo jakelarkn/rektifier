@@ -2607,3 +2607,124 @@ fn diff_query_unknown_table_both_reject() {
         "rektifier error mention: {stderr_ours}"
     );
 }
+
+// ===== Query Q2: Limit + ExclusiveStartKey / LastEvaluatedKey ==============
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_limit_sets_lek() {
+    ensure_device_events_table();
+    let pk = "diff-q-lek";
+    for ts in ["1", "2", "3", "4", "5"] {
+        let item = format!(
+            "{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"{ts}\"}},\"val\":{{\"N\":\"{ts}\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+    }
+
+    let q_ref = aws(REF, &[
+        "dynamodb","query","--table-name","device_events",
+        "--key-condition-expression","device_id = :pk",
+        "--expression-attribute-values", &format!("{{\":pk\":{{\"S\":\"{pk}\"}}}}"),
+        "--limit","2",
+    ]);
+    let q_ours = aws(OURS, &[
+        "dynamodb","query","--table-name","device_events",
+        "--key-condition-expression","device_id = :pk",
+        "--expression-attribute-values", &format!("{{\":pk\":{{\"S\":\"{pk}\"}}}}"),
+        "--limit","2",
+    ]);
+    assert_eq!(q_ref["Count"], q_ours["Count"], "Count diverged\nref: {q_ref}\nours: {q_ours}");
+    assert_eq!(q_ref["Items"], q_ours["Items"], "Items diverged\nref: {q_ref}\nours: {q_ours}");
+    assert_eq!(
+        q_ref["LastEvaluatedKey"], q_ours["LastEvaluatedKey"],
+        "LEK diverged\nref: {q_ref}\nours: {q_ours}"
+    );
+
+    for ts in ["1","2","3","4","5"] {
+        delete_both_composite("device_events", "device_id", pk, "ts", &format!("{{\"N\":\"{ts}\"}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_multi_page_traversal() {
+    ensure_device_events_table();
+    let pk = "diff-q-page";
+    for ts in 1..=9 {
+        let item = format!(
+            "{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"{ts}\"}},\"val\":{{\"N\":\"{ts}\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+    }
+
+    // Walk both endpoints in lockstep with L=3; both should yield the same
+    // Items in the same order and the same LEK at each step.
+    let mut esk: Option<Value> = None;
+    for page in 1..=5 {
+        let mut common: Vec<String> = vec![
+            "dynamodb".into(), "query".into(),
+            "--table-name".into(), "device_events".into(),
+            "--key-condition-expression".into(), "device_id = :pk".into(),
+            "--expression-attribute-values".into(),
+            format!("{{\":pk\":{{\"S\":\"{pk}\"}}}}"),
+            "--limit".into(), "3".into(),
+        ];
+        if let Some(e) = &esk {
+            common.push("--exclusive-start-key".into());
+            common.push(e.to_string());
+        }
+        let args: Vec<&str> = common.iter().map(String::as_str).collect();
+        let q_ref = aws(REF, &args);
+        let q_ours = aws(OURS, &args);
+        assert_eq!(q_ref["Items"], q_ours["Items"], "page {page} Items diverged");
+        assert_eq!(q_ref["LastEvaluatedKey"], q_ours["LastEvaluatedKey"], "page {page} LEK diverged");
+        match q_ref.get("LastEvaluatedKey") {
+            Some(lek) if !lek.is_null() => esk = Some(lek.clone()),
+            _ => break,
+        }
+        if page == 5 {
+            panic!("pagination didn't terminate");
+        }
+    }
+
+    for ts in 1..=9 {
+        delete_both_composite("device_events", "device_id", pk, "ts", &format!("{{\"N\":\"{ts}\"}}"));
+    }
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_query_last_page_no_lek() {
+    ensure_device_events_table();
+    let pk = "diff-q-lastpg";
+    for ts in ["1", "2", "3"] {
+        let item = format!(
+            "{{\"device_id\":{{\"S\":\"{pk}\"}},\"ts\":{{\"N\":\"{ts}\"}},\"val\":{{\"S\":\"x\"}}}}"
+        );
+        let _ = aws(REF, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+        let _ = aws(OURS, &["dynamodb","put-item","--table-name","device_events","--item",&item]);
+    }
+    let q_ref = aws(REF, &[
+        "dynamodb","query","--table-name","device_events",
+        "--key-condition-expression","device_id = :pk",
+        "--expression-attribute-values", &format!("{{\":pk\":{{\"S\":\"{pk}\"}}}}"),
+        "--limit","10",
+    ]);
+    let q_ours = aws(OURS, &[
+        "dynamodb","query","--table-name","device_events",
+        "--key-condition-expression","device_id = :pk",
+        "--expression-attribute-values", &format!("{{\":pk\":{{\"S\":\"{pk}\"}}}}"),
+        "--limit","10",
+    ]);
+    assert_eq!(q_ref["Count"], q_ours["Count"]);
+    assert_eq!(q_ref["Items"], q_ours["Items"]);
+    assert!(q_ref.get("LastEvaluatedKey").is_none(), "ref had LEK on last page");
+    assert!(q_ours.get("LastEvaluatedKey").is_none(), "ours had LEK on last page");
+
+    for ts in ["1","2","3"] {
+        delete_both_composite("device_events", "device_id", pk, "ts", &format!("{{\"N\":\"{ts}\"}}"));
+    }
+}

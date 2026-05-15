@@ -124,12 +124,17 @@ pub fn touched_paths(expr: &UpdateExpression) -> std::collections::BTreeSet<Stri
 ///
 /// `pk` is the resolved partition-key value (KCE always pins exactly
 /// one partition via `pk = :v`). `sk_condition` is the optional sort-
-/// key predicate. Q1 stops here; Q2/Q3/Q5 will add `limit`,
-/// `exclusive_start_key`, `filter`, and `forward` fields.
+/// key predicate. `limit` is the caller's per-call cap (Q2). `esk_sk`
+/// is the sort-key half of the `ExclusiveStartKey` cursor; the PK half
+/// is `pk` (translator-enforced equality with the query PK) so we only
+/// carry the SK component through to storage. Q3 adds `filter`, Q5
+/// adds `forward`.
 #[derive(Debug, Clone)]
 pub struct QueryPlan {
     pub pk: KeyValue,
     pub sk_condition: Option<SkCondition>,
+    pub limit: Option<u32>,
+    pub esk_sk: Option<KeyValue>,
 }
 
 #[derive(Debug, Clone)]

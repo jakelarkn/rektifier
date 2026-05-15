@@ -9,6 +9,7 @@ use crate::classify::classify_condition;
 use crate::error::{map_substitute_for_condition, TranslateError};
 use crate::key_condition::extract_key_condition;
 use crate::keys::{extract_key, reject_extra_key_attrs, KeyRole};
+use crate::paging::{decode_esk, validate_limit};
 use crate::plan::{
     ConditionPlan, DeleteItemPlan, GetItemPlan, PutItemPlan, QueryPlan, ReturnValuesMode,
     UpdateItemPlan,
@@ -233,9 +234,19 @@ pub fn translate_query(
         .unwrap_or(&empty_values);
     let cond = substitute_condition(raw, names, values).map_err(map_substitute_for_condition)?;
     let bounds = extract_key_condition(&cond, schema)?;
+
+    let limit = req.limit.map(validate_limit).transpose()?;
+
+    let esk_sk = match &req.exclusive_start_key {
+        None => None,
+        Some(esk) => decode_esk(esk, schema, &bounds.pk)?,
+    };
+
     Ok(QueryPlan {
         pk: bounds.pk,
         sk_condition: bounds.sk_condition,
+        limit,
+        esk_sk,
     })
 }
 

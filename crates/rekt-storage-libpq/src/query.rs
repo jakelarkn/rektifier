@@ -1,31 +1,33 @@
-//! `query_raw`: bounded read over one partition.
+//! `query_raw`: bounded read over one partition with keyset pagination.
 //!
-//! SQL shape (per call; not cached because the WHERE varies with
-//! `sk_condition`):
+//! SQL shape (per call; assembled programmatically since the WHERE
+//! varies with both `sk_condition` and the presence of an
+//! `exclusive_start_key`):
 //!
 //! ```sql
 //! SELECT <jsonb_col> FROM <table>
 //!   WHERE <pk_col> = $1::<pk_type>
-//!     [ AND <sk_col> <op>      $2::<sk_type> ]      -- Eq/Lt/Le/Gt/Ge
-//!     [ AND <sk_col> BETWEEN   $2::<sk_type> AND $3::<sk_type> ]
-//!     [ AND <sk_col> LIKE      $2 || '%' ESCAPE '\\' ]  -- BeginsWithS
+//!     [ AND <sk_col> <op>      $N::<sk_type> ]      -- Eq/Lt/Le/Gt/Ge
+//!     [ AND <sk_col> BETWEEN   $N::<sk_type> AND $M::<sk_type> ]
+//!     [ AND <sk_col> LIKE      $N ESCAPE '\' ]      -- BeginsWithS
+//!     [ AND <sk_col> > $N::<sk_type> ]              -- ExclusiveStartKey
 //!   ORDER BY <sk_col> ASC
-//!   LIMIT $N
+//!   LIMIT $LAST                                     -- bound as L+1
 //! ```
 //!
 //! `LIMIT` is bound separately so the same prepared statement can serve
-//! every call; for Q1 the dispatcher applies a soft cap of 1000 when
-//! the caller doesn't supply one.
+//! every call; the dispatcher applies a soft cap of 1000 when the caller
+//! omits one (see `COMPATIBILITY_NOTES.md`). The backend reads `L+1`
+//! rows; if `L+1` came back, the L-th row's key becomes the
+//! `LastEvaluatedKey` and the sentinel is dropped before returning.
 
 use crate::types::{cast_for_keytype, map_pg_err, pg_type_for_keytype, quote_ident, Bound};
 use crate::PgBackend;
-use rekt_storage::{BackendError, KeyValue, QueryOutcome, SkCondition, TableShape};
-use tokio_postgres::types::{Json, Type};
+use bytes::Bytes;
+use rekt_storage::{BackendError, KeyType, KeyValue, QueryOutcome, SkCondition, TableShape};
+use tokio_postgres::types::{Json, ToSql, Type};
 use tracing::Instrument;
 
-/// Soft cap when no `Limit` is supplied. DDB's real cap is 1 MB per
-/// page (variable item count); we cap by item count instead. See
-/// `COMPATIBILITY_NOTES.md`.
 const DEFAULT_LIMIT: u32 = 1000;
 
 #[tracing::instrument(
@@ -40,233 +42,244 @@ pub(crate) async fn query_raw(
     pk: &KeyValue,
     sk_condition: Option<&SkCondition>,
     limit: Option<u32>,
+    exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
 ) -> Result<QueryOutcome, BackendError> {
-    // A sort-key predicate against a hash-only table is a translator-
-    // detectable bug; double-check at the storage boundary so we don't
-    // silently emit "AND NULL = $2" or similar.
     if sk_condition.is_some() && shape.sk_col.is_none() {
         return Err(BackendError::UnexpectedSortKey {
             name: shape.table.to_string(),
         });
     }
-    // Hash-only tables can be queried (PK equality with no SK predicate)
-    // — that's just a 0-or-1-row return. Composite tables can also be
-    // queried without an SK predicate (returns the whole partition).
-    // `check_sk_shape` is too strict for Query because the SK is bound
-    // via the predicate, not as a separate KeyValue.
+
+    // Hash-only Query with ESK present always returns empty + no LEK:
+    // each partition has at most one row, so "after this key" never
+    // matches anything. DDB has the same behavior. Short-circuit to
+    // skip SQL entirely.
+    if shape.sk_col.is_none() && exclusive_start_key.is_some() {
+        return Ok(QueryOutcome::default());
+    }
 
     let table = quote_ident(shape.table);
-    let pk_col = quote_ident(shape.pk_col);
+    let pk_col_q = quote_ident(shape.pk_col);
     let jsonb_col = quote_ident(shape.jsonb_col);
     let pk_cast = cast_for_keytype(shape.pk_type);
     let pk_pg = pg_type_for_keytype(shape.pk_type);
 
+    // Common per-shape values for SK construction (composite only).
+    let sk_col_q = shape.sk_col.map(quote_ident);
+    let sk_cast = shape.sk_type.map(cast_for_keytype).unwrap_or("");
+    let sk_pg = shape.sk_type.map(pg_type_for_keytype);
+
+    // ---- Assemble WHERE clauses + param-type list + param values ----
+    //
+    // `$1` is always the PK. `next_idx` advances as each subsequent
+    // clause is appended. `params` collects `&dyn ToSql` references in
+    // bind order; the underlying values are held in this function's
+    // locals (precomputed_like_pattern, etc.) so they live long enough.
+    let mut where_sql = format!("{pk_col_q} = $1{pk_cast}");
+    let mut types: Vec<Type> = vec![pk_pg];
+    let pk_bound = Bound(pk);
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&pk_bound];
+    let mut next_idx: usize = 2;
+
+    // SK condition. Build the optional Bound storage values as locals so
+    // their references can be pushed into `params` after the matcher.
+    let sk_eq_bound: Option<Bound<'_>>;
+    let sk_between_lo: Option<Bound<'_>>;
+    let sk_between_hi: Option<Bound<'_>>;
+    let sk_like_pattern: Option<String>;
+    match sk_condition {
+        None => {
+            sk_eq_bound = None;
+            sk_between_lo = None;
+            sk_between_hi = None;
+            sk_like_pattern = None;
+        }
+        Some(cond) => {
+            // Safety: validated above that sk_col is Some when sk_condition
+            // is Some; sk_pg / sk_col_q / sk_cast all aligned.
+            let sk_col = sk_col_q.as_deref().expect("sk_condition implies sk_col");
+            let sk_type = sk_pg.clone().expect("sk_condition implies sk_type");
+            match cond {
+                SkCondition::Eq(v)
+                | SkCondition::Lt(v)
+                | SkCondition::Le(v)
+                | SkCondition::Gt(v)
+                | SkCondition::Ge(v) => {
+                    let op = match cond {
+                        SkCondition::Eq(_) => "=",
+                        SkCondition::Lt(_) => "<",
+                        SkCondition::Le(_) => "<=",
+                        SkCondition::Gt(_) => ">",
+                        SkCondition::Ge(_) => ">=",
+                        _ => unreachable!(),
+                    };
+                    where_sql.push_str(&format!(
+                        " AND {sk_col} {op} ${next_idx}{sk_cast}"
+                    ));
+                    types.push(sk_type);
+                    sk_eq_bound = Some(Bound(v));
+                    sk_between_lo = None;
+                    sk_between_hi = None;
+                    sk_like_pattern = None;
+                    next_idx += 1;
+                }
+                SkCondition::Between(lo, hi) => {
+                    where_sql.push_str(&format!(
+                        " AND {sk_col} BETWEEN ${next_idx}{sk_cast} AND ${}{sk_cast}",
+                        next_idx + 1
+                    ));
+                    types.push(sk_type.clone());
+                    types.push(sk_type);
+                    sk_eq_bound = None;
+                    sk_between_lo = Some(Bound(lo));
+                    sk_between_hi = Some(Bound(hi));
+                    sk_like_pattern = None;
+                    next_idx += 2;
+                }
+                SkCondition::BeginsWithS(prefix) => {
+                    where_sql.push_str(&format!(
+                        " AND {sk_col} LIKE ${next_idx} ESCAPE '\\'"
+                    ));
+                    types.push(Type::TEXT);
+                    sk_eq_bound = None;
+                    sk_between_lo = None;
+                    sk_between_hi = None;
+                    sk_like_pattern = Some(format!("{}%", escape_like(prefix)));
+                    next_idx += 1;
+                }
+            }
+        }
+    }
+    if let Some(b) = sk_eq_bound.as_ref() {
+        params.push(b);
+    }
+    if let (Some(lo), Some(hi)) = (sk_between_lo.as_ref(), sk_between_hi.as_ref()) {
+        params.push(lo);
+        params.push(hi);
+    }
+    if let Some(pat) = sk_like_pattern.as_ref() {
+        params.push(pat);
+    }
+
+    // ExclusiveStartKey (composite tables only; hash-only short-
+    // circuited above). For forward order, we want rows strictly
+    // greater than the ESK's sk component. The ESK's pk is required to
+    // equal the query pk in v1 (translator-enforced); we don't re-bind
+    // it here since the PK equality is already in the WHERE.
+    let esk_sk_bound: Option<Bound<'_>>;
+    match exclusive_start_key {
+        None => {
+            esk_sk_bound = None;
+        }
+        Some((_esk_pk, Some(esk_sk))) => {
+            let sk_col = sk_col_q.as_deref().expect("ESK with composite");
+            let sk_type = sk_pg.clone().expect("ESK with composite");
+            where_sql.push_str(&format!(" AND {sk_col} > ${next_idx}{sk_cast}"));
+            types.push(sk_type);
+            esk_sk_bound = Some(Bound(esk_sk));
+            next_idx += 1;
+        }
+        Some((_, None)) => {
+            // Composite shape but ESK missing sk component is a
+            // translator-layer bug; treat as no ESK.
+            esk_sk_bound = None;
+        }
+    }
+    if let Some(b) = esk_sk_bound.as_ref() {
+        params.push(b);
+    }
+
+    // LIMIT (always last). Bind as L+1 so we can detect "more remain"
+    // by counting returned rows.
+    let lim_input = limit.unwrap_or(DEFAULT_LIMIT);
+    let lim_plus_one = (lim_input as i64).saturating_add(1);
     let order_by = match shape.sk_col {
         Some(sk_col) => format!(" ORDER BY {} ASC", quote_ident(sk_col)),
         None => String::new(),
     };
+    types.push(Type::INT8);
+    params.push(&lim_plus_one);
 
-    let lim = limit.unwrap_or(DEFAULT_LIMIT) as i64;
+    let sql = format!(
+        "SELECT {jsonb_col} FROM {table} WHERE {where_sql}{order_by} LIMIT ${next_idx}"
+    );
 
-    // Build the SQL fragment for the SK predicate, the parameter types,
-    // and the bound parameters in lockstep. `$1` is always the PK; `$N`
-    // for the SK operands; `${N+1}` is the LIMIT. Doing this in one pass
-    // keeps the param numbering stable.
-    //
-    // We bind LIMIT through a parameter (not a literal in the SQL) so
-    // tokio-postgres can cache the prepared statement across distinct
-    // limit values.
-    enum SkBuild<'a> {
-        None,
-        Cmp {
-            sk_col: String,
-            op: &'static str,
-            sk_cast: &'static str,
-            sk_type: Type,
-            value: Bound<'a>,
-        },
-        Between {
-            sk_col: String,
-            sk_cast: &'static str,
-            sk_type: Type,
-            lo: Bound<'a>,
-            hi: Bound<'a>,
-        },
-        BeginsWith {
-            sk_col: String,
-            prefix: &'a str,
-        },
-    }
-
-    let sk_build = match (shape.sk_col, shape.sk_type, sk_condition) {
-        (_, _, None) => SkBuild::None,
-        (Some(sk_col_name), Some(sk_type), Some(cond)) => {
-            let sk_col = quote_ident(sk_col_name);
-            let sk_cast = cast_for_keytype(sk_type);
-            let sk_pg = pg_type_for_keytype(sk_type);
-            match cond {
-                SkCondition::Eq(v) => SkBuild::Cmp {
-                    sk_col,
-                    op: "=",
-                    sk_cast,
-                    sk_type: sk_pg,
-                    value: Bound(v),
-                },
-                SkCondition::Lt(v) => SkBuild::Cmp {
-                    sk_col,
-                    op: "<",
-                    sk_cast,
-                    sk_type: sk_pg,
-                    value: Bound(v),
-                },
-                SkCondition::Le(v) => SkBuild::Cmp {
-                    sk_col,
-                    op: "<=",
-                    sk_cast,
-                    sk_type: sk_pg,
-                    value: Bound(v),
-                },
-                SkCondition::Gt(v) => SkBuild::Cmp {
-                    sk_col,
-                    op: ">",
-                    sk_cast,
-                    sk_type: sk_pg,
-                    value: Bound(v),
-                },
-                SkCondition::Ge(v) => SkBuild::Cmp {
-                    sk_col,
-                    op: ">=",
-                    sk_cast,
-                    sk_type: sk_pg,
-                    value: Bound(v),
-                },
-                SkCondition::Between(lo, hi) => SkBuild::Between {
-                    sk_col,
-                    sk_cast,
-                    sk_type: sk_pg,
-                    lo: Bound(lo),
-                    hi: Bound(hi),
-                },
-                SkCondition::BeginsWithS(prefix) => SkBuild::BeginsWith {
-                    sk_col,
-                    prefix: prefix.as_str(),
-                },
-            }
-        }
-        // The two impossible cases (sk_condition Some on hash-only, or
-        // sk_col Some without sk_type) are caught above / unreachable.
-        (None, _, Some(_)) => unreachable!("sk_condition without sk_col"),
-        (Some(_), None, _) => unreachable!(
-            "TableShape `{}`: sk_col without sk_type",
-            shape.table
-        ),
-    };
-
-    // Assemble SQL, parameter types, and LIKE-escaped prefix (if any).
-    // The LIKE branch escapes `\`, `%`, `_` in the prefix so the user-
-    // supplied string is matched literally (modulo the trailing `%`).
-    let (sql, mut types): (String, Vec<Type>) = match &sk_build {
-        SkBuild::None => (
-            format!(
-                "SELECT {jsonb_col} FROM {table} \
-                 WHERE {pk_col} = $1{pk_cast}{order_by} LIMIT $2"
-            ),
-            vec![pk_pg, Type::INT8],
-        ),
-        SkBuild::Cmp {
-            sk_col,
-            op,
-            sk_cast,
-            sk_type,
-            ..
-        } => (
-            format!(
-                "SELECT {jsonb_col} FROM {table} \
-                 WHERE {pk_col} = $1{pk_cast} AND {sk_col} {op} $2{sk_cast}{order_by} LIMIT $3"
-            ),
-            vec![pk_pg, sk_type.clone(), Type::INT8],
-        ),
-        SkBuild::Between {
-            sk_col,
-            sk_cast,
-            sk_type,
-            ..
-        } => (
-            format!(
-                "SELECT {jsonb_col} FROM {table} \
-                 WHERE {pk_col} = $1{pk_cast} \
-                   AND {sk_col} BETWEEN $2{sk_cast} AND $3{sk_cast}{order_by} LIMIT $4"
-            ),
-            vec![pk_pg, sk_type.clone(), sk_type.clone(), Type::INT8],
-        ),
-        SkBuild::BeginsWith { sk_col, .. } => (
-            // ESCAPE '\' lets us use `\` to neutralize wildcard chars in
-            // the prefix. We pass the already-escaped string + a literal
-            // `%` suffix as a single TEXT parameter.
-            format!(
-                "SELECT {jsonb_col} FROM {table} \
-                 WHERE {pk_col} = $1{pk_cast} AND {sk_col} LIKE $2 ESCAPE '\\'{order_by} LIMIT $3"
-            ),
-            vec![pk_pg, Type::TEXT, Type::INT8],
-        ),
-    };
-    // ensure pk_pg is unused warning quieted — already used in types.
-    let _ = &mut types;
-
+    // ---- Execute ----
     let client = backend.client().await?;
     let stmt = client
         .prepare_typed_cached(&sql, &types)
         .instrument(tracing::debug_span!("pg.prepare"))
         .await
         .map_err(|e| map_pg_err(shape.table, e))?;
+    let rows = client
+        .query(&stmt, &params)
+        .instrument(tracing::debug_span!("pg.query"))
+        .await
+        .map_err(|e| map_pg_err(shape.table, e))?;
 
-    let pk_bound = Bound(pk);
-    let like_pattern: Option<String> = match &sk_build {
-        SkBuild::BeginsWith { prefix, .. } => Some(format!("{}%", escape_like(prefix))),
-        _ => None,
-    };
-
-    let rows = match &sk_build {
-        SkBuild::None => {
-            client
-                .query(&stmt, &[&pk_bound, &lim])
-                .instrument(tracing::debug_span!("pg.query"))
-                .await
-        }
-        SkBuild::Cmp { value, .. } => {
-            client
-                .query(&stmt, &[&pk_bound, value, &lim])
-                .instrument(tracing::debug_span!("pg.query"))
-                .await
-        }
-        SkBuild::Between { lo, hi, .. } => {
-            client
-                .query(&stmt, &[&pk_bound, lo, hi, &lim])
-                .instrument(tracing::debug_span!("pg.query"))
-                .await
-        }
-        SkBuild::BeginsWith { .. } => {
-            let pat = like_pattern.as_deref().expect("BeginsWith built above");
-            client
-                .query(&stmt, &[&pk_bound, &pat, &lim])
-                .instrument(tracing::debug_span!("pg.query"))
-                .await
-        }
-    }
-    .map_err(|e| map_pg_err(shape.table, e))?;
-
+    // ---- Decode + apply L+1 sentinel ----
     let mut items: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
-    for row in rows {
+    for row in &rows {
         let Json(v): Json<serde_json::Value> = row.get(0);
         items.push(v);
     }
+    let has_more = items.len() as i64 == lim_plus_one;
+    let last_evaluated_key = if has_more {
+        // Drop the sentinel; the L-th row's key becomes the LEK.
+        items.truncate(lim_input as usize);
+        items
+            .last()
+            .and_then(|row| lek_from_row(row, shape))
+    } else {
+        None
+    };
     let scanned = items.len() as u32;
     Ok(QueryOutcome {
         count: scanned,
         scanned_count: scanned,
         items,
-        last_evaluated_key: None,
+        last_evaluated_key,
     })
+}
+
+/// Pull `(pk, Option<sk>)` out of a stored row's DDB-JSON so the
+/// caller can re-encode it as `LastEvaluatedKey`.
+fn lek_from_row(
+    row: &serde_json::Value,
+    shape: &TableShape<'_>,
+) -> Option<(KeyValue, Option<KeyValue>)> {
+    let pk = extract_key_from_jsonb(row, shape.pk_col, shape.pk_type)?;
+    let sk = match (shape.sk_col, shape.sk_type) {
+        (Some(col), Some(ty)) => Some(extract_key_from_jsonb(row, col, ty)?),
+        _ => None,
+    };
+    Some((pk, sk))
+}
+
+fn extract_key_from_jsonb(
+    row: &serde_json::Value,
+    attr: &str,
+    ty: KeyType,
+) -> Option<KeyValue> {
+    let tagged = row.get(attr)?;
+    match ty {
+        KeyType::S => tagged
+            .get("S")?
+            .as_str()
+            .map(|s| KeyValue::S(s.to_string())),
+        KeyType::N => tagged
+            .get("N")?
+            .as_str()
+            .map(|s| KeyValue::N(s.to_string())),
+        KeyType::B => {
+            use base64::Engine;
+            let s = tagged.get("B")?.as_str()?;
+            base64::engine::general_purpose::STANDARD
+                .decode(s)
+                .ok()
+                .map(|b| KeyValue::B(Bytes::from(b)))
+        }
+    }
 }
 
 /// Escape SQL `LIKE` wildcards in a literal prefix so the resulting

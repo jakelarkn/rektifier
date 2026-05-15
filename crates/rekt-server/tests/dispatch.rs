@@ -299,37 +299,61 @@ impl Backend for MockBackend {
         pk: &KeyValue,
         sk_condition: Option<&SkCondition>,
         limit: Option<u32>,
+        exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
     ) -> Result<QueryOutcome, BackendError> {
         let pk_value = kv_to_string(pk);
-        let store = self.store.lock().unwrap();
 
-        // Collect (sk_string, item) for every row in the partition,
-        // filtered by the SK predicate. The mock's keyspace is a flat
-        // HashMap, so we scan it and select rows whose (table, pk)
-        // matches.
+        // Hash-only Query with ESK: short-circuit to empty (matches DDB
+        // and PgBackend behavior).
+        if shape.sk_col.is_none() && exclusive_start_key.is_some() {
+            return Ok(QueryOutcome::default());
+        }
+
+        let store = self.store.lock().unwrap();
         let mut hits: Vec<(String, serde_json::Value)> = store
             .iter()
             .filter(|((t, p, _sk), _)| t == shape.table && p == &pk_value)
             .filter(|((_, _, sk), _)| match (sk_condition, shape.sk_type) {
                 (None, _) => true,
                 (Some(cond), Some(sk_type)) => sk_predicate(cond, sk, sk_type),
-                // sk_condition Some on a hash-only table is rejected at
-                // the storage boundary; we shouldn't see it here.
                 (Some(_), None) => false,
             })
             .map(|((_, _, sk), v)| (sk.clone(), v.clone()))
             .collect();
 
-        // Sort by SK in ascending order. Numeric comparison for N keys,
-        // lexical for S/B. The mock has no B-SK tests today.
         if let Some(sk_type) = shape.sk_type {
             hits.sort_by(|a, b| compare_sk_strings(&a.0, &b.0, sk_type));
         }
 
+        // Apply ESK: keep rows strictly greater than esk_sk.
+        if let Some((_, Some(esk_sk))) = exclusive_start_key {
+            if let Some(sk_type) = shape.sk_type {
+                let cutoff = kv_to_string(esk_sk);
+                hits.retain(|(sk, _)| {
+                    compare_sk_strings(sk, &cutoff, sk_type) == std::cmp::Ordering::Greater
+                });
+            }
+        }
+
         let lim = limit.unwrap_or(1000) as usize;
-        if hits.len() > lim {
+        let has_more = hits.len() > lim;
+        if has_more {
             hits.truncate(lim);
         }
+
+        let last_evaluated_key = if has_more {
+            hits.last().map(|(sk_str, _)| {
+                let sk_kv = shape.sk_type.map(|t| match t {
+                    KeyType::S => KeyValue::S(sk_str.clone()),
+                    KeyType::N => KeyValue::N(sk_str.clone()),
+                    // B-SK paging isn't exercised in the mock today.
+                    KeyType::B => KeyValue::S(sk_str.clone()),
+                });
+                (pk.clone(), sk_kv)
+            })
+        } else {
+            None
+        };
 
         let items: Vec<serde_json::Value> = hits.into_iter().map(|(_, v)| v).collect();
         let n = items.len() as u32;
@@ -337,7 +361,7 @@ impl Backend for MockBackend {
             items,
             count: n,
             scanned_count: n,
-            last_evaluated_key: None,
+            last_evaluated_key,
         })
     }
 
@@ -3180,4 +3204,224 @@ async fn query_placeholders_substitute() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
     assert_eq!(body["Count"], 1);
+}
+
+// ===== Query Q2: Limit + ExclusiveStartKey / LastEvaluatedKey ==============
+
+#[tokio::test]
+async fn query_limit_truncates_and_sets_lek() {
+    let app = app();
+    for ts in 1..=5 {
+        put_item(
+            &app,
+            "device_events",
+            json!({
+                "device_id":{"S":"q-lim-1"},
+                "ts":{"N":ts.to_string()},
+                "val":{"N":ts.to_string()}
+            }),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName":"device_events",
+                "KeyConditionExpression":"device_id = :pk",
+                "ExpressionAttributeValues":{":pk":{"S":"q-lim-1"}},
+                "Limit": 2
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["Count"], 2);
+    let ts: Vec<&str> = body["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["ts"]["N"].as_str().unwrap())
+        .collect();
+    assert_eq!(ts, vec!["1", "2"]);
+    // Limit < partition size → LEK present, equal to the last returned key.
+    assert_eq!(
+        body["LastEvaluatedKey"],
+        json!({"device_id":{"S":"q-lim-1"},"ts":{"N":"2"}})
+    );
+}
+
+#[tokio::test]
+async fn query_last_page_no_lek() {
+    let app = app();
+    for ts in 1..=3 {
+        put_item(
+            &app,
+            "device_events",
+            json!({
+                "device_id":{"S":"q-lastpg"},
+                "ts":{"N":ts.to_string()},
+                "val":{"N":"x"}
+            }),
+        )
+        .await;
+    }
+    // Limit > partition size → no LEK in response.
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName":"device_events",
+                "KeyConditionExpression":"device_id = :pk",
+                "ExpressionAttributeValues":{":pk":{"S":"q-lastpg"}},
+                "Limit": 10
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["Count"], 3);
+    assert!(body.get("LastEvaluatedKey").is_none());
+}
+
+#[tokio::test]
+async fn query_multi_page_traversal_reassembles() {
+    let app = app();
+    for ts in 1..=10 {
+        put_item(
+            &app,
+            "device_events",
+            json!({
+                "device_id":{"S":"q-page"},
+                "ts":{"N":ts.to_string()},
+                "val":{"N":ts.to_string()}
+            }),
+        )
+        .await;
+    }
+
+    // Page through L=3 at a time; collect all items + assert order.
+    let mut all_ts: Vec<String> = Vec::new();
+    let mut esk: Option<Value> = None;
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        if pages > 10 {
+            panic!("pagination didn't terminate");
+        }
+        let mut body_in = json!({
+            "TableName":"device_events",
+            "KeyConditionExpression":"device_id = :pk",
+            "ExpressionAttributeValues":{":pk":{"S":"q-page"}},
+            "Limit": 3
+        });
+        if let Some(e) = &esk {
+            body_in["ExclusiveStartKey"] = e.clone();
+        }
+        let resp = app
+            .clone()
+            .oneshot(ddb_request("Query", body_in))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        for item in body["Items"].as_array().unwrap() {
+            all_ts.push(item["ts"]["N"].as_str().unwrap().to_string());
+        }
+        match body.get("LastEvaluatedKey") {
+            Some(lek) if !lek.is_null() => esk = Some(lek.clone()),
+            _ => break,
+        }
+    }
+    assert_eq!(
+        all_ts,
+        (1..=10).map(|n| n.to_string()).collect::<Vec<_>>()
+    );
+    assert!(pages >= 4, "expected at least 4 pages for L=3 over 10 items, got {pages}");
+}
+
+#[tokio::test]
+async fn query_limit_one_single_row_page() {
+    let app = app();
+    for ts in 1..=3 {
+        put_item(
+            &app,
+            "device_events",
+            json!({
+                "device_id":{"S":"q-l1"},
+                "ts":{"N":ts.to_string()},
+                "val":{"N":"x"}
+            }),
+        )
+        .await;
+    }
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName":"device_events",
+                "KeyConditionExpression":"device_id = :pk",
+                "ExpressionAttributeValues":{":pk":{"S":"q-l1"}},
+                "Limit": 1
+            }),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["Count"], 1);
+    assert_eq!(body["Items"][0]["ts"]["N"], "1");
+    assert_eq!(
+        body["LastEvaluatedKey"],
+        json!({"device_id":{"S":"q-l1"},"ts":{"N":"1"}})
+    );
+}
+
+#[tokio::test]
+async fn query_invalid_limit_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName":"device_events",
+                "KeyConditionExpression":"device_id = :pk",
+                "ExpressionAttributeValues":{":pk":{"S":"q-bad-limit"}},
+                "Limit": 0
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body
+        .get("__type")
+        .and_then(Value::as_str)
+        .unwrap()
+        .ends_with("#ValidationException"));
+}
+
+#[tokio::test]
+async fn query_invalid_esk_pk_mismatch_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName":"device_events",
+                "KeyConditionExpression":"device_id = :pk",
+                "ExpressionAttributeValues":{":pk":{"S":"q-mismatch"}},
+                "ExclusiveStartKey":{
+                    "device_id":{"S":"q-OTHER"},
+                    "ts":{"N":"1"}
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body
+        .get("__type")
+        .and_then(Value::as_str)
+        .unwrap()
+        .ends_with("#ValidationException"));
 }

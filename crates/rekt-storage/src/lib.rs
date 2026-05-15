@@ -313,22 +313,25 @@ pub trait Backend: Send + Sync + 'static {
     /// Query — bounded read over a single partition.
     ///
     /// Emits a `SELECT … FROM <table> WHERE pk_col = $1 [AND <sk-cond>]
-    /// ORDER BY sk_col ASC LIMIT $L` against the table's indexed key
-    /// columns. `pk` always equality-matches; `sk_condition` (when set)
-    /// adds the SK predicate. `limit` is the server's per-call cap (the
-    /// dispatcher applies a soft default of 1000 — see
-    /// `COMPATIBILITY_NOTES.md`).
+    /// [AND <sk-col> > <esk-sk>] ORDER BY sk_col ASC LIMIT $L+1`
+    /// against the table's indexed key columns. `pk` always
+    /// equality-matches; `sk_condition` (when set) adds the SK
+    /// predicate. `exclusive_start_key` (when set) adds a keyset-
+    /// pagination predicate (`sk > esk_sk` for forward order in v1; Q5
+    /// will add descending).
     ///
-    /// Q1 returns every matching row in `items`; `count` and
-    /// `scanned_count` are equal (Q3 will split them when
-    /// FilterExpression evaluates per row). `last_evaluated_key` is
-    /// always `None` in Q1 (Q2 will populate it for pagination).
+    /// The backend reads `limit + 1` rows; if `limit + 1` came back, it
+    /// drops the sentinel, populates `last_evaluated_key` from the
+    /// L-th row's keys, and the caller passes that back as the next
+    /// ESK. `count` and `scanned_count` are equal until Q3 adds
+    /// FilterExpression.
     async fn query_raw(
         &self,
         shape: &TableShape<'_>,
         pk: &KeyValue,
         sk_condition: Option<&SkCondition>,
         limit: Option<u32>,
+        exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
     ) -> Result<QueryOutcome, BackendError>;
 }
 

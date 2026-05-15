@@ -11,6 +11,7 @@ rekt-storage = { path = "../rekt-storage" }
 rekt-expressions = { path = "../rekt-expressions" }
 rekt-protocol = { path = "../rekt-protocol" }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 deadpool-postgres = { workspace = true }
 tokio-postgres = { workspace = true }
@@ -19,5 +20,4 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 rekt-translator = { path = "../rekt-translator" }
-base64 = { workspace = true }
 tokio = { workspace = true }

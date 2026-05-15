@@ -30,9 +30,12 @@ pub mod error;
 mod key_condition;
 mod keys;
 pub mod materialize;
+mod paging;
 pub mod plan;
 pub mod schema;
 pub mod translate;
+
+pub use paging::encode_lek;
 
 // Public re-exports so external callers can `use rekt_translator::X;`
 // for any of the headline types without knowing the submodule layout.
@@ -1522,6 +1525,8 @@ mod tests {
                 )
             },
             consistent_read: None,
+            limit: None,
+            exclusive_start_key: None,
         }
     }
 
@@ -1779,5 +1784,173 @@ mod tests {
             plan.sk_condition,
             Some(SkCondition::BeginsWithS(ref s)) if s == "2026-"
         ));
+    }
+
+    // ============================================================
+    // translate_query Q2 — Limit + ExclusiveStartKey
+    // ============================================================
+
+    #[test]
+    fn query_limit_carried_into_plan() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        req.limit = Some(50);
+        let plan = translate_query(&req, &schema_hash_s()).unwrap();
+        assert_eq!(plan.limit, Some(50));
+    }
+
+    #[test]
+    fn query_limit_zero_rejected() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        req.limit = Some(0);
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(err, TranslateError::InvalidLimit { got: 0 }));
+    }
+
+    #[test]
+    fn query_limit_above_cap_rejected() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        req.limit = Some(1001);
+        let err = translate_query(&req, &schema_hash_s()).unwrap_err();
+        assert!(matches!(err, TranslateError::InvalidLimit { got: 1001 }));
+    }
+
+    #[test]
+    fn query_esk_carries_sk_for_composite() {
+        let mut req = query_req(
+            "events",
+            "device_id = :pk",
+            &[(":pk", AttributeValue::S("dev-1".into()))],
+            &[],
+        );
+        req.exclusive_start_key = Some(item_of(&[
+            ("device_id", AttributeValue::S("dev-1".into())),
+            ("ts", AttributeValue::N("2000".into())),
+        ]));
+        let plan = translate_query(&req, &schema_composite_s_n()).unwrap();
+        assert_eq!(plan.esk_sk, Some(KeyValue::N("2000".into())));
+    }
+
+    #[test]
+    fn query_esk_hash_only_decodes_no_sk() {
+        let mut req = query_req(
+            "users",
+            "id = :pk",
+            &[(":pk", AttributeValue::S("u1".into()))],
+            &[],
+        );
+        req.exclusive_start_key =
+            Some(item_of(&[("id", AttributeValue::S("u1".into()))]));
+        let plan = translate_query(&req, &schema_hash_s()).unwrap();
+        assert!(plan.esk_sk.is_none());
+    }
+
+    #[test]
+    fn query_esk_missing_pk_rejected() {
+        let mut req = query_req(
+            "events",
+            "device_id = :pk",
+            &[(":pk", AttributeValue::S("dev-1".into()))],
+            &[],
+        );
+        req.exclusive_start_key =
+            Some(item_of(&[("ts", AttributeValue::N("2000".into()))]));
+        let err = translate_query(&req, &schema_composite_s_n()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::InvalidExclusiveStartKey { .. }
+        ));
+    }
+
+    #[test]
+    fn query_esk_pk_mismatch_rejected() {
+        let mut req = query_req(
+            "events",
+            "device_id = :pk",
+            &[(":pk", AttributeValue::S("dev-1".into()))],
+            &[],
+        );
+        req.exclusive_start_key = Some(item_of(&[
+            ("device_id", AttributeValue::S("dev-OTHER".into())),
+            ("ts", AttributeValue::N("2000".into())),
+        ]));
+        let err = translate_query(&req, &schema_composite_s_n()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::ExclusiveStartKeyPkMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn query_esk_extra_attr_rejected() {
+        let mut req = query_req(
+            "events",
+            "device_id = :pk",
+            &[(":pk", AttributeValue::S("dev-1".into()))],
+            &[],
+        );
+        req.exclusive_start_key = Some(item_of(&[
+            ("device_id", AttributeValue::S("dev-1".into())),
+            ("ts", AttributeValue::N("2000".into())),
+            ("rogue", AttributeValue::S("nope".into())),
+        ]));
+        let err = translate_query(&req, &schema_composite_s_n()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::InvalidExclusiveStartKey { .. }
+        ));
+    }
+
+    #[test]
+    fn query_esk_wrong_sk_type_rejected() {
+        let mut req = query_req(
+            "events",
+            "device_id = :pk",
+            &[(":pk", AttributeValue::S("dev-1".into()))],
+            &[],
+        );
+        // device_events schema expects ts: N, give it S.
+        req.exclusive_start_key = Some(item_of(&[
+            ("device_id", AttributeValue::S("dev-1".into())),
+            ("ts", AttributeValue::S("not-a-number".into())),
+        ]));
+        let err = translate_query(&req, &schema_composite_s_n()).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::InvalidExclusiveStartKey { .. }
+        ));
+    }
+
+    #[test]
+    fn query_encode_lek_round_trip() {
+        // encode_lek -> decode (via translate_query) should preserve the
+        // sk component for composite tables.
+        let pk = KeyValue::S("dev-1".into());
+        let sk = KeyValue::N("2000".into());
+        let lek = encode_lek(&pk, Some(&sk), &schema_composite_s_n());
+        // Use the LEK as the next ESK.
+        let mut req = query_req(
+            "events",
+            "device_id = :pk",
+            &[(":pk", AttributeValue::S("dev-1".into()))],
+            &[],
+        );
+        req.exclusive_start_key = Some(lek);
+        let plan = translate_query(&req, &schema_composite_s_n()).unwrap();
+        assert_eq!(plan.esk_sk, Some(KeyValue::N("2000".into())));
     }
 }

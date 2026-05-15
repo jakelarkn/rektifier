@@ -188,8 +188,17 @@ impl Backend for PgBackend {
         pk: &KeyValue,
         sk_condition: Option<&SkCondition>,
         limit: Option<u32>,
+        exclusive_start_key: Option<(&KeyValue, Option<&KeyValue>)>,
     ) -> Result<QueryOutcome, BackendError> {
-        query::query_raw(self, shape, pk, sk_condition, limit).await
+        query::query_raw(
+            self,
+            shape,
+            pk,
+            sk_condition,
+            limit,
+            exclusive_start_key,
+        )
+        .await
     }
 }
 #[cfg(test)]
@@ -2084,7 +2093,7 @@ mod tests {
         }
 
         let out = backend
-            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, None)
+            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, None, None)
             .await
             .unwrap();
         assert_eq!(out.count, 3);
@@ -2145,6 +2154,7 @@ mod tests {
                 &pk,
                 Some(&SkCondition::Eq(KeyValue::N("300".into()))),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2157,6 +2167,7 @@ mod tests {
                 &shape,
                 &pk,
                 Some(&SkCondition::Lt(KeyValue::N("300".into()))),
+                None,
                 None,
             )
             .await
@@ -2174,6 +2185,7 @@ mod tests {
                 &shape,
                 &pk,
                 Some(&SkCondition::Ge(KeyValue::N("300".into()))),
+                None,
                 None,
             )
             .await
@@ -2194,6 +2206,7 @@ mod tests {
                     KeyValue::N("200".into()),
                     KeyValue::N("400".into()),
                 )),
+                None,
                 None,
             )
             .await
@@ -2250,6 +2263,7 @@ mod tests {
                 &KeyValue::S("t-1".into()),
                 Some(&SkCondition::BeginsWithS("2026-01".into())),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2267,6 +2281,7 @@ mod tests {
                 &shape,
                 &KeyValue::S("t-1".into()),
                 Some(&SkCondition::BeginsWithS("%".into())),
+                None,
                 None,
             )
             .await
@@ -2317,7 +2332,7 @@ mod tests {
             .await;
         }
         let out = backend
-            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, Some(3))
+            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, Some(3), None)
             .await
             .unwrap();
         assert_eq!(out.count, 3);
@@ -2330,6 +2345,229 @@ mod tests {
 
         client
             .batch_execute("DROP TABLE rekt_t_q_limit;")
+            .await
+            .unwrap();
+    }
+
+    // ============================================================
+    // Q2 — Limit + ExclusiveStartKey/LastEvaluatedKey paging
+    // ============================================================
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn query_limit_sets_lek_when_more_remain() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_q_lek;
+                 CREATE TABLE rekt_t_q_lek (
+                   doc       jsonb NOT NULL,
+                   device_id text    GENERATED ALWAYS AS (doc#>>'{device_id,S}')     STORED,
+                   ts        numeric GENERATED ALWAYS AS ((doc#>>'{ts,N}')::numeric) STORED,
+                   PRIMARY KEY (device_id, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_q_lek",
+            pk_col: "device_id",
+            pk_type: KeyType::S,
+            sk_col: Some("ts"),
+            sk_type: Some(KeyType::N),
+            jsonb_col: "doc",
+        };
+        for ts in 1..=5 {
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({
+                    "device_id":{"S":"dev-1"},
+                    "ts":{"N": ts.to_string()},
+                    "val":{"N": ts.to_string()}
+                }),
+            )
+            .await;
+        }
+        let out = backend
+            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, Some(2), None)
+            .await
+            .unwrap();
+        assert_eq!(out.count, 2);
+        let ts: Vec<&str> = out
+            .items
+            .iter()
+            .map(|i| i["ts"]["N"].as_str().unwrap())
+            .collect();
+        assert_eq!(ts, vec!["1", "2"]);
+        let (lek_pk, lek_sk) = out.last_evaluated_key.expect("LEK present");
+        assert_eq!(lek_pk, KeyValue::S("dev-1".into()));
+        assert_eq!(lek_sk, Some(KeyValue::N("2".into())));
+
+        // Last page: no LEK.
+        let out = backend
+            .query_raw(&shape, &KeyValue::S("dev-1".into()), None, Some(10), None)
+            .await
+            .unwrap();
+        assert_eq!(out.count, 5);
+        assert!(out.last_evaluated_key.is_none());
+
+        client
+            .batch_execute("DROP TABLE rekt_t_q_lek;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn query_multi_page_reassembles_partition() {
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_q_page;
+                 CREATE TABLE rekt_t_q_page (
+                   doc       jsonb NOT NULL,
+                   device_id text    GENERATED ALWAYS AS (doc#>>'{device_id,S}')     STORED,
+                   ts        numeric GENERATED ALWAYS AS ((doc#>>'{ts,N}')::numeric) STORED,
+                   PRIMARY KEY (device_id, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_q_page",
+            pk_col: "device_id",
+            pk_type: KeyType::S,
+            sk_col: Some("ts"),
+            sk_type: Some(KeyType::N),
+            jsonb_col: "doc",
+        };
+        for ts in 1..=10 {
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({
+                    "device_id":{"S":"dev-1"},
+                    "ts":{"N": ts.to_string()},
+                    "val":{"N":"x"}
+                }),
+            )
+            .await;
+        }
+
+        let pk = KeyValue::S("dev-1".into());
+        let mut all_ts: Vec<String> = Vec::new();
+        let mut esk: Option<(KeyValue, Option<KeyValue>)> = None;
+        let mut iter = 0;
+        loop {
+            iter += 1;
+            assert!(iter <= 10, "pagination didn't terminate");
+            let esk_ref = esk
+                .as_ref()
+                .map(|(p, s)| (p, s.as_ref()));
+            let out = backend
+                .query_raw(&shape, &pk, None, Some(3), esk_ref)
+                .await
+                .unwrap();
+            for item in &out.items {
+                all_ts.push(item["ts"]["N"].as_str().unwrap().to_string());
+            }
+            match out.last_evaluated_key {
+                Some(next) => esk = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(
+            all_ts,
+            (1..=10).map(|n| n.to_string()).collect::<Vec<_>>()
+        );
+
+        client
+            .batch_execute("DROP TABLE rekt_t_q_page;")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn query_esk_with_sk_predicate_combines() {
+        // ESK + sk_condition: caller passes ESK to resume, but the
+        // original sk_condition (e.g. begins_with) still applies.
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_q_esk_bw;
+                 CREATE TABLE rekt_t_q_esk_bw (
+                   data   jsonb NOT NULL,
+                   thread text GENERATED ALWAYS AS (data#>>'{thread,S}') STORED,
+                   ts     text GENERATED ALWAYS AS (data#>>'{ts,S}')     STORED,
+                   PRIMARY KEY (thread, ts)
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_q_esk_bw",
+            pk_col: "thread",
+            pk_type: KeyType::S,
+            sk_col: Some("ts"),
+            sk_type: Some(KeyType::S),
+            jsonb_col: "data",
+        };
+        for ts in [
+            "2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04", "2026-02-01",
+        ] {
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({"thread":{"S":"t-1"},"ts":{"S":ts},"body":{"S":"x"}}),
+            )
+            .await;
+        }
+
+        // First page: begins_with("2026-01"), L=2 → ts in [01, 02], LEK at 02.
+        let pk = KeyValue::S("t-1".into());
+        let out = backend
+            .query_raw(
+                &shape,
+                &pk,
+                Some(&SkCondition::BeginsWithS("2026-01".into())),
+                Some(2),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.count, 2);
+        let (_, lek_sk) = out.last_evaluated_key.expect("LEK present");
+        assert_eq!(lek_sk, Some(KeyValue::S("2026-01-02".into())));
+
+        // Second page: same begins_with, ESK = ("t-1", "2026-01-02")
+        // → ts in [03, 04]. No LEK (4 items total in the prefix).
+        let esk_sk = KeyValue::S("2026-01-02".into());
+        let esk = (&pk, Some(&esk_sk));
+        let out = backend
+            .query_raw(
+                &shape,
+                &pk,
+                Some(&SkCondition::BeginsWithS("2026-01".into())),
+                Some(2),
+                Some(esk),
+            )
+            .await
+            .unwrap();
+        let ts: Vec<&str> = out
+            .items
+            .iter()
+            .map(|i| i["ts"]["S"].as_str().unwrap())
+            .collect();
+        assert_eq!(ts, vec!["2026-01-03", "2026-01-04"]);
+        assert!(out.last_evaluated_key.is_none());
+
+        client
+            .batch_execute("DROP TABLE rekt_t_q_esk_bw;")
             .await
             .unwrap();
     }

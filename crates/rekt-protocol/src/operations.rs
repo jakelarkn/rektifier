@@ -119,6 +119,16 @@ pub struct QueryRequest {
     /// span; see `COMPATIBILITY_NOTES.md`.
     #[serde(default)]
     pub consistent_read: Option<bool>,
+    /// Maximum items to scan from PG before returning. DDB caps at 1 MB
+    /// per page (variable item count); rektifier caps by item count
+    /// (soft default 1000) — see `COMPATIBILITY_NOTES.md`.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Pagination cursor: the `LastEvaluatedKey` from the previous
+    /// response. Caller passes it back verbatim; rektifier resumes
+    /// strictly after this key.
+    #[serde(default)]
+    pub exclusive_start_key: Option<Item>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -127,4 +137,9 @@ pub struct QueryResponse {
     pub items: Vec<Item>,
     pub count: u32,
     pub scanned_count: u32,
+    /// Present when more items remain in the partition than fit under
+    /// `Limit`. Caller passes back verbatim as `ExclusiveStartKey` to
+    /// fetch the next page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_evaluated_key: Option<Item>,
 }

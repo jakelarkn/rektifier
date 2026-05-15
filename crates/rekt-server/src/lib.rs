@@ -33,7 +33,7 @@ use rekt_protocol::{
 use rekt_sigv4::{SigV4Error, Verifier};
 use rekt_storage::{Backend, BackendError, UpdateDecision, UpdateOutcome};
 use rekt_translator::{
-    apply_update_expression, evaluate_condition, materialize_insert_only_update,
+    apply_update_expression, encode_lek, evaluate_condition, materialize_insert_only_update,
     materialize_simple_sql_update, materialize_simple_update, touched_paths,
     translate_delete_item, translate_get_item, translate_put_item, translate_query,
     translate_update_item, ConditionRouting, ReturnValuesMode, TableSchema, TranslateError,
@@ -486,13 +486,26 @@ async fn handle_query(state: &AppState, body: &Bytes) -> Result<Response, ApiErr
     })?;
 
     let plan = translate_query(&req, schema)?;
+    let esk_pair = plan
+        .esk_sk
+        .as_ref()
+        .map(|sk| (&plan.pk, Some(sk)))
+        .or_else(|| {
+            // Hash-only ESK: the translator decodes esk_sk = None for a
+            // hash-only table, but the storage layer still needs to see
+            // "ESK present" to short-circuit. Detect via the raw request.
+            req.exclusive_start_key
+                .as_ref()
+                .map(|_| (&plan.pk, None::<&rekt_storage::KeyValue>))
+        });
     let outcome = state
         .backend
         .query_raw(
             &schema.shape(),
             &plan.pk,
             plan.sk_condition.as_ref(),
-            None,
+            plan.limit,
+            esk_pair,
         )
         .await?;
 
@@ -506,10 +519,16 @@ async fn handle_query(state: &AppState, body: &Bytes) -> Result<Response, ApiErr
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    let last_evaluated_key = outcome
+        .last_evaluated_key
+        .as_ref()
+        .map(|(pk, sk)| encode_lek(pk, sk.as_ref(), schema));
+
     Ok(json_ok(&QueryResponse {
         items,
         count: outcome.count,
         scanned_count: outcome.scanned_count,
+        last_evaluated_key,
     }))
 }
 
