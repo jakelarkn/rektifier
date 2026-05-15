@@ -315,6 +315,7 @@ pub struct TransactWritePlanItem {
 #[derive(Debug, Clone)]
 pub enum TransactWriteKind {
     Put { item_json: serde_json::Value },
-    // T4: Delete, ConditionCheck.
+    Delete,
+    ConditionCheck,
     // T5: Update.
 }

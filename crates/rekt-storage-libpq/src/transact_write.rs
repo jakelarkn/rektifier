@@ -11,7 +11,10 @@
 //! `Vec<TransactCancelReason>` so the HTTP layer can render DDB's
 //! `TransactionCanceledException` wire shape (T6).
 
-use crate::put_delete::{put_item_inside_tx, put_with_condition_inside_tx};
+use crate::put_delete::{
+    condition_check_inside_tx, delete_item_inside_tx, delete_with_condition_inside_tx,
+    put_item_inside_tx, put_with_condition_inside_tx,
+};
 use crate::types::map_pg_err;
 use crate::PgBackend;
 use rekt_storage::{
@@ -42,31 +45,56 @@ pub(crate) async fn transact_write_raw(
     // Iterate in request order; on first failure, build the
     // CancellationReasons[] array and bail.
     for (i, op) in items.iter().enumerate() {
-        match op {
+        let result: Result<(), BackendError> = match op {
             TransactWriteOp::Put {
                 shape,
                 pk,
                 sk,
                 item,
                 condition,
-                return_old_on_failure,
-            } => {
-                let result = match condition.as_ref() {
-                    None => {
-                        put_item_inside_tx(backend, &tx, shape, pk, sk.as_ref(), item)
-                            .await
-                            .map(|_old| ())
-                    }
-                    Some(cond) => {
-                        put_with_condition_inside_tx(&tx, shape, pk, sk.as_ref(), item, cond)
-                            .await
-                            .map(|_old| ())
-                    }
-                };
-                if let Err(err) = result {
-                    return Err(into_cancelled(err, i, n, *return_old_on_failure, items));
+                ..
+            } => match condition.as_ref() {
+                None => {
+                    put_item_inside_tx(backend, &tx, shape, pk, sk.as_ref(), item)
+                        .await
+                        .map(|_| ())
                 }
-            }
+                Some(cond) => {
+                    put_with_condition_inside_tx(&tx, shape, pk, sk.as_ref(), item, cond)
+                        .await
+                        .map(|_| ())
+                }
+            },
+            TransactWriteOp::Delete {
+                shape,
+                pk,
+                sk,
+                condition,
+                ..
+            } => match condition.as_ref() {
+                None => {
+                    delete_item_inside_tx(backend, &tx, shape, pk, sk.as_ref())
+                        .await
+                        .map(|_| ())
+                }
+                Some(cond) => {
+                    delete_with_condition_inside_tx(&tx, shape, pk, sk.as_ref(), cond)
+                        .await
+                        .map(|_| ())
+                }
+            },
+            TransactWriteOp::ConditionCheck {
+                shape,
+                pk,
+                sk,
+                condition,
+                ..
+            } => condition_check_inside_tx(&tx, shape, pk, sk.as_ref(), condition)
+                .await
+                .map(|_| ()),
+        };
+        if let Err(err) = result {
+            return Err(into_cancelled(err, i, n, false, items));
         }
     }
 

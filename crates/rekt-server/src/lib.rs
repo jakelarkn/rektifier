@@ -1101,6 +1101,27 @@ async fn handle_transact_write_items(
                     return_old_on_failure: plan_item.return_old_on_failure,
                 });
             }
+            TransactWriteKind::Delete => {
+                ops.push(TransactWriteOp::Delete {
+                    shape,
+                    pk: plan_item.pk,
+                    sk: plan_item.sk,
+                    condition: condition_fn,
+                    return_old_on_failure: plan_item.return_old_on_failure,
+                });
+            }
+            TransactWriteKind::ConditionCheck => {
+                let cond = condition_fn.expect(
+                    "translator guarantees ConditionCheck has a condition",
+                );
+                ops.push(TransactWriteOp::ConditionCheck {
+                    shape,
+                    pk: plan_item.pk,
+                    sk: plan_item.sk,
+                    condition: cond,
+                    return_old_on_failure: plan_item.return_old_on_failure,
+                });
+            }
         }
     }
 

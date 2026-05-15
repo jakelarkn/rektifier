@@ -4902,3 +4902,63 @@ fn diff_transact_write_conditional_put_failure_atomicity() {
 
     delete_both("users", "{\"id\":{\"S\":\"tw-d-exists\"}}");
 }
+
+// ===== TransactWriteItems T4 — Delete + ConditionCheck =======================
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_transact_write_delete_and_condition_check() {
+    ensure_users_table();
+    // Seed guard row + victim row on both endpoints.
+    let guard = "{\"id\":{\"S\":\"tw-d-guard\"},\"flag\":{\"S\":\"alive\"}}";
+    let victim = "{\"id\":{\"S\":\"tw-d-victim\"},\"label\":{\"S\":\"x\"}}";
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",guard]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",guard]);
+    let _ = aws(REF, &["dynamodb","put-item","--table-name","users","--item",victim]);
+    let _ = aws(OURS, &["dynamodb","put-item","--table-name","users","--item",victim]);
+
+    let items = "[\
+        {\"ConditionCheck\":{\"TableName\":\"users\",\
+            \"Key\":{\"id\":{\"S\":\"tw-d-guard\"}},\
+            \"ConditionExpression\":\"flag = :v\",\
+            \"ExpressionAttributeValues\":{\":v\":{\"S\":\"alive\"}}}},\
+        {\"Delete\":{\"TableName\":\"users\",\
+            \"Key\":{\"id\":{\"S\":\"tw-d-victim\"}}}}\
+    ]";
+    let _ = aws(REF, &["dynamodb","transact-write-items","--transact-items",items]);
+    let _ = aws(OURS, &["dynamodb","transact-write-items","--transact-items",items]);
+
+    // Both endpoints: victim deleted, guard intact.
+    let g_key = "{\"id\":{\"S\":\"tw-d-guard\"}}";
+    let v_key = "{\"id\":{\"S\":\"tw-d-victim\"}}";
+    let g_ref = aws(REF, &["dynamodb","get-item","--table-name","users","--key",g_key]);
+    let g_ours = aws(OURS, &["dynamodb","get-item","--table-name","users","--key",g_key]);
+    assert_eq!(g_ref["Item"], g_ours["Item"]);
+    let v_ref = aws(REF, &["dynamodb","get-item","--table-name","users","--key",v_key]);
+    let v_ours = aws(OURS, &["dynamodb","get-item","--table-name","users","--key",v_key]);
+    assert!(v_ref.get("Item").is_none(), "ref didn't delete: {v_ref}");
+    assert!(v_ours.get("Item").is_none(), "ours didn't delete: {v_ours}");
+
+    delete_both("users", g_key);
+}
+
+#[test]
+#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+fn diff_transact_write_condition_check_failure_rolls_back() {
+    ensure_users_table();
+    // Don't seed the guard — attribute_exists(id) will fail.
+    let items = "[\
+        {\"Put\":{\"TableName\":\"users\",\"Item\":{\"id\":{\"S\":\"tw-d-cc-victim\"}}}},\
+        {\"ConditionCheck\":{\"TableName\":\"users\",\
+            \"Key\":{\"id\":{\"S\":\"tw-d-cc-missing\"}},\
+            \"ConditionExpression\":\"attribute_exists(id)\"}}\
+    ]";
+    let _ = aws_expecting_failure(REF, &["dynamodb","transact-write-items","--transact-items",items]);
+    let _ = aws_expecting_failure(OURS, &["dynamodb","transact-write-items","--transact-items",items]);
+    // Atomicity: tw-d-cc-victim must not exist on either side.
+    let k = "{\"id\":{\"S\":\"tw-d-cc-victim\"}}";
+    let r_ref = aws(REF, &["dynamodb","get-item","--table-name","users","--key",k]);
+    let r_ours = aws(OURS, &["dynamodb","get-item","--table-name","users","--key",k]);
+    assert!(r_ref.get("Item").is_none(), "ref leaked atomicity: {r_ref}");
+    assert!(r_ours.get("Item").is_none(), "ours leaked atomicity: {r_ours}");
+}

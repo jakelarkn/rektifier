@@ -578,20 +578,32 @@ impl Backend for MockBackend {
         let n = items.len();
         let mut failed_at: Option<(usize, &'static str)> = None;
         for (i, op) in items.iter().enumerate() {
-            match op {
-                TransactWriteOp::Put { shape, pk, sk, condition, .. } => {
-                    if let Some(cond) = condition.as_ref() {
-                        let key = (
-                            shape.table.to_string(),
-                            kv_to_string(pk),
-                            sk.as_ref().map(kv_to_string).unwrap_or_default(),
-                        );
-                        let existing = store.get(&key).cloned();
-                        if !cond(existing.as_ref()) {
-                            failed_at = Some((i, "ConditionalCheckFailed"));
-                            break;
-                        }
-                    }
+            let (shape_table, pk, sk, cond): (
+                &str,
+                &KeyValue,
+                Option<&KeyValue>,
+                Option<&ConditionEvalFn<'_>>,
+            ) = match op {
+                TransactWriteOp::Put {
+                    shape, pk, sk, condition, ..
+                } => (shape.table, pk, sk.as_ref(), condition.as_ref()),
+                TransactWriteOp::Delete {
+                    shape, pk, sk, condition, ..
+                } => (shape.table, pk, sk.as_ref(), condition.as_ref()),
+                TransactWriteOp::ConditionCheck {
+                    shape, pk, sk, condition, ..
+                } => (shape.table, pk, sk.as_ref(), Some(condition)),
+            };
+            if let Some(c) = cond {
+                let key = (
+                    shape_table.to_string(),
+                    kv_to_string(pk),
+                    sk.map(kv_to_string).unwrap_or_default(),
+                );
+                let existing = store.get(&key).cloned();
+                if !c(existing.as_ref()) {
+                    failed_at = Some((i, "ConditionalCheckFailed"));
+                    break;
                 }
             }
         }
@@ -621,6 +633,17 @@ impl Backend for MockBackend {
                         sk.as_ref().map(kv_to_string).unwrap_or_default(),
                     );
                     store.insert(key, item);
+                }
+                TransactWriteOp::Delete { shape, pk, sk, .. } => {
+                    let key = (
+                        shape.table.to_string(),
+                        kv_to_string(&pk),
+                        sk.as_ref().map(kv_to_string).unwrap_or_default(),
+                    );
+                    store.remove(&key);
+                }
+                TransactWriteOp::ConditionCheck { .. } => {
+                    // Read-only guard; no mutation.
                 }
             }
         }
@@ -6864,13 +6887,17 @@ async fn transact_write_unknown_field_in_put_rejected() {
 }
 
 #[tokio::test]
-async fn transact_write_delete_rejected_until_t4() {
+async fn transact_write_update_rejected_until_t5() {
     let app = app();
     let resp = app
         .oneshot(ddb_request(
             "TransactWriteItems",
             json!({"TransactItems":[
-                {"Delete":{"TableName":"users","Key":{"id":{"S":"x"}}}}
+                {"Update":{
+                    "TableName":"users",
+                    "Key":{"id":{"S":"x"}},
+                    "UpdateExpression":"SET label = :v"
+                }}
             ]}),
         ))
         .await
@@ -6913,4 +6940,244 @@ async fn transact_write_composite_table_put() {
         .unwrap();
     let body = body_json(resp).await;
     assert_eq!(body["Item"]["label"]["S"], "E");
+}
+
+// ===== TransactWriteItems T4 — Delete + ConditionCheck =======================
+
+#[tokio::test]
+async fn transact_write_delete_round_trip() {
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"tw-d-1"},"label":{"S":"L"}})).await;
+    put_item(&app, "users", json!({"id":{"S":"tw-d-2"},"label":{"S":"L"}})).await;
+    let body = json!({
+        "TransactItems": [
+            {"Delete":{"TableName":"users","Key":{"id":{"S":"tw-d-1"}}}},
+            {"Delete":{"TableName":"users","Key":{"id":{"S":"tw-d-2"}}}}
+        ]
+    });
+    let resp = app
+        .clone()
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // Both rows gone.
+    for id in ["tw-d-1", "tw-d-2"] {
+        let resp = app
+            .clone()
+            .oneshot(ddb_request(
+                "GetItem",
+                json!({"TableName":"users","Key":{"id":{"S":id}}}),
+            ))
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert!(body.get("Item").is_none(), "{id} not deleted");
+    }
+}
+
+#[tokio::test]
+async fn transact_write_delete_missing_row_is_noop() {
+    let app = app();
+    let body = json!({
+        "TransactItems": [
+            {"Delete":{"TableName":"users","Key":{"id":{"S":"never-existed"}}}}
+        ]
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn transact_write_conditional_delete_succeeds() {
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"tw-cd-1"}})).await;
+    let body = json!({
+        "TransactItems": [{
+            "Delete":{
+                "TableName":"users",
+                "Key":{"id":{"S":"tw-cd-1"}},
+                "ConditionExpression":"attribute_exists(id)"
+            }
+        }]
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn transact_write_conditional_delete_fails_returns_cancelled() {
+    let app = app();
+    // No seed → attribute_exists fails.
+    let body = json!({
+        "TransactItems": [{
+            "Delete":{
+                "TableName":"users",
+                "Key":{"id":{"S":"missing"}},
+                "ConditionExpression":"attribute_exists(id)"
+            }
+        }]
+    });
+    let resp = app
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["CancellationReasons"][0]["Code"].as_str().unwrap(),
+        "ConditionalCheckFailed"
+    );
+}
+
+#[tokio::test]
+async fn transact_write_condition_check_guards_sibling_put() {
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"tw-cc-guard"},"flag":{"S":"on"}})).await;
+
+    // ConditionCheck "flag=on" should pass; sibling Put then lands.
+    let body = json!({
+        "TransactItems": [
+            {"ConditionCheck":{
+                "TableName":"users",
+                "Key":{"id":{"S":"tw-cc-guard"}},
+                "ConditionExpression":"flag = :v",
+                "ExpressionAttributeValues":{":v":{"S":"on"}}
+            }},
+            {"Put":{"TableName":"users","Item":{"id":{"S":"tw-cc-side"},"label":{"S":"x"}}}}
+        ]
+    });
+    let resp = app
+        .clone()
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // tw-cc-side should now exist.
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"tw-cc-side"}}}),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert!(body.get("Item").is_some());
+}
+
+#[tokio::test]
+async fn transact_write_condition_check_failure_rolls_back_sibling_put() {
+    let app = app();
+    put_item(&app, "users", json!({"id":{"S":"tw-cc-fail"},"flag":{"S":"off"}})).await;
+
+    let body = json!({
+        "TransactItems": [
+            {"Put":{"TableName":"users","Item":{"id":{"S":"tw-cc-blocked"},"label":{"S":"x"}}}},
+            {"ConditionCheck":{
+                "TableName":"users",
+                "Key":{"id":{"S":"tw-cc-fail"}},
+                "ConditionExpression":"flag = :v",
+                "ExpressionAttributeValues":{":v":{"S":"on"}}
+            }}
+        ]
+    });
+    let resp = app
+        .clone()
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["CancellationReasons"][1]["Code"].as_str().unwrap(),
+        "ConditionalCheckFailed"
+    );
+
+    // Atomicity: tw-cc-blocked should NOT exist.
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"tw-cc-blocked"}}}),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert!(body.get("Item").is_none());
+}
+
+#[tokio::test]
+async fn transact_write_mixed_put_delete_condition_check() {
+    let app = app();
+    put_item(
+        &app,
+        "users",
+        json!({"id":{"S":"mix-guard"},"flag":{"S":"alive"}}),
+    )
+    .await;
+    put_item(&app, "users", json!({"id":{"S":"mix-victim"},"label":{"S":"X"}})).await;
+    let body = json!({
+        "TransactItems": [
+            {"ConditionCheck":{
+                "TableName":"users",
+                "Key":{"id":{"S":"mix-guard"}},
+                "ConditionExpression":"flag = :v",
+                "ExpressionAttributeValues":{":v":{"S":"alive"}}
+            }},
+            {"Put":{"TableName":"users","Item":{"id":{"S":"mix-new"},"label":{"S":"L"}}}},
+            {"Delete":{"TableName":"users","Key":{"id":{"S":"mix-victim"}}}}
+        ]
+    });
+    let resp = app
+        .clone()
+        .oneshot(ddb_request("TransactWriteItems", body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // mix-new exists, mix-victim deleted.
+    let r1 = app
+        .clone()
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"mix-new"}}}),
+        ))
+        .await
+        .unwrap();
+    assert!(body_json(r1).await.get("Item").is_some());
+    let r2 = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"mix-victim"}}}),
+        ))
+        .await
+        .unwrap();
+    assert!(body_json(r2).await.get("Item").is_none());
+}
+
+#[tokio::test]
+async fn transact_write_condition_check_without_expression_rejected() {
+    // The struct requires ConditionExpression to be present (serde). An
+    // empty string passes serde but the translator rejects.
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "TransactWriteItems",
+            json!({"TransactItems":[
+                {"ConditionCheck":{
+                    "TableName":"users",
+                    "Key":{"id":{"S":"x"}},
+                    "ConditionExpression":""
+                }}
+            ]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

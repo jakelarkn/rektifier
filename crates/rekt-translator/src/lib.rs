@@ -3198,17 +3198,48 @@ mod tests {
     }
 
     #[test]
-    fn transact_write_delete_rejected_until_t4() {
-        // PLAN-8 T3 only implements Put. Delete/Update/ConditionCheck reject.
+    fn transact_write_delete_ok() {
         let req = tw_req(vec![rekt_protocol::TransactWriteItem {
             delete: Some(rekt_protocol::TransactDelete {
                 table_name: "users".into(),
                 key: item_of(&[("id", AttributeValue::S("a".into()))]),
                 ..Default::default()
             }),
-            put: None,
-            update: None,
-            condition_check: None,
+            ..Default::default()
+        }]);
+        let plan = translate_transact_write_items(&req, &schemas_map(), 100).unwrap();
+        assert!(matches!(plan.items[0].kind, TransactWriteKind::Delete));
+    }
+
+    #[test]
+    fn transact_write_condition_check_ok() {
+        let req = tw_req(vec![rekt_protocol::TransactWriteItem {
+            condition_check: Some(rekt_protocol::TransactConditionCheck {
+                table_name: "users".into(),
+                key: item_of(&[("id", AttributeValue::S("a".into()))]),
+                condition_expression: "attribute_exists(id)".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]);
+        let plan = translate_transact_write_items(&req, &schemas_map(), 100).unwrap();
+        assert!(matches!(
+            plan.items[0].kind,
+            TransactWriteKind::ConditionCheck
+        ));
+        assert!(plan.items[0].condition.is_some());
+    }
+
+    #[test]
+    fn transact_write_update_rejected_until_t5() {
+        let req = tw_req(vec![rekt_protocol::TransactWriteItem {
+            update: Some(rekt_protocol::TransactUpdate {
+                table_name: "users".into(),
+                key: item_of(&[("id", AttributeValue::S("a".into()))]),
+                update_expression: "SET label = :v".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
         }]);
         let err = translate_transact_write_items(&req, &schemas_map(), 100).unwrap_err();
         assert!(matches!(err, TranslateError::MalformedTransactItem { .. }));

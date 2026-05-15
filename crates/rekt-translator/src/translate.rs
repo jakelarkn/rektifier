@@ -608,6 +608,8 @@ pub fn translate_transact_write_items(
             });
         }
 
+        let empty_names: BTreeMap<String, String> = BTreeMap::new();
+        let empty_values: BTreeMap<String, AttributeValue> = BTreeMap::new();
         if let Some(put) = ti.put.as_ref() {
             let schema = schemas.get(&put.table_name).ok_or_else(|| {
                 TranslateError::ResourceNotFoundForTransact {
@@ -619,8 +621,6 @@ pub fn translate_transact_write_items(
             if !seen.insert(target) {
                 return Err(TranslateError::DuplicateTransactTarget);
             }
-            let empty_names: BTreeMap<String, String> = BTreeMap::new();
-            let empty_values: BTreeMap<String, AttributeValue> = BTreeMap::new();
             let names = put.expression_attribute_names.as_ref().unwrap_or(&empty_names);
             let values = put
                 .expression_attribute_values
@@ -645,10 +645,84 @@ pub fn translate_transact_write_items(
                 condition,
                 return_old_on_failure,
             });
+        } else if let Some(del) = ti.delete.as_ref() {
+            let schema = schemas.get(&del.table_name).ok_or_else(|| {
+                TranslateError::ResourceNotFoundForTransact {
+                    table: del.table_name.clone(),
+                }
+            })?;
+            let (pk, sk) = extract_key_pair(&del.key, schema)?;
+            reject_extra_key_attrs(&del.key, schema)?;
+            let target = (del.table_name.clone(), pk.clone(), sk.clone());
+            if !seen.insert(target) {
+                return Err(TranslateError::DuplicateTransactTarget);
+            }
+            let names = del.expression_attribute_names.as_ref().unwrap_or(&empty_names);
+            let values = del
+                .expression_attribute_values
+                .as_ref()
+                .unwrap_or(&empty_values);
+            let condition = translate_condition(
+                del.condition_expression.as_deref(),
+                names,
+                values,
+                schema,
+            )?;
+            let return_old_on_failure = parse_return_old_on_failure(
+                del.return_values_on_condition_check_failure.as_deref(),
+            )?;
+            items.push(TransactWritePlanItem {
+                table_name: del.table_name.clone(),
+                pk,
+                sk,
+                kind: TransactWriteKind::Delete,
+                condition,
+                return_old_on_failure,
+            });
+        } else if let Some(cc) = ti.condition_check.as_ref() {
+            let schema = schemas.get(&cc.table_name).ok_or_else(|| {
+                TranslateError::ResourceNotFoundForTransact {
+                    table: cc.table_name.clone(),
+                }
+            })?;
+            let (pk, sk) = extract_key_pair(&cc.key, schema)?;
+            reject_extra_key_attrs(&cc.key, schema)?;
+            let target = (cc.table_name.clone(), pk.clone(), sk.clone());
+            if !seen.insert(target) {
+                return Err(TranslateError::DuplicateTransactTarget);
+            }
+            let names = cc.expression_attribute_names.as_ref().unwrap_or(&empty_names);
+            let values = cc
+                .expression_attribute_values
+                .as_ref()
+                .unwrap_or(&empty_values);
+            // ConditionExpression is required for ConditionCheck —
+            // the wire struct typed it as String, so we already
+            // have it.
+            let condition = translate_condition(
+                Some(cc.condition_expression.as_str()),
+                names,
+                values,
+                schema,
+            )?
+            .ok_or(TranslateError::MalformedTransactItem {
+                expected: "ConditionCheck requires non-empty ConditionExpression",
+            })?;
+            let return_old_on_failure = parse_return_old_on_failure(
+                cc.return_values_on_condition_check_failure.as_deref(),
+            )?;
+            items.push(TransactWritePlanItem {
+                table_name: cc.table_name.clone(),
+                pk,
+                sk,
+                kind: TransactWriteKind::ConditionCheck,
+                condition: Some(condition),
+                return_old_on_failure,
+            });
         } else {
-            // Delete / Update / ConditionCheck land in T4/T5.
+            // Update lands in T5.
             return Err(TranslateError::MalformedTransactItem {
-                expected: "Put (Delete / Update / ConditionCheck land in PLAN-8 T4/T5)",
+                expected: "Put / Delete / ConditionCheck (Update lands in PLAN-8 T5)",
             });
         }
     }

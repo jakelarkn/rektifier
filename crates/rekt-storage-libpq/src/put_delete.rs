@@ -245,6 +245,134 @@ pub(crate) async fn put_item_inside_tx(
     Ok(old_item.map(|Json(v)| v))
 }
 
+/// Tx-scoped unconditional delete. Idempotent — returns Ok whether
+/// the row existed or not, matching DDB DeleteItem semantics.
+pub(crate) async fn delete_item_inside_tx(
+    backend: &PgBackend,
+    tx: &deadpool_postgres::Transaction<'_>,
+    shape: &TableShape<'_>,
+    pk: &KeyValue,
+    sk: Option<&KeyValue>,
+) -> Result<Option<serde_json::Value>, BackendError> {
+    check_sk_shape(shape, sk)?;
+    let sql = backend.shape_sql(shape);
+    let stmt = tx
+        .prepare_typed_cached(&sql.delete_sql, &sql.key_types)
+        .await
+        .map_err(|e| map_pg_err(shape.table, e))?;
+    let pk_bound = Bound(pk);
+    let row = match sk {
+        None => tx
+            .query_opt(&stmt, &[&pk_bound])
+            .instrument(tracing::debug_span!("pg.execute"))
+            .await,
+        Some(sk_val) => {
+            let sk_bound = Bound(sk_val);
+            tx.query_opt(&stmt, &[&pk_bound, &sk_bound])
+                .instrument(tracing::debug_span!("pg.execute"))
+                .await
+        }
+    }
+    .map_err(|e| map_pg_err(shape.table, e))?;
+    Ok(row.map(|r| {
+        let Json(v): Json<serde_json::Value> = r.get(0);
+        v
+    }))
+}
+
+/// Tx-scoped conditional delete. SELECT FOR UPDATE → evaluate
+/// condition → on true DELETE, on false ConditionalCheckFailed.
+/// Matches `delete_with_condition_raw`'s logic but doesn't open/own
+/// the transaction.
+pub(crate) async fn delete_with_condition_inside_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    shape: &TableShape<'_>,
+    pk: &KeyValue,
+    sk: Option<&KeyValue>,
+    condition: &ConditionEvalFn<'_>,
+) -> Result<Option<serde_json::Value>, BackendError> {
+    check_sk_shape(shape, sk)?;
+    let prep = RmwSqlPrep::build(shape);
+
+    let table = quote_ident(shape.table);
+    let pk_col = quote_ident(shape.pk_col);
+    let pk_cast = cast_for_keytype(shape.pk_type);
+    let delete_sql = match (shape.sk_col, shape.sk_type) {
+        (None, _) => format!("DELETE FROM {table} WHERE {pk_col} = $1{pk_cast}"),
+        (Some(sk_col), Some(sk_type)) => {
+            let sk_col_q = quote_ident(sk_col);
+            let sk_cast = cast_for_keytype(sk_type);
+            format!(
+                "DELETE FROM {table} \
+                 WHERE {pk_col} = $1{pk_cast} AND {sk_col_q} = $2{sk_cast}"
+            )
+        }
+        (Some(_), None) => unreachable!(
+            "TableShape `{}`: sk_col without sk_type",
+            shape.table
+        ),
+    };
+
+    let select_stmt = tx
+        .prepare_typed_cached(&prep.select_sql, &prep.key_types)
+        .await
+        .map_err(|e| map_pg_err(shape.table, e))?;
+    let delete_stmt = tx
+        .prepare_typed_cached(&delete_sql, &prep.key_types)
+        .await
+        .map_err(|e| map_pg_err(shape.table, e))?;
+
+    let existing = prep.select_for_update(tx, &select_stmt, pk, sk).await?;
+    if !condition(existing.as_ref()) {
+        return Err(BackendError::ConditionalCheckFailed);
+    }
+    if existing.is_some() {
+        let pk_bound = Bound(pk);
+        match sk {
+            None => tx
+                .execute(&delete_stmt, &[&pk_bound])
+                .instrument(tracing::debug_span!("pg.delete"))
+                .await,
+            Some(sk_val) => {
+                let sk_bound = Bound(sk_val);
+                tx.execute(&delete_stmt, &[&pk_bound, &sk_bound])
+                    .instrument(tracing::debug_span!("pg.delete"))
+                    .await
+            }
+        }
+        .map_err(|e| map_pg_err(shape.table, e))?;
+    }
+    Ok(existing)
+}
+
+/// Tx-scoped read-only guard. SELECT FOR UPDATE → evaluate
+/// condition → on true return Ok(()), on false ConditionalCheckFailed.
+/// No mutation. Backs `TransactWriteOp::ConditionCheck`.
+///
+/// The FOR UPDATE lock is held for the duration of the outer
+/// transaction — preventing concurrent writes to the row until the
+/// whole TransactWriteItems either commits or aborts (the cross-row
+/// invariant guarantee).
+pub(crate) async fn condition_check_inside_tx(
+    tx: &deadpool_postgres::Transaction<'_>,
+    shape: &TableShape<'_>,
+    pk: &KeyValue,
+    sk: Option<&KeyValue>,
+    condition: &ConditionEvalFn<'_>,
+) -> Result<Option<serde_json::Value>, BackendError> {
+    check_sk_shape(shape, sk)?;
+    let prep = RmwSqlPrep::build(shape);
+    let select_stmt = tx
+        .prepare_typed_cached(&prep.select_sql, &prep.key_types)
+        .await
+        .map_err(|e| map_pg_err(shape.table, e))?;
+    let existing = prep.select_for_update(tx, &select_stmt, pk, sk).await?;
+    if !condition(existing.as_ref()) {
+        return Err(BackendError::ConditionalCheckFailed);
+    }
+    Ok(existing)
+}
+
 /// Tx-scoped conditional upsert — single-pass: SELECT FOR UPDATE,
 /// evaluate condition, INSERT/UPDATE accordingly. Returns the
 /// pre-update row on success. On condition false, returns

@@ -505,7 +505,30 @@ pub enum TransactWriteOp<'a> {
         /// (D11 in PLAN-8).
         return_old_on_failure: bool,
     },
-    // Delete / ConditionCheck land in T4; Update in T5.
+    /// DeleteItem-equivalent inside the cross-table tx.
+    /// `condition` runs as SELECT FOR UPDATE + closure-eval; on
+    /// `true` → DELETE, on `false` → ConditionalCheckFailed.
+    /// Unconditional Delete is idempotent (no row → still Ok).
+    Delete {
+        shape: TableShape<'a>,
+        pk: KeyValue,
+        sk: Option<KeyValue>,
+        condition: Option<ConditionEvalFn<'a>>,
+        return_old_on_failure: bool,
+    },
+    /// Read-only-but-locking guard inside the cross-table tx. Runs
+    /// SELECT FOR UPDATE + closure; on `true` → continue, on
+    /// `false` → ConditionalCheckFailed. No mutation. Used by
+    /// callers that need to assert another row's invariant without
+    /// writing it (DDB's TransactWriteItems API surface).
+    ConditionCheck {
+        shape: TableShape<'a>,
+        pk: KeyValue,
+        sk: Option<KeyValue>,
+        condition: ConditionEvalFn<'a>,
+        return_old_on_failure: bool,
+    },
+    // Update lands in T5.
 }
 
 /// Success outcome of a `transact_write_raw` call. Carries no data

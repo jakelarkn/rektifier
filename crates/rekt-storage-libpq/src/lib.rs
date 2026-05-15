@@ -4874,6 +4874,212 @@ mod tests {
         client.batch_execute("DROP TABLE rekt_t_tw_comp;").await.unwrap();
     }
 
+    // ===== TransactWriteItems T4 — Delete + ConditionCheck ===================
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn transact_write_delete_round_trip() {
+        use rekt_storage::TransactWriteOp;
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_tw_del;
+                 CREATE TABLE rekt_t_tw_del (
+                   data jsonb NOT NULL,
+                   id   text  GENERATED ALWAYS AS (data#>>'{id,S}') STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_tw_del",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        for n in ["a", "b"] {
+            pg_put(
+                &backend,
+                &shape,
+                &serde_json::json!({"id":{"S":n},"label":{"S":"x"}}),
+            )
+            .await;
+        }
+        let ops = vec![
+            TransactWriteOp::Delete {
+                shape: shape.clone(),
+                pk: KeyValue::S("a".into()),
+                sk: None,
+                condition: None,
+                return_old_on_failure: false,
+            },
+            TransactWriteOp::Delete {
+                shape: shape.clone(),
+                pk: KeyValue::S("b".into()),
+                sk: None,
+                condition: None,
+                return_old_on_failure: false,
+            },
+        ];
+        backend.transact_write_raw(ops).await.unwrap();
+        for n in ["a", "b"] {
+            let got = backend
+                .get_item_raw(&shape, &KeyValue::S(n.into()), None)
+                .await
+                .unwrap();
+            assert!(got.is_none(), "{n} not deleted");
+        }
+        client.batch_execute("DROP TABLE rekt_t_tw_del;").await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn transact_write_condition_check_guards_sibling_put() {
+        use rekt_storage::TransactWriteOp;
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_tw_cc;
+                 CREATE TABLE rekt_t_tw_cc (
+                   data jsonb NOT NULL,
+                   id   text  GENERATED ALWAYS AS (data#>>'{id,S}') STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_tw_cc",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        pg_put(
+            &backend,
+            &shape,
+            &serde_json::json!({"id":{"S":"guard"},"flag":{"S":"on"}}),
+        )
+        .await;
+
+        use rekt_expressions::{parse_condition_expression, substitute_condition};
+        let cond_ast = parse_condition_expression("flag = :v").unwrap();
+        let mut values: std::collections::BTreeMap<String, rekt_protocol::AttributeValue> =
+            std::collections::BTreeMap::new();
+        values.insert(":v".into(), rekt_protocol::AttributeValue::S("on".into()));
+        let cond = substitute_condition(
+            cond_ast,
+            &std::collections::BTreeMap::new(),
+            &values,
+        )
+        .unwrap();
+        let cond_eval: rekt_storage::ConditionEvalFn<'_> = Box::new(move |existing| {
+            rekt_translator::evaluate_condition(existing, &cond)
+        });
+
+        let ops = vec![
+            TransactWriteOp::ConditionCheck {
+                shape: shape.clone(),
+                pk: KeyValue::S("guard".into()),
+                sk: None,
+                condition: cond_eval,
+                return_old_on_failure: false,
+            },
+            TransactWriteOp::Put {
+                shape: shape.clone(),
+                pk: KeyValue::S("new".into()),
+                sk: None,
+                item: serde_json::json!({"id":{"S":"new"},"label":{"S":"y"}}),
+                condition: None,
+                return_old_on_failure: false,
+            },
+        ];
+        backend.transact_write_raw(ops).await.unwrap();
+        let got = backend
+            .get_item_raw(&shape, &KeyValue::S("new".into()), None)
+            .await
+            .unwrap();
+        assert!(got.is_some(), "sibling Put didn't land after CC passed");
+
+        client.batch_execute("DROP TABLE rekt_t_tw_cc;").await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires postgres on localhost:5432 (just up)"]
+    async fn transact_write_condition_check_failure_rolls_back_sibling() {
+        use rekt_storage::TransactWriteOp;
+        let backend = PgBackend::connect(&database_url()).unwrap();
+        let client = backend.client().await.unwrap();
+        client
+            .batch_execute(
+                "DROP TABLE IF EXISTS rekt_t_tw_cc_fail;
+                 CREATE TABLE rekt_t_tw_cc_fail (
+                   data jsonb NOT NULL,
+                   id   text  GENERATED ALWAYS AS (data#>>'{id,S}') STORED PRIMARY KEY
+                 );",
+            )
+            .await
+            .unwrap();
+        let shape = TableShape {
+            table: "rekt_t_tw_cc_fail",
+            pk_col: "id",
+            pk_type: KeyType::S,
+            sk_col: None,
+            sk_type: None,
+            jsonb_col: "data",
+        };
+        // Don't seed "guard" — attribute_exists(id) will fail.
+        use rekt_expressions::{parse_condition_expression, substitute_condition};
+        let cond_ast = parse_condition_expression("attribute_exists(id)").unwrap();
+        let cond = substitute_condition(
+            cond_ast,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::<String, rekt_protocol::AttributeValue>::new(),
+        )
+        .unwrap();
+        let cond_eval: rekt_storage::ConditionEvalFn<'_> = Box::new(move |existing| {
+            rekt_translator::evaluate_condition(existing, &cond)
+        });
+
+        let ops = vec![
+            TransactWriteOp::Put {
+                shape: shape.clone(),
+                pk: KeyValue::S("victim".into()),
+                sk: None,
+                item: serde_json::json!({"id":{"S":"victim"},"label":{"S":"should_not_land"}}),
+                condition: None,
+                return_old_on_failure: false,
+            },
+            TransactWriteOp::ConditionCheck {
+                shape: shape.clone(),
+                pk: KeyValue::S("missing-guard".into()),
+                sk: None,
+                condition: cond_eval,
+                return_old_on_failure: false,
+            },
+        ];
+        let err = backend.transact_write_raw(ops).await.unwrap_err();
+        match err {
+            BackendError::TransactionCancelled { reasons } => {
+                assert_eq!(reasons[0].code, "None");
+                assert_eq!(reasons[1].code, "ConditionalCheckFailed");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // Atomicity: victim must NOT exist.
+        let got = backend
+            .get_item_raw(&shape, &KeyValue::S("victim".into()), None)
+            .await
+            .unwrap();
+        assert!(got.is_none(), "atomicity broken: {got:?}");
+
+        client.batch_execute("DROP TABLE rekt_t_tw_cc_fail;").await.unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires postgres on localhost:5432 (just up)"]
     async fn transact_get_unknown_table_surfaces_table_not_found() {
