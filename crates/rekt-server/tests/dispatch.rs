@@ -6,6 +6,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use rekt_expressions::Condition;
 use rekt_catalog::{CatalogSnapshot, TableCatalog, TableEntry, TableStatus};
+use rekt_ddl::{DdlBackend, DdlError};
+use rekt_protocol::{CreateTableRequest, TableDescription};
 use rekt_server::{router, AppState};
 use rekt_sigv4::{PermissiveVerifier, Verifier};
 use rekt_storage::{
@@ -837,6 +839,86 @@ fn catalog() -> Arc<TableCatalog> {
     )))
 }
 
+/// In-memory `DdlBackend`. Mutates the shared `TableCatalog` directly
+/// (no PG). Exercises the same `validate_create_table` path the
+/// PG-backed impl uses, so validation rejections are tested at the
+/// dispatch layer; the PG-side advisory locking / CREATE TABLE
+/// emission is covered by libpq integration tests.
+struct MockDdlBackend {
+    catalog: Arc<TableCatalog>,
+}
+
+#[async_trait::async_trait]
+impl DdlBackend for MockDdlBackend {
+    async fn create_table(
+        &self,
+        req: &CreateTableRequest,
+    ) -> Result<TableDescription, DdlError> {
+        let plan = rekt_ddl::validate_create_table(req)?;
+        if self.catalog.get(&plan.table_name).is_some() {
+            return Err(DdlError::ResourceInUse(format!(
+                "Table already exists: {}",
+                plan.table_name
+            )));
+        }
+        let entry = rekt_ddl::entry_for_new_table(&plan);
+        let mut next = self.catalog.snapshot().entries.clone();
+        next.insert(plan.table_name.clone(), Arc::new(entry));
+        let snapshot = CatalogSnapshot::from_entries(next);
+        self.catalog.replace(snapshot);
+        let entry = self.catalog.get(&plan.table_name).unwrap();
+        Ok(table_description_from_entry_for_test(&entry))
+    }
+}
+
+/// Mirror of `rekt_server::ddl::table_description_from_entry`. Inlined
+/// in the test module so dispatch tests don't reach into the server
+/// crate's private helpers.
+fn table_description_from_entry_for_test(entry: &TableEntry) -> TableDescription {
+    use rekt_protocol::{AttributeDefinition, KeySchemaElement};
+    use rekt_storage::KeyType;
+    fn kts(k: KeyType) -> &'static str {
+        match k {
+            KeyType::S => "S",
+            KeyType::N => "N",
+            KeyType::B => "B",
+        }
+    }
+    let s = &entry.schema;
+    let mut ks = vec![KeySchemaElement {
+        attribute_name: s.pk_attr.clone(),
+        key_type: "HASH".into(),
+    }];
+    let mut ad = vec![AttributeDefinition {
+        attribute_name: s.pk_attr.clone(),
+        attribute_type: kts(s.pk_type).into(),
+    }];
+    if let (Some(sk_attr), Some(sk_type)) = (&s.sk_attr, s.sk_type) {
+        ks.push(KeySchemaElement {
+            attribute_name: sk_attr.clone(),
+            key_type: "RANGE".into(),
+        });
+        ad.push(AttributeDefinition {
+            attribute_name: sk_attr.clone(),
+            attribute_type: kts(sk_type).into(),
+        });
+    }
+    TableDescription {
+        table_name: Some(s.name.clone()),
+        table_status: Some(entry.status.to_wire_str().into()),
+        table_arn: Some(format!(
+            "arn:aws:dynamodb:::rektifier-table/{}",
+            s.name
+        )),
+        creation_date_time: Some(entry.creation_date_ms as f64 / 1000.0),
+        key_schema: Some(ks),
+        attribute_definitions: Some(ad),
+        item_count: Some(0),
+        table_size_bytes: Some(0),
+        ..Default::default()
+    }
+}
+
 fn app() -> axum::Router {
     app_with(MockBackend::default(), std::time::Duration::from_secs(30))
 }
@@ -881,7 +963,8 @@ fn app_users_unserveable() -> axum::Router {
     let state = AppState {
         verifier: Arc::new(PermissiveVerifier) as Arc<dyn Verifier>,
         backend: Arc::new(MockBackend::default()) as Arc<dyn Backend>,
-        catalog,
+        catalog: catalog.clone(),
+        ddl: Arc::new(MockDdlBackend { catalog }) as Arc<dyn DdlBackend>,
         batch_limits: rekt_server::BatchLimits::default(),
         request_timeout: std::time::Duration::from_secs(30),
     };
@@ -892,10 +975,12 @@ fn app_users_unserveable() -> axum::Router {
 /// panics or sleeps to exercise the resilience middleware) or a
 /// custom request timeout.
 fn app_with(backend: MockBackend, request_timeout: std::time::Duration) -> axum::Router {
+    let cat = catalog();
     let state = AppState {
         verifier: Arc::new(PermissiveVerifier) as Arc<dyn Verifier>,
         backend: Arc::new(backend) as Arc<dyn Backend>,
-        catalog: catalog(),
+        catalog: cat.clone(),
+        ddl: Arc::new(MockDdlBackend { catalog: cat }) as Arc<dyn DdlBackend>,
         batch_limits: rekt_server::BatchLimits::default(),
         request_timeout,
     };
@@ -990,16 +1075,12 @@ async fn unknown_table_is_resource_not_found() {
 #[tokio::test]
 async fn unsupported_op_is_unknown_operation() {
     let app = app();
-    // `CreateTable` is not yet implemented (PLAN-10 D6). Swap this for
+    // `UpdateTable` is not yet implemented (PLAN-10 D7). Swap this for
     // whatever is still unsupported as more ops land.
     let resp = app
         .oneshot(ddb_request(
-            "CreateTable",
-            json!({
-                "TableName":"new",
-                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
-                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]
-            }),
+            "UpdateTable",
+            json!({"TableName":"users"}),
         ))
         .await
         .unwrap();
@@ -8095,4 +8176,174 @@ async fn list_tables_includes_unserveable_entries() {
         .map(|v| v.as_str().unwrap())
         .collect();
     assert!(names.contains(&"users"), "unserveable `users` must appear");
+}
+
+// ===== D6: CreateTable ======================================================
+
+/// End-to-end CreateTable round-trip via the mock backend. The new
+/// table is immediately serveable + DescribeTable echoes back the
+/// shape (invalidate_on_local_ddl semantics are baked into the mock).
+#[tokio::test]
+async fn create_table_round_trip_via_mock() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "CreateTable",
+            json!({
+                "TableName": "Widgets",
+                "KeySchema": [{"AttributeName":"id","KeyType":"HASH"}],
+                "AttributeDefinitions": [{"AttributeName":"id","AttributeType":"S"}]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let td = &body["TableDescription"];
+    assert_eq!(td["TableName"], "Widgets");
+    assert_eq!(td["TableStatus"], "ACTIVE");
+    assert_eq!(
+        td["TableArn"],
+        "arn:aws:dynamodb:::rektifier-table/Widgets"
+    );
+    let ks = td["KeySchema"].as_array().unwrap();
+    assert_eq!(ks[0]["AttributeName"], "id");
+    assert_eq!(ks[0]["KeyType"], "HASH");
+}
+
+/// DescribeTable on the newly-created table works — confirms the
+/// catalog actually gained the entry (the dispatch round-trip would
+/// pass otherwise if the handler short-circuited the description from
+/// the request body alone).
+#[tokio::test]
+async fn create_then_describe_visible_in_catalog() {
+    let app = app();
+    let _ = app
+        .clone()
+        .oneshot(ddb_request(
+            "CreateTable",
+            json!({
+                "TableName":"Gizmos",
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]
+            }),
+        ))
+        .await
+        .unwrap();
+    let resp = app
+        .oneshot(ddb_request(
+            "DescribeTable",
+            json!({"TableName":"Gizmos"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["Table"]["TableName"], "Gizmos");
+}
+
+/// KD12: `_rektifier_*` prefix rejected at CreateTable validation.
+#[tokio::test]
+async fn create_table_rejects_reserved_prefix() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "CreateTable",
+            json!({
+                "TableName":"_rektifier_my_table",
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ValidationException"));
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("reserved"));
+}
+
+/// Duplicate name returns `ResourceInUseException` per DDB. Pre-existing
+/// `users` fixture is targeted.
+#[tokio::test]
+async fn create_table_duplicate_returns_resource_in_use() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "CreateTable",
+            json!({
+                "TableName":"users",
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ResourceInUseException"));
+}
+
+/// Unused AttributeDefinitions entries fail validation — DDB-parity
+/// strictness.
+#[tokio::test]
+async fn create_table_rejects_unused_attribute_definition() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "CreateTable",
+            json!({
+                "TableName":"WidgetsTwo",
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+                "AttributeDefinitions":[
+                    {"AttributeName":"id","AttributeType":"S"},
+                    {"AttributeName":"extra","AttributeType":"S"}
+                ]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ValidationException"));
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("unused"));
+}
+
+/// Streams rejection — KD: PLAN-10 D10 deferred.
+#[tokio::test]
+async fn create_table_rejects_stream_enabled_true() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "CreateTable",
+            json!({
+                "TableName":"WithStreams",
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+                "StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_IMAGE"}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("Streams"));
 }

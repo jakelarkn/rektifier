@@ -13,9 +13,9 @@ use crate::{json_ok, parse_request, ApiError, AppState};
 use bytes::Bytes;
 use rekt_catalog::TableEntry;
 use rekt_protocol::{
-    AttributeDefinition, DescribeTableRequest, DescribeTableResponse,
-    GlobalSecondaryIndexDescription, KeySchemaElement, ListTablesRequest, ListTablesResponse,
-    Projection, ProvisionedThroughputDescription, TableDescription,
+    AttributeDefinition, CreateTableRequest, CreateTableResponse, DescribeTableRequest,
+    DescribeTableResponse, GlobalSecondaryIndexDescription, KeySchemaElement, ListTablesRequest,
+    ListTablesResponse, Projection, ProvisionedThroughputDescription, TableDescription,
 };
 use rekt_storage::KeyType;
 
@@ -147,6 +147,26 @@ pub(crate) fn table_description_from_entry(entry: &TableEntry) -> TableDescripti
         table_class_summary: None,
         deletion_protection_enabled: None,
     }
+}
+
+// ===== CreateTable ===========================================================
+
+#[tracing::instrument(
+    level = "debug",
+    skip_all,
+    name = "server.create_table",
+    fields(table = tracing::field::Empty)
+)]
+pub(crate) async fn handle_create_table(
+    state: &AppState,
+    body: &Bytes,
+) -> Result<axum::response::Response, ApiError> {
+    let req: CreateTableRequest = parse_request(body, "CreateTable")?;
+    tracing::Span::current().record("table", req.table_name.as_str());
+    let description = state.ddl.create_table(&req).await?;
+    Ok(json_ok(&CreateTableResponse {
+        table_description: description,
+    }))
 }
 
 // ===== DescribeTable =========================================================

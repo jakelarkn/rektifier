@@ -8,10 +8,12 @@ description = "axum HTTP server dispatching DynamoDB ops to translator + backend
 
 [dependencies]
 rekt-catalog = { path = "../rekt-catalog" }
+rekt-ddl = { path = "../rekt-ddl" }
 rekt-protocol = { path = "../rekt-protocol" }
 rekt-sigv4 = { path = "../rekt-sigv4" }
 rekt-storage = { path = "../rekt-storage" }
 rekt-translator = { path = "../rekt-translator" }
+async-trait = { workspace = true }
 axum = "0.7"
 tower-http = { workspace = true, features = ["limit", "trace", "catch-panic", "timeout"] }
 http = { workspace = true }

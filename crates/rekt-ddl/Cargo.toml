@@ -1,0 +1,20 @@
+[package]
+name = "rekt-ddl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "DDL orchestration for rektifier: CreateTable/DeleteTable/UpdateTable workers"
+
+[dependencies]
+async-trait = { workspace = true }
+deadpool-postgres = { workspace = true }
+rekt-catalog = { path = "../rekt-catalog" }
+rekt-protocol = { path = "../rekt-protocol" }
+rekt-storage = { path = "../rekt-storage" }
+rekt-translator = { path = "../rekt-translator" }
+serde_json = { workspace = true }
+sha1 = "0.10"
+thiserror = { workspace = true }
+tokio-postgres = { workspace = true }
+tracing = { workspace = true }

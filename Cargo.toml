@@ -9,6 +9,7 @@ members = [
     "crates/rekt-expressions",
     "crates/rekt-config",
     "crates/rekt-catalog",
+    "crates/rekt-ddl",
     "crates/rekt-server",
     "crates/rektifier",
     "crates/rekt-bench",

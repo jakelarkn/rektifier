@@ -24,6 +24,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use deadpool_postgres::{Manager, Pool};
 use rekt_catalog::{Reconciler, TableCatalog};
+use rekt_ddl::PgDdlBackend;
 use rekt_config::Config;
 use rekt_server::{router, AppState};
 use rekt_sigv4::PermissiveVerifier;
@@ -88,6 +89,12 @@ async fn main() -> Result<()> {
     );
     Arc::clone(&reconciler).spawn_periodic();
 
+    let ddl = Arc::new(PgDdlBackend::new(
+        pool.clone(),
+        catalog.clone(),
+        reconciler,
+        config.catalog.invalidate_on_local_ddl,
+    ));
     let backend = PgBackend::new(pool).with_retry_policy(rek_retry_policy(&config));
     tracing::info!(
         max_attempts = config.pg.retry.max_attempts,
@@ -96,10 +103,12 @@ async fn main() -> Result<()> {
         jitter_pct = config.pg.retry.jitter_pct,
         "PG retry policy configured"
     );
+
     let state = AppState {
         verifier: Arc::new(PermissiveVerifier),
         backend: Arc::new(backend),
         catalog,
+        ddl,
         batch_limits: rek_batch_limits(&config),
         request_timeout: std::time::Duration::from_millis(config.server.request_timeout_ms),
     };

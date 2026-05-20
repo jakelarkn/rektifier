@@ -37,6 +37,7 @@ use rekt_protocol::{
     WriteRequest,
 };
 use rekt_catalog::{CatalogSnapshot, TableCatalog, TableEntry};
+use rekt_ddl::DdlBackend;
 use rekt_sigv4::{SigV4Error, Verifier};
 use rekt_storage::{Backend, BackendError, TransactGetOp, TransactWriteOp, UpdateDecision, UpdateOutcome};
 use rekt_translator::{
@@ -76,6 +77,11 @@ pub struct AppState {
     /// the immutable `Arc<HashMap<String, TableSchema>>` of pre-D2 —
     /// see PLAN-10 KD4.
     pub catalog: Arc<TableCatalog>,
+    /// DDL surface: CreateTable / DeleteTable / UpdateTable. The
+    /// trait abstraction lets dispatch tests supply an in-memory
+    /// implementation; the binary wires a `PgDdlBackend` that talks to
+    /// the real database (PLAN-10 D6+).
+    pub ddl: Arc<dyn DdlBackend>,
     /// Per-call quantity caps on the batch ops. Defaults to DDB
     /// values (100 / 25); operator can override via `[batch_limits]`
     /// in `rektifier.toml`. See `COMPATIBILITY_NOTES.md`.
@@ -178,6 +184,9 @@ pub enum ApiError {
     #[error("ResourceNotFoundException: {0}")]
     ResourceNotFound(String),
 
+    #[error("ResourceInUseException: {0}")]
+    ResourceInUse(String),
+
     #[error("AccessDeniedException: {0}")]
     AccessDenied(String),
 
@@ -200,6 +209,7 @@ impl ApiError {
             Self::Serialization(_) => "SerializationException",
             Self::Validation(_) => "ValidationException",
             Self::ResourceNotFound(_) => "ResourceNotFoundException",
+            Self::ResourceInUse(_) => "ResourceInUseException",
             Self::AccessDenied(_) => "AccessDeniedException",
             Self::ConditionalCheckFailed(_) => "ConditionalCheckFailedException",
             Self::TransactionCancelled { .. } => "TransactionCanceledException",
@@ -222,6 +232,7 @@ impl ApiError {
             | Self::Serialization(m)
             | Self::Validation(m)
             | Self::ResourceNotFound(m)
+            | Self::ResourceInUse(m)
             | Self::AccessDenied(m)
             | Self::ConditionalCheckFailed(m)
             | Self::Internal(m) => m.clone(),
@@ -381,6 +392,19 @@ impl From<BackendError> for ApiError {
     }
 }
 
+impl From<rekt_ddl::DdlError> for ApiError {
+    fn from(e: rekt_ddl::DdlError) -> Self {
+        use rekt_ddl::DdlError;
+        match e {
+            DdlError::Validation(m) => ApiError::Validation(m),
+            DdlError::ResourceInUse(m) => ApiError::ResourceInUse(m),
+            DdlError::ResourceNotFound(m) => ApiError::ResourceNotFound(m),
+            DdlError::Catalog(c) => ApiError::Internal(format!("catalog error: {c}")),
+            DdlError::Internal(m) => ApiError::Internal(m),
+        }
+    }
+}
+
 impl From<SigV4Error> for ApiError {
     fn from(e: SigV4Error) -> Self {
         ApiError::AccessDenied(e.to_string())
@@ -528,6 +552,7 @@ async fn dispatch(State(state): State<AppState>, req: Request) -> Result<Respons
         "BatchWriteItem" => handle_batch_write_item(&state, &body).await,
         "TransactGetItems" => handle_transact_get_items(&state, &body).await,
         "TransactWriteItems" => handle_transact_write_items(&state, &body).await,
+        "CreateTable" => ddl::handle_create_table(&state, &body).await,
         "DescribeTable" => ddl::handle_describe_table(&state, &body).await,
         "ListTables" => ddl::handle_list_tables(&state, &body).await,
         _ => Err(ApiError::UnknownOperation(format!(
