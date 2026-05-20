@@ -48,15 +48,53 @@ lint:
 fmt:
     cargo fmt --all
 
-# Apply the example PG schema (creates users + device_events tables)
-bootstrap-pg:
-    docker compose exec -T postgres psql -U rektifier rektifier < rektifier-bootstrap.sql
+# Provision the example tables via the DDB CreateTable API (PLAN-10 D8).
+# Requires rektifier to be running on :9000 (use `just run` in another shell).
+# Equivalent fixture set to the pre-D8 rektifier-bootstrap.sql, but issued
+# through the wire API the SDK uses.
+bootstrap-tables:
+    aws dynamodb create-table \
+        --endpoint-url http://localhost:9000 \
+        --table-name users \
+        --key-schema AttributeName=id,KeyType=HASH \
+        --attribute-definitions AttributeName=id,AttributeType=S \
+        --billing-mode PAY_PER_REQUEST
+    aws dynamodb create-table \
+        --endpoint-url http://localhost:9000 \
+        --table-name device_events \
+        --key-schema AttributeName=device_id,KeyType=HASH AttributeName=ts,KeyType=RANGE \
+        --attribute-definitions AttributeName=device_id,AttributeType=S AttributeName=ts,AttributeType=N \
+        --billing-mode PAY_PER_REQUEST
+    aws dynamodb create-table \
+        --endpoint-url http://localhost:9000 \
+        --table-name counters \
+        --key-schema AttributeName=id,KeyType=HASH \
+        --attribute-definitions AttributeName=id,AttributeType=N \
+        --billing-mode PAY_PER_REQUEST
+    aws dynamodb create-table \
+        --endpoint-url http://localhost:9000 \
+        --table-name blobs \
+        --key-schema AttributeName=binmark,KeyType=HASH \
+        --attribute-definitions AttributeName=binmark,AttributeType=B \
+        --billing-mode PAY_PER_REQUEST
+    aws dynamodb create-table \
+        --endpoint-url http://localhost:9000 \
+        --table-name binsorted \
+        --key-schema AttributeName=id,KeyType=HASH AttributeName=binmark,KeyType=RANGE \
+        --attribute-definitions AttributeName=id,AttributeType=S AttributeName=binmark,AttributeType=B \
+        --billing-mode PAY_PER_REQUEST
+    aws dynamodb create-table \
+        --endpoint-url http://localhost:9000 \
+        --table-name messages \
+        --key-schema AttributeName=thread,KeyType=HASH AttributeName=ts,KeyType=RANGE \
+        --attribute-definitions AttributeName=thread,AttributeType=S AttributeName=ts,AttributeType=S \
+        --billing-mode PAY_PER_REQUEST
 
 # Run rektifier with the example config
 run:
     REKTIFIER_CONFIG=rektifier.toml.example cargo run --bin rektifier
 
-# Smoke: PutItem then GetItem against rektifier (assumes bootstrap-pg was run).
+# Smoke: PutItem then GetItem against rektifier (assumes bootstrap-tables was run).
 smoke-put-get:
     aws dynamodb put-item \
         --endpoint-url http://localhost:9000 \
@@ -82,7 +120,7 @@ bench-build:
 
 # Profile a workload under tracing-flame and emit flamegraph.svg.
 # Requires `cargo install inferno` once (for the inferno-flamegraph binary).
-# Assumes docker + bootstrap-pg already applied, and ddb-local users table
+# Assumes docker + bootstrap-tables already applied, and ddb-local users table
 # created via `./target/release/rekt-bench setup-ddb-local` (only needed
 # if you switch the workload to --target ddb-local).
 flame:
@@ -99,7 +137,7 @@ flame:
     @echo 'wrote flamegraph.svg — open it in a browser'
 
 # Run a quick (10s/target/workload) bench across all three targets for put + get.
-# Assumes: docker up + bootstrap-pg applied + rektifier running + ddb-local
+# Assumes: docker up + bootstrap-tables applied + rektifier running + ddb-local
 # `users` table created (`./target/release/rekt-bench setup-ddb-local`).
 bench-quick: bench-build
     ./target/release/rekt-bench setup-ddb-local

@@ -9,7 +9,6 @@ description = "Runtime catalog of DDB tables for rektifier (cache + metadata tab
 [dependencies]
 arc-swap = { workspace = true }
 deadpool-postgres = { workspace = true }
-rekt-config = { path = "../rekt-config" }
 rekt-storage = { path = "../rekt-storage" }
 rekt-translator = { path = "../rekt-translator" }
 serde_json = { workspace = true }

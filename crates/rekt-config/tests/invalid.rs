@@ -1,4 +1,8 @@
 //! Tests for invalid configs — every validation rule, one failing case each.
+//!
+//! Table-shape rules moved out of TOML in PLAN-10 D8; those validations
+//! now live in `rekt-ddl::validation` and are exercised against the
+//! `CreateTable` request shape (see `rekt-ddl::validation::tests`).
 
 use rekt_config::{load_from_str, ConfigError};
 
@@ -11,14 +15,7 @@ fn err_msg(toml: &str) -> String {
 
 #[test]
 fn missing_server_section() {
-    let r = load_from_str(
-        r#"
-[[tables]]
-name      = "t"
-pk_attr   = "id"
-jsonb_col = "data"
-"#,
-    );
+    let r = load_from_str("");
     assert!(matches!(r, Err(ConfigError::ParseToml(_))));
 }
 
@@ -34,27 +31,6 @@ mystery_field = true
     );
     assert!(
         msg.contains("unknown field") || msg.contains("mystery_field"),
-        "got: {msg}"
-    );
-}
-
-#[test]
-fn unknown_field_in_table() {
-    let msg = err_msg(
-        r#"
-[server]
-listen_addr  = "127.0.0.1:9000"
-database_url = "postgres://x"
-
-[[tables]]
-name      = "t"
-pk_attr   = "id"
-jsonb_col = "data"
-ttl_attr  = "expires_at"
-"#,
-    );
-    assert!(
-        msg.contains("unknown field") || msg.contains("ttl_attr"),
         "got: {msg}"
     );
 }
@@ -81,122 +57,6 @@ database_url = ""
 "#,
     );
     assert!(msg.contains("database_url"), "got: {msg}");
-}
-
-#[test]
-fn sk_attr_without_sk_type() {
-    let msg = err_msg(
-        r#"
-[server]
-listen_addr  = "127.0.0.1:9000"
-database_url = "postgres://x"
-
-[[tables]]
-name      = "t"
-pk_attr   = "id"
-sk_attr   = "ts"
-jsonb_col = "doc"
-"#,
-    );
-    assert!(
-        msg.contains("sk_attr") && msg.contains("sk_type"),
-        "got: {msg}"
-    );
-}
-
-#[test]
-fn sk_type_without_sk_attr() {
-    let msg = err_msg(
-        r#"
-[server]
-listen_addr  = "127.0.0.1:9000"
-database_url = "postgres://x"
-
-[[tables]]
-name      = "t"
-pk_attr   = "id"
-sk_type   = "N"
-jsonb_col = "doc"
-"#,
-    );
-    assert!(
-        msg.contains("sk_attr") && msg.contains("sk_type"),
-        "got: {msg}"
-    );
-}
-
-#[test]
-fn duplicate_table_name() {
-    let msg = err_msg(
-        r#"
-[server]
-listen_addr  = "127.0.0.1:9000"
-database_url = "postgres://x"
-
-[[tables]]
-name      = "users"
-pk_attr   = "id"
-jsonb_col = "data"
-
-[[tables]]
-name      = "users"
-pk_attr   = "id"
-jsonb_col = "data2"
-"#,
-    );
-    assert!(
-        msg.contains("duplicate table name") && msg.contains("users"),
-        "got: {msg}"
-    );
-}
-
-#[test]
-fn duplicate_pg_table() {
-    let msg = err_msg(
-        r#"
-[server]
-listen_addr  = "127.0.0.1:9000"
-database_url = "postgres://x"
-
-[[tables]]
-name      = "users_a"
-pg_table  = "shared"
-pk_attr   = "id"
-jsonb_col = "data"
-
-[[tables]]
-name      = "users_b"
-pg_table  = "shared"
-pk_attr   = "id"
-jsonb_col = "data"
-"#,
-    );
-    assert!(
-        msg.contains("duplicate pg_table") && msg.contains("shared"),
-        "got: {msg}"
-    );
-}
-
-#[test]
-fn bad_pk_type_string() {
-    let msg = err_msg(
-        r#"
-[server]
-listen_addr  = "127.0.0.1:9000"
-database_url = "postgres://x"
-
-[[tables]]
-name      = "t"
-pk_attr   = "id"
-pk_type   = "Z"
-jsonb_col = "data"
-"#,
-    );
-    // serde reports unknown variant; just check the field name appears.
-    assert!(
-        msg.contains("Z") || msg.to_lowercase().contains("variant"),
-        "got: {msg}"
-    );
 }
 
 #[test]

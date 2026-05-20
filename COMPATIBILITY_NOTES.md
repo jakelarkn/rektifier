@@ -291,22 +291,27 @@ layers.
 
 ## Configuration
 
-### Tables must be declared in `rektifier.toml` ahead of time — Strict
+### Tables are runtime objects created via `CreateTable` — Parity
 
-DDB tables are created dynamically via `CreateTable`. Rektifier
-currently treats the config TOML as the source of truth: tables not
-listed in the config are rejected with `ResourceNotFoundException`
-at the translator boundary. There is no `CreateTable` /
-`DescribeTable` / `DeleteTable` API yet.
+(Closed by PLAN-10 D8.) Pre-D8, tables were declared in
+`rektifier.toml` under `[[tables]]` and resolved at process startup.
+As of D8, the wire DDL API (`CreateTable` / `DeleteTable` /
+`UpdateTable`) is the sole provisioning surface; the
+`_rektifier_tables` PG catalog is the source of truth.
 
-**Migration risk:** SDK clients that call `CreateTable` (e.g.
-`DynamoDbClient::createTable` in tests or migration tooling) fail
-against rektifier.
+Closed divergences (kept for historical context):
+- `CreateTable` returned `UnknownOperationException` — fixed in D6.
+- `DescribeTable` / `ListTables` returned `UnknownOperationException`
+  — fixed in D5.
+- `DeleteTable` / `UpdateTable` returned `UnknownOperationException`
+  — fixed in D7.
 
-**Closure plan:** tracked in `PLAN-10-ddl-operations.md`. D6 lands
-`CreateTable` and switches the source of truth to the
-`_rektifier_tables` catalog; D8 deletes the `[[tables]]` block from
-TOML entirely.
+Standing divergences in this area are tracked separately:
+"DescribeTable wire-status masks internal failure states" (Observable),
+"PG table name is auto-derived" (Strict), "TableArn is synthesized
+with empty region/account" (Observable + Strict), "Unserveable tables
+surface as ResourceNotFoundException" (Strict cause, Observable
+message).
 
 ### Unserveable tables surface as `ResourceNotFoundException` — Strict (cause), Observable (message)
 

@@ -11,7 +11,7 @@
 //! sustained ops/sec, recorded into an HDR histogram during the run.
 //!
 //! Prereqs (operator owns; see README / justfile):
-//!   - PG `users` table created via `just bootstrap-pg`
+//!   - PG `users` table created via `just bootstrap-tables`
 //!   - rektifier running with `rektifier.toml.example` (for `--target rektifier`)
 //!   - dynamodb-local `users` table created (the diff tests' `ensure_ref_table`
 //!     does this; the `setup-ddb-local` subcommand also does it here)

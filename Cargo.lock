@@ -1388,7 +1388,6 @@ version = "0.0.1"
 dependencies = [
  "arc-swap",
  "deadpool-postgres",
- "rekt-config",
  "rekt-storage",
  "rekt-translator",
  "serde_json",

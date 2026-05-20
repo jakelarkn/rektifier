@@ -23,13 +23,13 @@ prints PASS / FAIL and the process exits non-zero on any failure.
 - **JDK 17+** (`java -version`).
 - **Maven 3.6+** (`mvn -version`). On macOS: `brew install maven`.
 - **rektifier listening on `127.0.0.1:9000`** with the tables in
-  `rektifier.toml.example` declared and `just bootstrap-pg` applied.
+  `rektifier.toml.example` declared and `just bootstrap-tables` applied.
 
 ## Running
 
 ```sh
 # rektifier must be up; e.g.
-just bootstrap-pg
+just bootstrap-tables
 REKTIFIER_CONFIG=rektifier.toml.example cargo run --release --bin rektifier &
 
 # v1

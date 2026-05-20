@@ -4,15 +4,19 @@
 //! 1. Initialize structured tracing (`REKTIFIER_LOG` env filter).
 //! 2. Load config from `REKTIFIER_CONFIG` (path to TOML) — hard-exit on parse error.
 //! 3. Build a deadpool-postgres `Pool` against the configured `database_url`.
-//! 4. Ensure `_rektifier_tables` exists; seed TOML `[[tables]]` into it
-//!    via idempotent upsert (transitional through D7; removed in D8).
+//! 4. Ensure `_rektifier_tables` exists (catalog bootstrap).
 //! 5. Run one synchronous reconcile pass: introspect each cataloged
 //!    table against `information_schema`, flip `serveable` per-table.
 //!    Drift on table X no longer blocks startup; the reconciler emits
 //!    error-level logs for any unserveable row.
-//! 6. Build `AppState { verifier, backend, catalog }`.
+//! 6. Build `AppState { verifier, backend, catalog, ddl }`.
 //! 7. Spawn the periodic reconciler task (PLAN-10 KD3).
 //! 8. Bind on `listen_addr`, serve `rekt_server::router(state)`.
+//!
+//! Tables are runtime objects, declared exclusively via the DDB
+//! `CreateTable` wire API (PLAN-10 D8). A fresh rektifier process
+//! against a fresh PG starts with an empty catalog; the operator
+//! issues `CreateTable` to populate it.
 //!
 //! The verifier wired in for MVP is `PermissiveVerifier` — SigV4 signatures
 //! are NOT validated. Don't expose this to untrusted networks until
@@ -41,11 +45,7 @@ async fn main() -> Result<()> {
     let config_path = PathBuf::from(config_path);
     let config = rekt_config::load_from_path(&config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
-    tracing::info!(
-        path = %config_path.display(),
-        tables = config.tables.len(),
-        "config loaded"
-    );
+    tracing::info!(path = %config_path.display(), "config loaded");
 
     let pool = build_pool(&config.server.database_url, &config.pg)
         .context("building Postgres pool")?;
@@ -60,14 +60,6 @@ async fn main() -> Result<()> {
     rekt_catalog::ensure_metadata_tables(&pool)
         .await
         .context("ensuring _rektifier_tables exists")?;
-    let seeded = rekt_catalog::seed_from_config(&pool, &config.tables)
-        .await
-        .context("seeding TOML [[tables]] into _rektifier_tables")?;
-    tracing::info!(
-        seeded,
-        total = config.tables.len(),
-        "seeder upserted TOML tables into _rektifier_tables"
-    );
 
     let catalog = Arc::new(TableCatalog::empty());
     let reconciler = Arc::new(Reconciler::new(

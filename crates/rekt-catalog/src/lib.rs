@@ -25,7 +25,6 @@
 pub mod bootstrap;
 pub mod metadata;
 pub mod reconciler;
-pub mod seeder;
 
 use arc_swap::ArcSwap;
 use rekt_translator::TableSchema;
@@ -35,7 +34,6 @@ use std::sync::Arc;
 pub use bootstrap::ensure_metadata_tables;
 pub use metadata::{load_snapshot, MetadataRow};
 pub use reconciler::{ReconcileVerdict, Reconciler};
-pub use seeder::seed_from_config;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {

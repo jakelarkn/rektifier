@@ -5,7 +5,7 @@
 //!
 //! Setup:
 //! 1. `just up` (docker compose for PG + dynamodb-local).
-//! 2. `just bootstrap-pg` (creates the `users` and `device_events` PG tables).
+//! 2. `just bootstrap-tables` (creates the `users` and `device_events` PG tables).
 //! 3. Start rektifier: `REKTIFIER_CONFIG=rektifier.toml.example cargo run --bin rektifier`.
 //! 4. Run: `cargo test -p rekt-diff-tests -- --ignored`.
 //!
@@ -275,7 +275,7 @@ fn ensure_messages_table() {
 // ===== Test cases =============================================================
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_s_only() {
     ensure_users_table();
     assert_round_trip_matches(
@@ -286,7 +286,7 @@ fn diff_s_only() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_high_precision_number_attribute() {
     ensure_users_table();
     // 30 digits — within DDB's 38 limit. Verbatim text round-trip; no canonicalization.
@@ -298,7 +298,7 @@ fn diff_high_precision_number_attribute() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_binary_value() {
     ensure_users_table();
     // base64("\x00\x01\x02\xff") = "AAEC/w=="
@@ -310,7 +310,7 @@ fn diff_binary_value() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_bool_true() {
     ensure_users_table();
     assert_round_trip_matches(
@@ -321,7 +321,7 @@ fn diff_bool_true() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_bool_false() {
     ensure_users_table();
     assert_round_trip_matches(
@@ -332,7 +332,7 @@ fn diff_bool_false() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_null() {
     ensure_users_table();
     assert_round_trip_matches(
@@ -343,7 +343,7 @@ fn diff_null() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_list_mixed_types() {
     ensure_users_table();
     assert_round_trip_matches(
@@ -354,7 +354,7 @@ fn diff_list_mixed_types() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_nested_map() {
     ensure_users_table();
     assert_round_trip_matches(
@@ -365,7 +365,7 @@ fn diff_nested_map() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_string_set() {
     ensure_users_table();
     assert_round_trip_matches(
@@ -376,7 +376,7 @@ fn diff_string_set() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_number_set() {
     ensure_users_table();
     assert_round_trip_matches(
@@ -387,7 +387,7 @@ fn diff_number_set() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_binary_set() {
     ensure_users_table();
     // base64("a") == "YQ==", base64("bb") == "YmI=", base64("ccc") == "Y2Nj"
@@ -401,7 +401,7 @@ fn diff_binary_set() {
 // ===== Empty-collection edges ================================================
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_empty_string_value() {
     ensure_users_table();
     // DDB has allowed empty S values since 2020.
@@ -413,7 +413,7 @@ fn diff_empty_string_value() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_empty_binary_value() {
     ensure_users_table();
     // Empty base64 -> 0 bytes. DDB has allowed empty B values since 2020.
@@ -425,7 +425,7 @@ fn diff_empty_binary_value() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_empty_list() {
     ensure_users_table();
     assert_round_trip_matches(
@@ -436,7 +436,7 @@ fn diff_empty_list() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_empty_map() {
     ensure_users_table();
     assert_round_trip_matches(
@@ -452,7 +452,7 @@ fn diff_empty_map() {
 // shapes a DDB item commonly takes (list of lists, list of maps, map of lists).
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_list_of_lists() {
     ensure_users_table();
     assert_round_trip_matches(
@@ -463,7 +463,7 @@ fn diff_list_of_lists() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_list_of_maps() {
     ensure_users_table();
     assert_round_trip_matches(
@@ -474,7 +474,7 @@ fn diff_list_of_maps() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_map_of_lists() {
     ensure_users_table();
     assert_round_trip_matches(
@@ -485,7 +485,7 @@ fn diff_map_of_lists() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_composite_key_with_numeric_sort_key() {
     ensure_device_events_table();
     assert_round_trip_matches(
@@ -496,7 +496,7 @@ fn diff_composite_key_with_numeric_sort_key() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_delete_then_get_returns_empty() {
     ensure_users_table();
     let table = "users";
@@ -567,7 +567,7 @@ fn diff_delete_then_get_returns_empty() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_delete_nonexistent_is_idempotent() {
     ensure_users_table();
     let key = r#"{"id":{"S":"diff_delete_never_existed"}}"#;
@@ -613,7 +613,7 @@ fn strip_metadata(mut v: Value) -> Value {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_get_missing_returns_empty() {
     ensure_users_table();
     let key = r#"{"id":{"S":"diff_definitely_not_present_anywhere"}}"#;
@@ -702,7 +702,7 @@ fn assert_update_round_trip_matches(
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_set_on_missing_row_upserts() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -721,7 +721,7 @@ fn diff_update_set_on_missing_row_upserts() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_set_on_existing_row_merges() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -740,7 +740,7 @@ fn diff_update_set_on_existing_row_merges() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_remove_present_attribute() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -757,7 +757,7 @@ fn diff_update_remove_present_attribute() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_remove_absent_attribute_is_noop() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -769,7 +769,7 @@ fn diff_update_remove_absent_attribute_is_noop() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_set_and_remove_combined() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -788,7 +788,7 @@ fn diff_update_set_and_remove_combined() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_set_all_attribute_value_variants() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -818,7 +818,7 @@ fn diff_update_set_all_attribute_value_variants() {
 // ---- Phase 4c: attribute_not_exists(pk) -----------------------------------
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_insert_only_succeeds_on_missing_row() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -843,7 +843,7 @@ fn diff_update_insert_only_succeeds_on_missing_row() {
 /// because both endpoints fail and the AWS CLI exits nonzero — we
 /// invoke them directly and assert the error shape matches.
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_insert_only_fails_on_existing_row() {
     ensure_users_table();
     let key = r##"{"id":{"S":"diff_io_clash"}}"##;
@@ -903,7 +903,7 @@ fn diff_update_insert_only_fails_on_existing_row() {
 // ---- Phase 4d: SimpleSql conditions (UPDATE … WHERE) ---------------------
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_attribute_exists_pk_succeeds_when_row_present() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -924,7 +924,7 @@ fn diff_update_attribute_exists_pk_succeeds_when_row_present() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_attribute_exists_pk_fails_when_row_missing() {
     ensure_users_table();
     let key = r##"{"id":{"S":"diff_ae_missing"}}"##;
@@ -959,7 +959,7 @@ fn diff_update_attribute_exists_pk_fails_when_row_missing() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_optimistic_lock_via_version() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -980,7 +980,7 @@ fn diff_update_optimistic_lock_via_version() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_optimistic_lock_mismatched_version_is_ccfe() {
     ensure_users_table();
     let key = r##"{"id":{"S":"diff_oplock_mismatch"}}"##;
@@ -1018,7 +1018,7 @@ fn diff_update_optimistic_lock_mismatched_version_is_ccfe() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_numeric_ordering() {
     ensure_users_table();
     // score < 100 → applies; sets score=50.
@@ -1038,7 +1038,7 @@ fn diff_update_numeric_ordering() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_string_ordering() {
     ensure_users_table();
     // #n >= "a" → applies. (`name` is a DDB reserved keyword, must be
@@ -1061,7 +1061,7 @@ fn diff_update_string_ordering() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_boolean_and_composition() {
     ensure_users_table();
     // `status` and `version` are both DDB reserved keywords; alias both.
@@ -1083,7 +1083,7 @@ fn diff_update_boolean_and_composition() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_boolean_or_composition() {
     ensure_users_table();
     // version = 1 OR status = "active" → true (status matches). Both
@@ -1106,7 +1106,7 @@ fn diff_update_boolean_or_composition() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_not_composition() {
     ensure_users_table();
     // NOT attribute_exists(deleted) → true when no `deleted` attr.
@@ -1131,7 +1131,7 @@ fn diff_update_not_composition() {
 // ---- Phase 3b/3c: slow-path UpdateExpression RHS forms -------------------
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_set_path_ref() {
     ensure_users_table();
     // `source` is DDB-reserved; alias it.
@@ -1149,7 +1149,7 @@ fn diff_update_set_path_ref() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_arithmetic_increment() {
     ensure_users_table();
     // `counter` is DDB-reserved; alias it.
@@ -1169,7 +1169,7 @@ fn diff_update_arithmetic_increment() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_arithmetic_decrement() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -1188,7 +1188,7 @@ fn diff_update_arithmetic_decrement() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_if_not_exists_preserves() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -1205,7 +1205,7 @@ fn diff_update_if_not_exists_preserves() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_if_not_exists_uses_fallback() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -1222,7 +1222,7 @@ fn diff_update_if_not_exists_uses_fallback() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_list_append_appends() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -1239,7 +1239,7 @@ fn diff_update_list_append_appends() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_list_append_prepends() {
     ensure_users_table();
     // list_append(:new, tags) prepends.
@@ -1259,7 +1259,7 @@ fn diff_update_list_append_prepends() {
 // ---- Phase 4e: slow-path condition shapes ---------------------------------
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_begins_with_condition() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -1280,7 +1280,7 @@ fn diff_update_begins_with_condition() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_contains_set_membership() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -1299,7 +1299,7 @@ fn diff_update_contains_set_membership() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_between_numeric() {
     ensure_users_table();
     // `score` is DDB-reserved → alias.
@@ -1321,7 +1321,7 @@ fn diff_update_between_numeric() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_in_list() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -1342,7 +1342,7 @@ fn diff_update_in_list() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_attribute_type() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -1365,7 +1365,7 @@ fn diff_update_attribute_type() {
 // ---- Phase 5: ADD ---------------------------------------------------------
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_add_numeric_increments() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -1384,7 +1384,7 @@ fn diff_update_add_numeric_increments() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_add_numeric_on_missing_row() {
     ensure_users_table();
     let key = r##"{"id":{"S":"diff_add_new"}}"##;
@@ -1422,7 +1422,7 @@ fn diff_update_add_numeric_on_missing_row() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_add_set_union() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -1441,7 +1441,7 @@ fn diff_update_add_set_union() {
 // ---- Phase 6: DELETE ------------------------------------------------------
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_delete_set_removes_subset() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -1458,7 +1458,7 @@ fn diff_update_delete_set_removes_subset() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_delete_set_emptied_removes_attribute() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -1475,7 +1475,7 @@ fn diff_update_delete_set_emptied_removes_attribute() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_delete_path_absent_noop() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -1513,7 +1513,7 @@ fn run_for_error(endpoint: &str, args: &[&str]) -> String {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_composite_key() {
     ensure_device_events_table();
     assert_update_round_trip_matches(
@@ -1532,7 +1532,7 @@ fn diff_update_composite_key() {
 // ---- Phase 7a: ReturnValues=ALL_NEW --------------------------------------
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_all_new_insert() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -1553,7 +1553,7 @@ fn diff_update_return_values_all_new_insert() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_all_new_update_merge() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -1574,7 +1574,7 @@ fn diff_update_return_values_all_new_update_merge() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_all_new_with_remove() {
     // Verifies the response reflects post-update state including REMOVE.
     ensure_users_table();
@@ -1592,7 +1592,7 @@ fn diff_update_return_values_all_new_with_remove() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_all_new_insert_only_path() {
     // InsertOnlyOnPk routing — attribute_not_exists(pk) on a missing row.
     ensure_users_table();
@@ -1616,7 +1616,7 @@ fn diff_update_return_values_all_new_insert_only_path() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_all_new_sql_cond_path() {
     // SimpleSql routing — optimistic-lock pattern.
     ensure_users_table();
@@ -1640,7 +1640,7 @@ fn diff_update_return_values_all_new_sql_cond_path() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_all_new_tx_path() {
     // Path-ref RHS forces the slow (tx) path.
     ensure_users_table();
@@ -1660,7 +1660,7 @@ fn diff_update_return_values_all_new_tx_path() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_all_new_add_numeric() {
     // ADD :n on the tx path; ALL_NEW must reflect the incremented value.
     ensure_users_table();
@@ -1684,7 +1684,7 @@ fn diff_update_return_values_all_new_add_numeric() {
 // ---- Phase 7b: ReturnValues=ALL_OLD --------------------------------------
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_all_old_on_insert_omits_attributes() {
     // No prior row → both endpoints must omit `Attributes`.
     ensure_users_table();
@@ -1702,7 +1702,7 @@ fn diff_update_return_values_all_old_on_insert_omits_attributes() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_all_old_on_update_returns_pre_image() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -1719,7 +1719,7 @@ fn diff_update_return_values_all_old_on_update_returns_pre_image() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_all_old_with_remove() {
     // ALL_OLD must include the attribute that this UPDATE removed.
     ensure_users_table();
@@ -1735,7 +1735,7 @@ fn diff_update_return_values_all_old_with_remove() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_all_old_insert_only_path() {
     // InsertOnlyOnPk succeeds only when row is absent → ALL_OLD has
     // nothing to return.
@@ -1755,7 +1755,7 @@ fn diff_update_return_values_all_old_insert_only_path() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_all_old_sql_cond_path() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -1772,7 +1772,7 @@ fn diff_update_return_values_all_old_sql_cond_path() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_all_old_tx_path() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -1788,7 +1788,7 @@ fn diff_update_return_values_all_old_tx_path() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_all_old_add_numeric() {
     // ADD :n on the tx path; ALL_OLD must reflect the pre-increment value.
     ensure_users_table();
@@ -1808,7 +1808,7 @@ fn diff_update_return_values_all_old_add_numeric() {
 // ---- Phase 7c: ReturnValues=UPDATED_NEW / UPDATED_OLD --------------------
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_updated_new_set() {
     // UPDATED_NEW must contain only the touched attribute, with its
     // post-update value.
@@ -1827,7 +1827,7 @@ fn diff_update_return_values_updated_new_set() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_updated_old_set() {
     // UPDATED_OLD must contain only the touched attribute, with its
     // pre-update value.
@@ -1846,7 +1846,7 @@ fn diff_update_return_values_updated_old_set() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_updated_new_on_remove_omits_attrs() {
     // REMOVE → touched attr no longer exists → UPDATED_NEW omits
     // Attributes (or projection is empty — both endpoints should agree).
@@ -1863,7 +1863,7 @@ fn diff_update_return_values_updated_new_on_remove_omits_attrs() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_updated_old_on_remove_returns_pre_value() {
     ensure_users_table();
     assert_update_round_trip_matches(
@@ -1878,7 +1878,7 @@ fn diff_update_return_values_updated_old_on_remove_returns_pre_value() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_updated_old_on_fresh_insert_omits_attributes() {
     // No prior row → UPDATED_OLD has nothing.
     ensure_users_table();
@@ -1896,7 +1896,7 @@ fn diff_update_return_values_updated_old_on_fresh_insert_omits_attributes() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_updated_new_add_numeric() {
     // ADD :n on tx path → UPDATED_NEW returns incremented value only.
     ensure_users_table();
@@ -1913,7 +1913,7 @@ fn diff_update_return_values_updated_new_add_numeric() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_update_return_values_updated_new_mixed_set_and_remove() {
     // Two touched paths — verifies the projection includes both.
     ensure_users_table();
@@ -1938,7 +1938,7 @@ fn diff_update_return_values_updated_new_mixed_set_and_remove() {
 // focused on translator/storage logic.
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_reject_reserved_bare_name_in_update_expression() {
     ensure_users_table();
     let args = &[
@@ -1963,7 +1963,7 @@ fn diff_reject_reserved_bare_name_in_update_expression() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_reject_reserved_bare_name_in_condition_expression() {
     ensure_users_table();
     let args = &[
@@ -1989,7 +1989,7 @@ fn diff_reject_reserved_bare_name_in_condition_expression() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_aliased_reserved_name_is_accepted() {
     // Verifies the bypass: `#n → "name"` succeeds on both endpoints
     // because the parser only sees the placeholder.
@@ -2087,7 +2087,7 @@ fn assert_delete_round_trip_matches(
 // ---- Conditional PutItem -----------------------------------------------------
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_put_attribute_not_exists_succeeds_on_missing() {
     ensure_users_table();
     assert_put_round_trip_matches(
@@ -2100,7 +2100,7 @@ fn diff_put_attribute_not_exists_succeeds_on_missing() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_put_attribute_not_exists_fails_when_row_exists() {
     ensure_users_table();
     let key = r##"{"id":{"S":"diff_put_ane_dup"}}"##;
@@ -2121,7 +2121,7 @@ fn diff_put_attribute_not_exists_fails_when_row_exists() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_put_optimistic_lock_matched() {
     ensure_users_table();
     assert_put_round_trip_matches(
@@ -2137,7 +2137,7 @@ fn diff_put_optimistic_lock_matched() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_put_optimistic_lock_stale_is_ccfe() {
     ensure_users_table();
     let key = r##"{"id":{"S":"diff_put_oplock_stale"}}"##;
@@ -2159,7 +2159,7 @@ fn diff_put_optimistic_lock_stale_is_ccfe() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_put_all_old_on_overwrite_returns_pre_image() {
     ensure_users_table();
     assert_put_round_trip_matches(
@@ -2172,7 +2172,7 @@ fn diff_put_all_old_on_overwrite_returns_pre_image() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_put_all_old_on_insert_omits_attributes() {
     ensure_users_table();
     assert_put_round_trip_matches(
@@ -2187,7 +2187,7 @@ fn diff_put_all_old_on_insert_omits_attributes() {
 // ---- Conditional DeleteItem --------------------------------------------------
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_delete_attribute_exists_succeeds_when_present() {
     ensure_users_table();
     assert_delete_round_trip_matches(
@@ -2199,7 +2199,7 @@ fn diff_delete_attribute_exists_succeeds_when_present() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_delete_attribute_exists_fails_when_row_missing() {
     ensure_users_table();
     let key = r##"{"id":{"S":"diff_del_ae_missing"}}"##;
@@ -2217,7 +2217,7 @@ fn diff_delete_attribute_exists_fails_when_row_missing() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_delete_optimistic_lock_matched() {
     ensure_users_table();
     assert_delete_round_trip_matches(
@@ -2232,7 +2232,7 @@ fn diff_delete_optimistic_lock_matched() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_delete_all_old_returns_deleted_item() {
     ensure_users_table();
     assert_delete_round_trip_matches(
@@ -2244,7 +2244,7 @@ fn diff_delete_all_old_returns_deleted_item() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_delete_all_old_on_missing_omits_attributes() {
     ensure_users_table();
     assert_delete_round_trip_matches(
@@ -2265,7 +2265,7 @@ fn diff_delete_all_old_on_missing_omits_attributes() {
 // `users` / `device_events` tables.
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_n_pk_round_trip() {
     ensure_counters_table();
     assert_round_trip_matches(
@@ -2276,7 +2276,7 @@ fn diff_n_pk_round_trip() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_n_pk_update_increment() {
     ensure_counters_table();
     assert_update_round_trip_matches(
@@ -2291,7 +2291,7 @@ fn diff_n_pk_update_increment() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_n_pk_conditional_delete_all_old() {
     ensure_counters_table();
     assert_delete_round_trip_matches(
@@ -2306,7 +2306,7 @@ fn diff_n_pk_conditional_delete_all_old() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_b_pk_round_trip() {
     ensure_blobs_table();
     assert_round_trip_matches(
@@ -2317,7 +2317,7 @@ fn diff_b_pk_round_trip() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_b_pk_update_set() {
     ensure_blobs_table();
     assert_update_round_trip_matches(
@@ -2332,7 +2332,7 @@ fn diff_b_pk_update_set() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_b_pk_put_all_old_overwrites() {
     ensure_blobs_table();
     assert_put_round_trip_matches(
@@ -2345,7 +2345,7 @@ fn diff_b_pk_put_all_old_overwrites() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_composite_b_sort_round_trip() {
     ensure_binsorted_table();
     assert_round_trip_matches(
@@ -2356,7 +2356,7 @@ fn diff_composite_b_sort_round_trip() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_composite_b_sort_two_keys_in_same_partition() {
     // Two distinct items sharing the same partition but different B sort
     // keys must coexist under both endpoints.
@@ -2433,7 +2433,7 @@ fn assert_query_matches(table: &str, kce: &str, eav: &str, extra: &[&str]) {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_pk_only() {
     ensure_device_events_table();
     // Use a unique pk so this test is idempotent across re-runs.
@@ -2461,7 +2461,7 @@ fn diff_query_pk_only() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_sk_equality() {
     ensure_device_events_table();
     let pk = "diff-q-sk-eq";
@@ -2483,7 +2483,7 @@ fn diff_query_sk_equality() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_sk_range() {
     ensure_device_events_table();
     let pk = "diff-q-sk-range";
@@ -2505,7 +2505,7 @@ fn diff_query_sk_range() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_sk_between() {
     ensure_device_events_table();
     let pk = "diff-q-sk-btw";
@@ -2532,7 +2532,7 @@ fn diff_query_sk_between() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_sk_begins_with_string() {
     ensure_messages_table();
     let pk = "diff-q-bw";
@@ -2559,7 +2559,7 @@ fn diff_query_sk_begins_with_string() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_empty_partition() {
     ensure_device_events_table();
     let pk = "diff-q-empty-no-such-partition";
@@ -2568,7 +2568,7 @@ fn diff_query_empty_partition() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_unknown_table_both_reject() {
     // Both DDB-local and rektifier should reject a query against a
     // non-existent table — the error class matters more than wording.
@@ -2611,7 +2611,7 @@ fn diff_query_unknown_table_both_reject() {
 // ===== Query Q2: Limit + ExclusiveStartKey / LastEvaluatedKey ==============
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_limit_sets_lek() {
     ensure_device_events_table();
     let pk = "diff-q-lek";
@@ -2648,7 +2648,7 @@ fn diff_query_limit_sets_lek() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_multi_page_traversal() {
     ensure_device_events_table();
     let pk = "diff-q-page";
@@ -2696,7 +2696,7 @@ fn diff_query_multi_page_traversal() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_last_page_no_lek() {
     ensure_device_events_table();
     let pk = "diff-q-lastpg";
@@ -2732,7 +2732,7 @@ fn diff_query_last_page_no_lek() {
 // ===== Query Q3: FilterExpression vs DDB-local =============================
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_filter_drops_some_rows() {
     ensure_device_events_table();
     let pk = "diff-q-filt-some";
@@ -2765,7 +2765,7 @@ fn diff_query_filter_drops_some_rows() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_filter_with_limit_lek_when_count_zero() {
     ensure_device_events_table();
     let pk = "diff-q-filt-lim";
@@ -2803,7 +2803,7 @@ fn diff_query_filter_with_limit_lek_when_count_zero() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_filter_attribute_exists() {
     ensure_device_events_table();
     let pk = "diff-q-filt-ae";
@@ -2870,7 +2870,7 @@ fn extract_keyish(item: &Value, attr: &str) -> String {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_scan_users_round_trip() {
     // Both endpoints accumulate state across many test runs (and
     // DDB-local in particular is never reset between sessions), so
@@ -2920,7 +2920,7 @@ fn diff_scan_users_round_trip() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_scan_composite_round_trip() {
     // Scope to the partition we just seeded; see notes on
     // `diff_scan_users_round_trip` for why we can't compare absolute
@@ -2960,7 +2960,7 @@ fn diff_scan_composite_round_trip() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_scan_unknown_table_both_reject() {
     let stderr_ref = aws_expecting_failure(
         REF,
@@ -2983,7 +2983,7 @@ fn diff_scan_unknown_table_both_reject() {
 // ===== Q5: Scan paging + filter; Query descending vs DDB-local ============
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_scan_limit_sets_lek() {
     ensure_device_events_table();
     let pk = "diff-scan-lim";
@@ -3020,7 +3020,7 @@ fn diff_scan_limit_sets_lek() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_scan_filter_drops_some_rows() {
     ensure_device_events_table();
     let pk = "diff-scan-filt";
@@ -3066,7 +3066,7 @@ fn diff_scan_filter_drops_some_rows() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_descending_traversal() {
     ensure_device_events_table();
     let pk = "diff-q-desc";
@@ -3097,7 +3097,7 @@ fn diff_query_descending_traversal() {
 // ===== Q6: Select=COUNT + ProjectionExpression vs DDB-local ===============
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_select_count() {
     ensure_device_events_table();
     let pk = "diff-q-count";
@@ -3134,7 +3134,7 @@ fn diff_query_select_count() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_projection_prunes_attributes() {
     ensure_device_events_table();
     let pk = "diff-q-proj";
@@ -3160,7 +3160,7 @@ fn diff_query_projection_prunes_attributes() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_scan_select_count() {
     // DDB-local accumulates across runs, so a bare Scan + COUNT
     // compares non-deterministic totals. Add a tier-tag attribute
@@ -3211,7 +3211,7 @@ fn ensure_binsorted_table_q5() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_scan_blobs_b_pk_round_trip() {
     ensure_blobs_table();
     // Three binary keys; insert distinct base64 values.
@@ -3239,7 +3239,7 @@ fn diff_scan_blobs_b_pk_round_trip() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_blobs_b_pk_round_trip() {
     ensure_blobs_table();
     let k = "AAFF";
@@ -3265,7 +3265,7 @@ fn diff_query_blobs_b_pk_round_trip() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_binsorted_sb_composite() {
     ensure_binsorted_table_q5();
     let pk = "diff-binsorted";
@@ -3297,7 +3297,7 @@ fn diff_query_binsorted_sb_composite() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_binsorted_begins_with_b_sk_divergence() {
     // PLAN-4 D8: begins_with on a B-typed SK is deferred in rektifier.
     // DDB-local actually accepts the request (returns 0 items in a
@@ -3345,7 +3345,7 @@ fn diff_query_binsorted_begins_with_b_sk_divergence() {
 // ----- N-PK Query/Scan + ordering ------------------------------------------
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_counters_n_pk() {
     ensure_counters_table();
     for n in [10, 1, 20, 2] {
@@ -3376,7 +3376,7 @@ fn diff_query_counters_n_pk() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_scan_counters_n_pk_ordering() {
     ensure_counters_table();
     // Insert in a non-monotonic order to flush out any lex-vs-numeric
@@ -3407,7 +3407,7 @@ fn diff_scan_counters_n_pk_ordering() {
 // ----- Type round-trip across all 10 AttributeValue variants ---------------
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_type_coverage_all_av_variants() {
     ensure_device_events_table();
     let pk = "diff-q-typecov";
@@ -3484,7 +3484,7 @@ fn drop_filter_corpus(pk: &str) {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_filter_comparison_ops() {
     let pk = "diff-q-filt-cmp";
     seed_filter_corpus(pk);
@@ -3512,7 +3512,7 @@ fn diff_query_filter_comparison_ops() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_filter_and_or_not() {
     let pk = "diff-q-filt-bool";
     seed_filter_corpus(pk);
@@ -3553,7 +3553,7 @@ fn diff_query_filter_and_or_not() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_filter_between_and_in() {
     let pk = "diff-q-filt-rangeset";
     seed_filter_corpus(pk);
@@ -3583,7 +3583,7 @@ fn diff_query_filter_between_and_in() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_filter_begins_with_contains_attr_type() {
     let pk = "diff-q-filt-fn";
     seed_filter_corpus(pk);
@@ -3617,7 +3617,7 @@ fn diff_query_filter_begins_with_contains_attr_type() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_filter_attribute_not_exists() {
     let pk = "diff-q-filt-nex";
     // 3 rows; some have `extra` set, some don't.
@@ -3649,7 +3649,7 @@ fn diff_query_filter_attribute_not_exists() {
 // ----- Error / rejection parity --------------------------------------------
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_invalid_limit_zero_both_reject() {
     let stderr_ref = aws_expecting_failure(REF, &[
         "dynamodb","query","--table-name","users",
@@ -3674,7 +3674,7 @@ fn diff_query_invalid_limit_zero_both_reject() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_invalid_select_both_reject() {
     let stderr_ref = aws_expecting_failure(REF, &[
         "dynamodb","query","--table-name","users",
@@ -3695,7 +3695,7 @@ fn diff_query_invalid_select_both_reject() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_count_with_projection_both_reject() {
     // DDB rejects Select=COUNT combined with ProjectionExpression as
     // a ValidationException. Rektifier matches per Q6 validation.
@@ -3724,7 +3724,7 @@ fn diff_query_count_with_projection_both_reject() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_malformed_esk_wrong_type_both_reject() {
     // Composite events table — provide an ESK with the wrong SK type.
     ensure_device_events_table();
@@ -3748,7 +3748,7 @@ fn diff_query_malformed_esk_wrong_type_both_reject() {
 // ----- Projection + filter combination -------------------------------------
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_projection_with_filter() {
     let pk = "diff-q-proj-filt";
     seed_filter_corpus(pk);
@@ -3778,7 +3778,7 @@ fn diff_query_projection_with_filter() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_projection_with_reserved_word_alias() {
     let pk = "diff-q-proj-resv";
     let item = format!(
@@ -3806,7 +3806,7 @@ fn diff_query_projection_with_reserved_word_alias() {
 // ----- Select=COUNT + filter (Count vs ScannedCount parity) ----------------
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_select_count_with_filter() {
     let pk = "diff-q-cnt-filt";
     seed_filter_corpus(pk);
@@ -3831,7 +3831,7 @@ fn diff_query_select_count_with_filter() {
 // ----- messages (S+S) — Scan + non-begins_with KCE operators ---------------
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_query_messages_sk_equality() {
     ensure_messages_table();
     let pk = "diff-msgs-eq";
@@ -3860,7 +3860,7 @@ fn diff_query_messages_sk_equality() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_scan_messages_round_trip() {
     ensure_messages_table();
     let pk = "diff-msgs-scan";
@@ -3888,7 +3888,7 @@ fn diff_scan_messages_round_trip() {
 // ===== BatchGetItem (B1) ======================================================
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_get_single_table_hash_only() {
     ensure_users_table();
     // Seed three rows on both endpoints.
@@ -3919,7 +3919,7 @@ fn diff_batch_get_single_table_hash_only() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_get_missing_keys_silently_omitted() {
     ensure_users_table();
     let item = "{\"id\":{\"S\":\"bg-only-hit\"},\"label\":{\"S\":\"present\"}}";
@@ -3945,7 +3945,7 @@ fn diff_batch_get_missing_keys_silently_omitted() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_get_all_misses_returns_empty_array() {
     ensure_users_table();
     let req_items = "{\"users\":{\"Keys\":[\
@@ -3962,7 +3962,7 @@ fn diff_batch_get_all_misses_returns_empty_array() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_get_composite_key_table() {
     ensure_device_events_table();
     let pk = "bg-comp-pk";
@@ -3993,7 +3993,7 @@ fn diff_batch_get_composite_key_table() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_get_unprocessed_keys_always_empty() {
     ensure_users_table();
     let item = "{\"id\":{\"S\":\"bg-uk\"}}";
@@ -4011,7 +4011,7 @@ fn diff_batch_get_unprocessed_keys_always_empty() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_get_duplicate_keys_both_reject() {
     ensure_users_table();
     let req_items = "{\"users\":{\"Keys\":[\
@@ -4029,7 +4029,7 @@ fn diff_batch_get_duplicate_keys_both_reject() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_get_missing_table_both_reject() {
     let req_items = "{\"this-table-does-not-exist\":{\"Keys\":[{\"id\":{\"S\":\"x\"}}]}}";
     let err_ref = aws_expecting_failure(REF, &["dynamodb","batch-get-item","--request-items",req_items]);
@@ -4045,7 +4045,7 @@ fn diff_batch_get_missing_table_both_reject() {
 // ===== BatchGetItem multi-table (B2) =========================================
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_get_multi_table() {
     ensure_users_table();
     ensure_device_events_table();
@@ -4095,7 +4095,7 @@ fn diff_batch_get_multi_table() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_get_multi_table_one_empty() {
     ensure_users_table();
     ensure_device_events_table();
@@ -4123,7 +4123,7 @@ fn diff_batch_get_multi_table_one_empty() {
 // ===== BatchGetItem projection (B3) ==========================================
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_get_with_projection() {
     ensure_users_table();
     for id in ["bg-pj-a", "bg-pj-b"] {
@@ -4163,7 +4163,7 @@ fn diff_batch_get_with_projection() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_get_consistent_read_silently_accepted() {
     ensure_users_table();
     let item = "{\"id\":{\"S\":\"bg-cr\"},\"label\":{\"S\":\"x\"}}";
@@ -4182,7 +4182,7 @@ fn diff_batch_get_consistent_read_silently_accepted() {
 // ===== BatchWriteItem Put-only (B4) ==========================================
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_write_put_only_persists() {
     ensure_users_table();
     let req_items = "{\"users\":[\
@@ -4209,7 +4209,7 @@ fn diff_batch_write_put_only_persists() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_write_composite_table() {
     ensure_device_events_table();
     let pk = "bw-d-comp";
@@ -4231,7 +4231,7 @@ fn diff_batch_write_composite_table() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_write_duplicate_keys_both_reject() {
     let req_items = "{\"users\":[\
         {\"PutRequest\":{\"Item\":{\"id\":{\"S\":\"bw-d-dup\"}}}},\
@@ -4246,7 +4246,7 @@ fn diff_batch_write_duplicate_keys_both_reject() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_write_unprocessed_items_always_empty() {
     ensure_users_table();
     let req_items = "{\"users\":[{\"PutRequest\":{\"Item\":{\"id\":{\"S\":\"bw-d-uk\"}}}}]}";
@@ -4260,7 +4260,7 @@ fn diff_batch_write_unprocessed_items_always_empty() {
 // ===== BatchWriteItem mix + multi-table (B5) ==================================
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_write_mixed_put_and_delete() {
     ensure_users_table();
     // Pre-seed rows on both endpoints that we will delete.
@@ -4291,7 +4291,7 @@ fn diff_batch_write_mixed_put_and_delete() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_write_multi_table_fan_out() {
     ensure_users_table();
     ensure_device_events_table();
@@ -4315,7 +4315,7 @@ fn diff_batch_write_multi_table_fan_out() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_write_delete_of_missing_row_is_noop() {
     ensure_users_table();
     let req_items = "{\"users\":[\
@@ -4336,7 +4336,7 @@ fn diff_batch_write_delete_of_missing_row_is_noop() {
 // ===== BatchWriteItem strict-field rejection (B6) =============================
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_write_extra_field_in_put_request_both_reject() {
     // PutRequest with ConditionExpression: DDB rejects; we reject via
     // serde(deny_unknown_fields). Both must fail with 4xx (D6 strict
@@ -4371,7 +4371,7 @@ fn diff_batch_write_extra_field_in_put_request_both_reject() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_write_return_consumed_capacity_envelope_accepted() {
     // Envelope-level ReturnConsumedCapacity is accepted on both sides
     // (we drop it; DDB returns metering). The call should succeed.
@@ -4404,7 +4404,7 @@ fn diff_batch_write_return_consumed_capacity_envelope_accepted() {
 /// this; this test confirms the batch wire shape doesn't normalize
 /// or drop any variant.
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_round_trip_all_attribute_value_variants() {
     ensure_users_table();
     let pk = "bg-variants-all";
@@ -4450,7 +4450,7 @@ fn diff_batch_round_trip_all_attribute_value_variants() {
 /// (`binsorted` table) — the per-row binary cast in the
 /// IN (VALUES ...) emitter has no other diff-level coverage.
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_get_binary_sk_via_binsorted() {
     ensure_binsorted_table();
     let pk = "bg-bsk";
@@ -4488,7 +4488,7 @@ fn diff_batch_get_binary_sk_via_binsorted() {
 /// MEDIUM: N-PK BatchGetItem via the configured `counters` table —
 /// closes the diff-layer key-type-matrix asymmetry.
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_get_numeric_pk_via_counters() {
     ensure_counters_table();
     for n in ["10001", "10002", "10003"] {
@@ -4520,7 +4520,7 @@ fn diff_batch_get_numeric_pk_via_counters() {
 
 /// MEDIUM: B-PK BatchGetItem via the configured `blobs` table.
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_get_binary_pk_via_blobs() {
     ensure_blobs_table();
     for b64 in ["YmctZA==", "YmctZQ==", "YmctZg=="] {
@@ -4552,7 +4552,7 @@ fn diff_batch_get_binary_pk_via_blobs() {
 /// configured `counters` table — closes the write-side per-key-type
 /// asymmetry.
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_write_numeric_pk_via_counters() {
     ensure_counters_table();
     let req_items = "{\"counters\":[\
@@ -4573,7 +4573,7 @@ fn diff_batch_write_numeric_pk_via_counters() {
 /// MEDIUM: B-PK BatchWriteItem persists + reads back via the
 /// configured `blobs` table.
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_write_binary_pk_via_blobs() {
     ensure_blobs_table();
     let req_items = "{\"blobs\":[\
@@ -4589,7 +4589,7 @@ fn diff_batch_write_binary_pk_via_blobs() {
 
 /// MEDIUM: BatchWriteItem with B-typed SK via `binsorted`.
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_write_binary_sk_via_binsorted() {
     ensure_binsorted_table();
     let pk = "bw-d-bsk";
@@ -4613,7 +4613,7 @@ fn diff_batch_write_binary_sk_via_binsorted() {
 /// MEDIUM: multi-table BatchGet with an unknown table — both
 /// endpoints must reject the whole request (no partial response).
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_get_multi_table_unknown_table_both_reject() {
     ensure_users_table();
     let req_items = "{\"users\":[],\"no-such-table\":[]}";
@@ -4635,7 +4635,7 @@ fn diff_batch_get_multi_table_unknown_table_both_reject() {
 /// endpoints must reject before any writes fire — assert via
 /// pre/post GetItem on a sentinel row.
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_batch_write_unknown_table_in_multi_table_doesnt_write_anything() {
     ensure_users_table();
     // Sentinel: pre-existing row that should be untouched on both
@@ -4673,7 +4673,7 @@ fn diff_batch_write_unknown_table_in_multi_table_doesnt_write_anything() {
 // ===== TransactGetItems (T1) =================================================
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_transact_get_single_table_happy_path() {
     ensure_users_table();
     let ids = ["tg-a", "tg-b", "tg-c"];
@@ -4715,7 +4715,7 @@ fn diff_transact_get_single_table_happy_path() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_transact_get_missing_slots_emit_empty_object() {
     ensure_users_table();
     let item = "{\"id\":{\"S\":\"tg-hit\"},\"label\":{\"S\":\"present\"}}";
@@ -4740,7 +4740,7 @@ fn diff_transact_get_missing_slots_emit_empty_object() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_transact_get_composite_table_round_trip() {
     ensure_device_events_table();
     for ts in [1, 2, 3] {
@@ -4784,7 +4784,7 @@ fn diff_transact_get_composite_table_round_trip() {
 // ===== TransactGetItems T2 — multi-table + projection ========================
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_transact_get_multi_table_round_trip() {
     ensure_users_table();
     ensure_device_events_table();
@@ -4812,7 +4812,7 @@ fn diff_transact_get_multi_table_round_trip() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_transact_get_projection_prunes_attributes() {
     ensure_users_table();
     let item =
@@ -4845,7 +4845,7 @@ fn diff_transact_get_projection_prunes_attributes() {
 // ===== TransactWriteItems T3 — Put-only =====================================
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_transact_write_put_only_round_trip() {
     ensure_users_table();
     let items = "[\
@@ -4868,7 +4868,7 @@ fn diff_transact_write_put_only_round_trip() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_transact_write_conditional_put_failure_atomicity() {
     ensure_users_table();
     // Seed the row whose ConditionExpression will fail.
@@ -4906,7 +4906,7 @@ fn diff_transact_write_conditional_put_failure_atomicity() {
 // ===== TransactWriteItems T4 — Delete + ConditionCheck =======================
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_transact_write_delete_and_condition_check() {
     ensure_users_table();
     // Seed guard row + victim row on both endpoints.
@@ -4943,7 +4943,7 @@ fn diff_transact_write_delete_and_condition_check() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_transact_write_condition_check_failure_rolls_back() {
     ensure_users_table();
     // Don't seed the guard — attribute_exists(id) will fail.
@@ -4966,7 +4966,7 @@ fn diff_transact_write_condition_check_failure_rolls_back() {
 // ===== TransactWriteItems T5 — Update =======================================
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_transact_write_update_existing_row() {
     ensure_users_table();
     let seed = "{\"id\":{\"S\":\"tw-d-upd-1\"},\"label\":{\"S\":\"old\"}}";
@@ -4992,7 +4992,7 @@ fn diff_transact_write_update_existing_row() {
 }
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_transact_write_update_with_failing_condition_atomicity() {
     ensure_users_table();
     let seed = "{\"id\":{\"S\":\"tw-d-upd-cf\"},\"label\":{\"S\":\"keep_me\"}}";
@@ -5032,7 +5032,7 @@ fn diff_transact_write_update_with_failing_condition_atomicity() {
 // ===== TransactWriteItems T6 — Multi-table + CancellationReasons polish =====
 
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_transact_write_multi_table_happy_path() {
     ensure_users_table();
     ensure_device_events_table();
@@ -5061,7 +5061,7 @@ fn diff_transact_write_multi_table_happy_path() {
 /// endpoints. The Code strings come from a closed set DDB
 /// documents; rektifier emits the same canonical values.
 #[test]
-#[ignore = "requires `just up` + `just bootstrap-pg` + a running rektifier on :9000"]
+#[ignore = "requires `just up` + `just bootstrap-tables` + a running rektifier on :9000"]
 fn diff_transact_write_cancellation_wire_shape() {
     ensure_users_table();
     // Seed a row that will fail attribute_not_exists.

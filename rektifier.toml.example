@@ -43,47 +43,13 @@ max_sort_key_bytes       = 1024      # 1 KB  (DDB)
 max_attribute_name_bytes = 65536     # 64 KB (DDB)
 max_nesting_depth        = 32        # DDB
 
-# Hash-only S-PK table.
-[[tables]]
-name      = "users"
-pk_attr   = "id"
-jsonb_col = "data"
+# Catalog tunables (PLAN-10 KD3 / KD4). The reconciler periodically
+# rebuilds the in-memory catalog snapshot from `_rektifier_tables` and
+# verifies each row against live PG.
+[catalog]
+reconcile_interval_ms   = 30000      # 30s (0 disables the periodic timer)
+invalidate_on_local_ddl = true       # immediate reconcile after Create/Update/DeleteTable
 
-# Composite table: S partition key + N sort key.
-[[tables]]
-name      = "device_events"
-pk_attr   = "device_id"
-sk_attr   = "ts"
-sk_type   = "N"
-jsonb_col = "doc"
-
-# Hash-only N-PK. Used by diff tests for parity across key shapes.
-[[tables]]
-name      = "counters"
-pk_attr   = "id"
-pk_type   = "N"
-jsonb_col = "data"
-
-# Hash-only B-PK. Used by diff tests for parity across key shapes.
-[[tables]]
-name      = "blobs"
-pk_attr   = "binmark"
-pk_type   = "B"
-jsonb_col = "data"
-
-# Composite S + B sort key. Used by diff tests for parity across key shapes.
-[[tables]]
-name      = "binsorted"
-pk_attr   = "id"
-sk_attr   = "binmark"
-sk_type   = "B"
-jsonb_col = "data"
-
-# Composite S + S. Used by Query parity tests for `begins_with(sk, :v)`
-# and other S-typed sort-key predicates.
-[[tables]]
-name      = "messages"
-pk_attr   = "thread"
-sk_attr   = "ts"
-sk_type   = "S"
-jsonb_col = "data"
+# Tables are NOT declared in TOML as of PLAN-10 D8. Use the DDB
+# `CreateTable` API to provision them at runtime — see the
+# `bootstrap-tables` justfile recipe for an example.

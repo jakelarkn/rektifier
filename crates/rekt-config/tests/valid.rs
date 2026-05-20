@@ -1,12 +1,16 @@
-//! Tests for valid configs — defaults, merges, and per-table overrides.
+//! Tests for valid configs — defaults, [pg] section, [catalog] section,
+//! [limits] inheritance.
+//!
+//! Table declarations were removed from TOML in PLAN-10 D8; tables are
+//! now runtime objects created via the DDB `CreateTable` wire API.
 
 use rekt_config::{load_from_str, Config, Limits};
-use rekt_storage::KeyType;
 
 const FULL: &str = r#"
 [server]
-listen_addr  = "127.0.0.1:9000"
-database_url = "postgres://rektifier:rektifier@localhost:5432/rektifier"
+listen_addr        = "127.0.0.1:9000"
+database_url       = "postgres://rektifier:rektifier@localhost:5432/rektifier"
+request_timeout_ms = 15000
 
 [limits]
 max_item_size_bytes      = 409600
@@ -15,114 +19,27 @@ max_sort_key_bytes       = 1024
 max_attribute_name_bytes = 65536
 max_nesting_depth        = 32
 
-[[tables]]
-name      = "users"
-pk_attr   = "id"
-jsonb_col = "data"
-
-[[tables]]
-name      = "device_events"
-pk_attr   = "device_id"
-sk_attr   = "ts"
-sk_type   = "N"
-jsonb_col = "doc"
-
-[[tables]]
-name      = "legacy_users"
-pg_table  = "users_v2"
-pk_attr   = "id"
-jsonb_col = "doc"
-
-[[tables]]
-name      = "blobs"
-pk_attr   = "hash"
-pk_type   = "B"
-jsonb_col = "meta"
-
-[[tables]]
-name      = "documents"
-pk_attr   = "doc_id"
-jsonb_col = "data"
-  [tables.limits]
-  max_item_size_bytes      = 16777216
-  max_attribute_name_bytes = "unlimited"
+[catalog]
+reconcile_interval_ms   = 15000
+invalidate_on_local_ddl = false
 "#;
 
 #[test]
 fn parses_full_example() {
     let cfg: Config = load_from_str(FULL).unwrap();
-
     assert_eq!(cfg.server.listen_addr.to_string(), "127.0.0.1:9000");
     assert_eq!(
         cfg.server.database_url,
         "postgres://rektifier:rektifier@localhost:5432/rektifier"
     );
-    assert_eq!(cfg.tables.len(), 5);
+    assert_eq!(cfg.server.request_timeout_ms, 15_000);
 }
 
 #[test]
-fn table_defaults_apply() {
+fn limits_section_applies_to_server_baseline() {
     let cfg = load_from_str(FULL).unwrap();
-    let users = cfg.tables.iter().find(|t| t.name == "users").unwrap();
-    assert_eq!(users.pg_table, "users", "pg_table should default to name");
-    assert_eq!(users.pk_type, KeyType::S, "pk_type should default to S");
-    assert!(users.sk_attr.is_none());
-    assert!(users.sk_type.is_none());
-}
-
-#[test]
-fn pg_table_override() {
-    let cfg = load_from_str(FULL).unwrap();
-    let t = cfg
-        .tables
-        .iter()
-        .find(|t| t.name == "legacy_users")
-        .unwrap();
-    assert_eq!(t.pg_table, "users_v2");
-}
-
-#[test]
-fn composite_table_carries_sk() {
-    let cfg = load_from_str(FULL).unwrap();
-    let t = cfg
-        .tables
-        .iter()
-        .find(|t| t.name == "device_events")
-        .unwrap();
-    assert_eq!(t.sk_attr.as_deref(), Some("ts"));
-    assert_eq!(t.sk_type, Some(KeyType::N));
-}
-
-#[test]
-fn binary_pk_type() {
-    let cfg = load_from_str(FULL).unwrap();
-    let t = cfg.tables.iter().find(|t| t.name == "blobs").unwrap();
-    assert_eq!(t.pk_type, KeyType::B);
-}
-
-#[test]
-fn server_limits_apply_to_tables_by_default() {
-    let cfg = load_from_str(FULL).unwrap();
-    let users = cfg.tables.iter().find(|t| t.name == "users").unwrap();
-    assert_eq!(users.limits.max_item_size_bytes, Some(409600));
-    assert_eq!(users.limits.max_partition_key_bytes, Some(2048));
-    assert_eq!(users.limits.max_sort_key_bytes, Some(1024));
-    assert_eq!(users.limits.max_attribute_name_bytes, Some(65536));
-    assert_eq!(users.limits.max_nesting_depth, Some(32));
-}
-
-#[test]
-fn per_table_limit_overrides_and_inheritance() {
-    let cfg = load_from_str(FULL).unwrap();
-    let docs = cfg.tables.iter().find(|t| t.name == "documents").unwrap();
-    // Explicit override.
-    assert_eq!(docs.limits.max_item_size_bytes, Some(16_777_216));
-    // Explicit "unlimited" removes the cap for this table only.
-    assert_eq!(docs.limits.max_attribute_name_bytes, None);
-    // Inherited from server.
-    assert_eq!(docs.limits.max_partition_key_bytes, Some(2048));
-    assert_eq!(docs.limits.max_sort_key_bytes, Some(1024));
-    assert_eq!(docs.limits.max_nesting_depth, Some(32));
+    assert_eq!(cfg.limits.max_item_size_bytes, Some(409_600));
+    assert_eq!(cfg.limits.max_nesting_depth, Some(32));
 }
 
 #[test]
@@ -131,56 +48,45 @@ fn omitted_server_limits_get_ddb_defaults() {
 [server]
 listen_addr  = "127.0.0.1:9000"
 database_url = "postgres://x"
-
-[[tables]]
-name      = "t"
-pk_attr   = "id"
-jsonb_col = "data"
 "#;
     let cfg = load_from_str(minimal).unwrap();
-    let t = &cfg.tables[0];
     let ddb = Limits::ddb_defaults();
-    assert_eq!(t.limits, ddb);
+    assert_eq!(cfg.limits, ddb);
 }
 
 #[test]
-fn empty_tables_list_is_allowed() {
-    let no_tables = r#"
+fn catalog_defaults_when_section_omitted() {
+    let toml = r#"
 [server]
 listen_addr  = "127.0.0.1:9000"
 database_url = "postgres://x"
 "#;
-    let cfg = load_from_str(no_tables).unwrap();
-    assert!(cfg.tables.is_empty());
+    let cfg = load_from_str(toml).unwrap();
+    let defaults = rekt_config::CatalogConfig::defaults();
+    assert_eq!(cfg.catalog, defaults);
 }
 
 #[test]
-fn per_table_unlimited_only_affects_that_table() {
+fn catalog_overrides_apply() {
+    let cfg = load_from_str(FULL).unwrap();
+    assert_eq!(cfg.catalog.reconcile_interval_ms, 15_000);
+    assert!(!cfg.catalog.invalidate_on_local_ddl);
+}
+
+/// `reconcile_interval_ms = 0` is meaningful (disables the periodic
+/// timer; KD3 caveat). Verify it round-trips verbatim.
+#[test]
+fn catalog_zero_interval_is_preserved() {
     let toml = r#"
 [server]
 listen_addr  = "127.0.0.1:9000"
 database_url = "postgres://x"
 
-[[tables]]
-name      = "small"
-pk_attr   = "id"
-jsonb_col = "data"
-
-[[tables]]
-name      = "big"
-pk_attr   = "id"
-jsonb_col = "data"
-  [tables.limits]
-  max_item_size_bytes = "unlimited"
+[catalog]
+reconcile_interval_ms = 0
 "#;
     let cfg = load_from_str(toml).unwrap();
-    let small = cfg.tables.iter().find(|t| t.name == "small").unwrap();
-    let big = cfg.tables.iter().find(|t| t.name == "big").unwrap();
-    // Wait — both tables have the same name="id" pk + same jsonb_col, but
-    // different table names, and different pg_tables (defaulted). That's
-    // legal. Each gets its own limits.
-    assert!(small.limits.max_item_size_bytes.is_some());
-    assert_eq!(big.limits.max_item_size_bytes, None);
+    assert_eq!(cfg.catalog.reconcile_interval_ms, 0);
 }
 
 // ===== Obs-3: [pg] section ====================================================
@@ -248,4 +154,23 @@ max_pool_size = 64
     assert_eq!(cfg.pg.wait_timeout_ms, defaults.wait_timeout_ms);
     assert_eq!(cfg.pg.recycling_method, defaults.recycling_method);
     assert_eq!(cfg.pg.retry, defaults.retry);
+}
+
+/// D8: configs no longer carry `[[tables]]`. Confirm a TOML body with
+/// a `[[tables]]` block now fails to parse — `RawConfig` was tightened
+/// to `deny_unknown_fields`, so the deletion is the regression net.
+#[test]
+fn legacy_tables_block_rejected_post_d8() {
+    let toml = r#"
+[server]
+listen_addr  = "127.0.0.1:9000"
+database_url = "postgres://x"
+
+[[tables]]
+name      = "users"
+pk_attr   = "id"
+jsonb_col = "data"
+"#;
+    let r = load_from_str(toml);
+    assert!(r.is_err(), "expected parse error post-D8");
 }
