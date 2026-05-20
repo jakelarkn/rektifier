@@ -32,10 +32,10 @@ ON CONFLICT (table_name) DO NOTHING
 /// re-run: existing rows are left alone. Returns the number of new
 /// rows inserted (0 when every table already existed).
 ///
-/// The rows are inserted with `status = ACTIVE` and `serveable = true`
-/// because `rekt_meta::verify` runs *before* the seeder and has already
-/// confirmed the PG shape. D3's reconciler will be the ongoing
-/// authority for `serveable`.
+/// The rows are inserted with `status = ACTIVE` and `serveable = true`,
+/// but the reconciler runs immediately after the seeder and will flip
+/// any row whose live PG shape doesn't match its declared metadata —
+/// so initial trust here is fine: drift is caught on the first cycle.
 pub async fn seed_from_config(
     pool: &Pool,
     tables: &[TableConfig],

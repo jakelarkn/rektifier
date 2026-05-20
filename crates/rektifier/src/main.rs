@@ -4,14 +4,14 @@
 //! 1. Initialize structured tracing (`REKTIFIER_LOG` env filter).
 //! 2. Load config from `REKTIFIER_CONFIG` (path to TOML) — hard-exit on parse error.
 //! 3. Build a deadpool-postgres `Pool` against the configured `database_url`.
-//! 4. Verify every TOML-declared table's PG schema via `rekt_meta::verify`
-//!    — hard-exit on mismatch. (Transitional: D3 will replace this with
-//!    the reconciler.)
-//! 5. Ensure `_rektifier_tables` exists; seed TOML `[[tables]]` into it
+//! 4. Ensure `_rektifier_tables` exists; seed TOML `[[tables]]` into it
 //!    via idempotent upsert (transitional through D7; removed in D8).
-//! 6. Read the seeded rows back as the initial catalog snapshot and
-//!    push into `TableCatalog`. (D3 replaces this with the reconciler.)
-//! 7. Build `AppState { verifier, backend, catalog }`.
+//! 5. Run one synchronous reconcile pass: introspect each cataloged
+//!    table against `information_schema`, flip `serveable` per-table.
+//!    Drift on table X no longer blocks startup; the reconciler emits
+//!    error-level logs for any unserveable row.
+//! 6. Build `AppState { verifier, backend, catalog }`.
+//! 7. Spawn the periodic reconciler task (PLAN-10 KD3).
 //! 8. Bind on `listen_addr`, serve `rekt_server::router(state)`.
 //!
 //! The verifier wired in for MVP is `PermissiveVerifier` — SigV4 signatures
@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use deadpool_postgres::{Manager, Pool};
-use rekt_catalog::{CatalogSnapshot, TableCatalog};
+use rekt_catalog::{Reconciler, TableCatalog};
 use rekt_config::Config;
 use rekt_server::{router, AppState};
 use rekt_sigv4::PermissiveVerifier;
@@ -56,11 +56,6 @@ async fn main() -> Result<()> {
         "PG pool configured"
     );
 
-    rekt_meta::verify(&config.tables, &pool)
-        .await
-        .context("schema verification failed — refusing to start")?;
-    tracing::info!("all declared tables verified against PG schema");
-
     rekt_catalog::ensure_metadata_tables(&pool)
         .await
         .context("ensuring _rektifier_tables exists")?;
@@ -73,16 +68,25 @@ async fn main() -> Result<()> {
         "seeder upserted TOML tables into _rektifier_tables"
     );
 
-    let initial_entries = rekt_catalog::load_snapshot(&pool)
-        .await
-        .context("loading initial catalog snapshot from _rektifier_tables")?;
-    tracing::info!(
-        entries = initial_entries.len(),
-        "initial catalog snapshot loaded"
-    );
-    let catalog = Arc::new(TableCatalog::from_snapshot(
-        CatalogSnapshot::from_entries(initial_entries),
+    let catalog = Arc::new(TableCatalog::empty());
+    let reconciler = Arc::new(Reconciler::new(
+        pool.clone(),
+        catalog.clone(),
+        std::time::Duration::from_millis(config.catalog.reconcile_interval_ms),
     ));
+    // First pass synchronously so the cache is hot before we bind. Any
+    // unserveable table is logged at error level inside reconcile_now;
+    // we don't refuse to start the process.
+    let updated = reconciler
+        .reconcile_now()
+        .await
+        .context("initial catalog reconcile pass")?;
+    tracing::info!(
+        updated,
+        entries = catalog.snapshot().entries.len(),
+        "initial reconcile pass complete"
+    );
+    Arc::clone(&reconciler).spawn_periodic();
 
     let backend = PgBackend::new(pool).with_retry_policy(rek_retry_policy(&config));
     tracing::info!(

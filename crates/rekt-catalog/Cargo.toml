@@ -14,5 +14,6 @@ rekt-storage = { path = "../rekt-storage" }
 rekt-translator = { path = "../rekt-translator" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tokio-postgres = { workspace = true }
 tracing = { workspace = true }

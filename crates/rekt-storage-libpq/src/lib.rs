@@ -111,7 +111,7 @@ impl Default for PoolConfig {
 
 impl PgBackend {
     /// Wrap an existing pool. Prefer this when the caller wants to share a
-    /// `Pool` with other components (e.g. `rekt-meta::verify`).
+    /// `Pool` with other components (e.g. `rekt-catalog::Reconciler`).
     /// Uses the default retry policy; call
     /// [`PgBackend::with_retry_policy`] to override.
     pub fn new(pool: Pool) -> Self {

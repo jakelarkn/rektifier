@@ -8,7 +8,6 @@ members = [
     "crates/rekt-translator",
     "crates/rekt-expressions",
     "crates/rekt-config",
-    "crates/rekt-meta",
     "crates/rekt-catalog",
     "crates/rekt-server",
     "crates/rektifier",
