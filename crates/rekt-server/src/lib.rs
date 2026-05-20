@@ -34,7 +34,7 @@ use rekt_protocol::{
     TransactWriteItemsRequest, TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse,
     WriteRequest,
 };
-use rekt_catalog::TableCatalog;
+use rekt_catalog::{CatalogSnapshot, TableCatalog, TableEntry};
 use rekt_sigv4::{SigV4Error, Verifier};
 use rekt_storage::{Backend, BackendError, TransactGetOp, TransactWriteOp, UpdateDecision, UpdateOutcome};
 use rekt_translator::{
@@ -385,6 +385,77 @@ impl From<SigV4Error> for ApiError {
     }
 }
 
+/// Catalog gate (PLAN-10 D4 / KD5). Single-table handlers call this
+/// instead of fetching the entry directly: unknown OR unserveable both
+/// surface as `ResourceNotFoundException`, with the unserveable reason
+/// folded into the message so operators tailing logs / running the AWS
+/// CLI can see what's actually wrong.
+///
+/// KD5 rationale: from the client's perspective, an unserveable table
+/// is functionally equivalent to a missing one. DDB SDK retry logic
+/// for RNF often does the right thing — by the time the retry lands,
+/// the reconciler may have flipped serveable back.
+fn require_serveable(
+    catalog: &TableCatalog,
+    table_name: &str,
+) -> Result<Arc<TableEntry>, ApiError> {
+    let entry = catalog.get(table_name).ok_or_else(|| {
+        ApiError::ResourceNotFound(format!("Table not found: {table_name}"))
+    })?;
+    gate_serveable(&entry, table_name)?;
+    Ok(entry)
+}
+
+/// Multi-table variant: same wire shape (RNF on miss or unserveable)
+/// but reads from a `CatalogSnapshot` so the multi-table handler can
+/// pin a single coherent view across all referenced tables.
+fn require_serveable_in_snapshot<'a>(
+    snapshot: &'a CatalogSnapshot,
+    table_name: &str,
+) -> Result<&'a Arc<TableEntry>, ApiError> {
+    let entry = snapshot.entries.get(table_name).ok_or_else(|| {
+        ApiError::ResourceNotFound(format!("Table not found: {table_name}"))
+    })?;
+    gate_serveable(entry, table_name)?;
+    Ok(entry)
+}
+
+fn gate_serveable(entry: &TableEntry, table_name: &str) -> Result<(), ApiError> {
+    if entry.serveable {
+        return Ok(());
+    }
+    Err(ApiError::ResourceNotFound(format!(
+        "Table not currently serveable: {table_name} ({})",
+        entry
+            .unserveable_reason
+            .as_deref()
+            .unwrap_or("unknown reason")
+    )))
+}
+
+/// Multi-table gate: every referenced table must exist AND be serveable.
+/// Used pre-translate by BatchGet/Write and TransactGet/Write so the
+/// "not currently serveable" wire message wins over the translator's
+/// generic ResourceNotFound (which would say "table not found" instead,
+/// hiding the actionable reason from the operator).
+///
+/// PLAN-10 KD5: any unserveable referenced table fails the whole batch
+/// with RNF — pending diff-harness verification on whether DDB emits
+/// per-item UnprocessedKeys / CancellationReasons instead. Logged as
+/// Parity-unverified in COMPATIBILITY_NOTES.
+fn gate_referenced_tables<'a, I>(
+    snapshot: &CatalogSnapshot,
+    names: I,
+) -> Result<(), ApiError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    for name in names {
+        require_serveable_in_snapshot(snapshot, name)?;
+    }
+    Ok(())
+}
+
 /// Deserialize a request body and log warn-level on failure. Centralizes
 /// the "invalid <Op> body: <reason>" message + structured tracing field
 /// for every handler so a misbehaving SDK shows up in logs even when
@@ -466,9 +537,7 @@ async fn handle_put_item(state: &AppState, body: &Bytes) -> Result<Response, Api
     let req: PutItemRequest = parse_request(body, "PutItem")?;
     tracing::Span::current().record("table", req.table_name.as_str());
 
-    let entry = state.catalog.get(&req.table_name).ok_or_else(|| {
-        ApiError::ResourceNotFound(format!("Table not found: {}", req.table_name))
-    })?;
+    let entry = require_serveable(&state.catalog, &req.table_name)?;
     let schema = &entry.schema;
 
     let plan = translate_put_item(&req, schema)?;
@@ -538,9 +607,7 @@ async fn handle_get_item(state: &AppState, body: &Bytes) -> Result<Response, Api
     let req: GetItemRequest = parse_request(body, "GetItem")?;
     tracing::Span::current().record("table", req.table_name.as_str());
 
-    let entry = state.catalog.get(&req.table_name).ok_or_else(|| {
-        ApiError::ResourceNotFound(format!("Table not found: {}", req.table_name))
-    })?;
+    let entry = require_serveable(&state.catalog, &req.table_name)?;
     let schema = &entry.schema;
 
     let plan = translate_get_item(&req, schema)?;
@@ -565,9 +632,7 @@ async fn handle_delete_item(state: &AppState, body: &Bytes) -> Result<Response, 
     let req: DeleteItemRequest = parse_request(body, "DeleteItem")?;
     tracing::Span::current().record("table", req.table_name.as_str());
 
-    let entry = state.catalog.get(&req.table_name).ok_or_else(|| {
-        ApiError::ResourceNotFound(format!("Table not found: {}", req.table_name))
-    })?;
+    let entry = require_serveable(&state.catalog, &req.table_name)?;
     let schema = &entry.schema;
 
     let plan = translate_delete_item(&req, schema)?;
@@ -600,9 +665,7 @@ async fn handle_update_item(state: &AppState, body: &Bytes) -> Result<Response, 
     let req: UpdateItemRequest = parse_request(body, "UpdateItem")?;
     tracing::Span::current().record("table", req.table_name.as_str());
 
-    let entry = state.catalog.get(&req.table_name).ok_or_else(|| {
-        ApiError::ResourceNotFound(format!("Table not found: {}", req.table_name))
-    })?;
+    let entry = require_serveable(&state.catalog, &req.table_name)?;
     let schema = &entry.schema;
 
     let plan = translate_update_item(&req, schema)?;
@@ -710,9 +773,7 @@ async fn handle_query(state: &AppState, body: &Bytes) -> Result<Response, ApiErr
         tracing::Span::current().record("consistent_read", cr);
     }
 
-    let entry = state.catalog.get(&req.table_name).ok_or_else(|| {
-        ApiError::ResourceNotFound(format!("Table not found: {}", req.table_name))
-    })?;
+    let entry = require_serveable(&state.catalog, &req.table_name)?;
     let schema = &entry.schema;
 
     let plan = translate_query(&req, schema)?;
@@ -825,9 +886,7 @@ async fn handle_scan(state: &AppState, body: &Bytes) -> Result<Response, ApiErro
         tracing::Span::current().record("consistent_read", cr);
     }
 
-    let entry = state.catalog.get(&req.table_name).ok_or_else(|| {
-        ApiError::ResourceNotFound(format!("Table not found: {}", req.table_name))
-    })?;
+    let entry = require_serveable(&state.catalog, &req.table_name)?;
     let schema = &entry.schema;
 
     let plan = translate_scan(&req, schema)?;
@@ -879,6 +938,10 @@ async fn handle_batch_get_item(state: &AppState, body: &Bytes) -> Result<Respons
     let req: BatchGetItemRequest = parse_request(body, "BatchGetItem")?;
 
     let snapshot = state.catalog.snapshot();
+    gate_referenced_tables(
+        &snapshot,
+        req.request_items.keys().map(String::as_str),
+    )?;
     let plan = translate_batch_get_item(
         &req,
         &snapshot.schemas,
@@ -951,6 +1014,10 @@ async fn handle_batch_write_item(state: &AppState, body: &Bytes) -> Result<Respo
     let req: BatchWriteItemRequest = parse_request(body, "BatchWriteItem")?;
 
     let snapshot = state.catalog.snapshot();
+    gate_referenced_tables(
+        &snapshot,
+        req.request_items.keys().map(String::as_str),
+    )?;
     let plan = translate_batch_write_item(
         &req,
         &snapshot.schemas,
@@ -999,6 +1066,12 @@ async fn handle_transact_get_items(
     let req: TransactGetItemsRequest = parse_request(body, "TransactGetItems")?;
 
     let snapshot = state.catalog.snapshot();
+    gate_referenced_tables(
+        &snapshot,
+        req.transact_items
+            .iter()
+            .filter_map(|it| it.get.as_ref().map(|g| g.table_name.as_str())),
+    )?;
     let plan = translate_transact_get_items(
         &req,
         &snapshot.schemas,
@@ -1084,6 +1157,20 @@ async fn handle_transact_write_items(
     }
 
     let snapshot = state.catalog.snapshot();
+    gate_referenced_tables(
+        &snapshot,
+        req.transact_items.iter().filter_map(|it| {
+            if let Some(p) = it.put.as_ref() {
+                Some(p.table_name.as_str())
+            } else if let Some(d) = it.delete.as_ref() {
+                Some(d.table_name.as_str())
+            } else if let Some(u) = it.update.as_ref() {
+                Some(u.table_name.as_str())
+            } else {
+                it.condition_check.as_ref().map(|c| c.table_name.as_str())
+            }
+        }),
+    )?;
     let plan = translate_transact_write_items(
         &req,
         &snapshot.schemas,

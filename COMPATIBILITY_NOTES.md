@@ -303,8 +303,29 @@ at the translator boundary. There is no `CreateTable` /
 `DynamoDbClient::createTable` in tests or migration tooling) fail
 against rektifier.
 
-**Closure plan:** tracked in `PLAN-2` "Table lifecycle" — requires
-the metadata-table refactor deferred at Step 4.5 of PLAN-0.
+**Closure plan:** tracked in `PLAN-10-ddl-operations.md`. D6 lands
+`CreateTable` and switches the source of truth to the
+`_rektifier_tables` catalog; D8 deletes the `[[tables]]` block from
+TOML entirely.
+
+### Unserveable tables surface as `ResourceNotFoundException` — Strict (cause), Observable (message)
+
+When the reconciler (PLAN-10 D3) detects PG-schema drift on a
+table, that table is flagged `serveable = false` in the in-memory
+catalog. Every data-plane handler returns
+`ResourceNotFoundException` for ops against an unserveable table.
+
+The cause differs from DDB (DDB only emits RNF when the table truly
+doesn't exist); the *wire shape* is identical, so SDK retry logic
+that targets RNF behaves the same. The response `message` field is
+`"Table not currently serveable: <name> (<unserveable_reason>)"`,
+which lets operators tailing logs see what's actually wrong without
+needing to inspect `_rektifier_tables` directly.
+
+For batch / transact ops, any unserveable referenced table fails
+the whole request with RNF (PLAN-10 KD5). DDB's actual behavior for
+a batch referencing a missing or unhealthy table is
+`Parity-unverified` — diff-harness exercise pending.
 
 ---
 

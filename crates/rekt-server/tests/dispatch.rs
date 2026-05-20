@@ -841,6 +841,53 @@ fn app() -> axum::Router {
     app_with(MockBackend::default(), std::time::Duration::from_secs(30))
 }
 
+/// Build an app whose `users` table is flagged unserveable (drift
+/// scenario). Every op against `users` should return RNF with the
+/// drift reason in the message; other tables remain serveable.
+fn app_users_unserveable() -> axum::Router {
+    let mut entries = HashMap::new();
+    for (name, schema) in schemas() {
+        let serveable = name != "users";
+        let reason = if serveable {
+            None
+        } else {
+            Some("expected jsonb column `data`, got `text`".to_string())
+        };
+        entries.insert(
+            name.clone(),
+            Arc::new(TableEntry {
+                schema,
+                status: if serveable {
+                    TableStatus::Active
+                } else {
+                    TableStatus::Degraded
+                },
+                serveable,
+                unserveable_reason: reason,
+                creation_date_ms: 0,
+                last_modified_at_ms: 0,
+                last_modified_by: "dispatch-test-fixture".into(),
+                billing_mode: None,
+                provisioned_rcu: None,
+                provisioned_wcu: None,
+                tags: serde_json::json!({}),
+                gsis: HashMap::new(),
+            }),
+        );
+    }
+    let catalog = Arc::new(TableCatalog::from_snapshot(CatalogSnapshot::from_entries(
+        entries,
+    )));
+    let state = AppState {
+        verifier: Arc::new(PermissiveVerifier) as Arc<dyn Verifier>,
+        backend: Arc::new(MockBackend::default()) as Arc<dyn Backend>,
+        catalog,
+        batch_limits: rekt_server::BatchLimits::default(),
+        request_timeout: std::time::Duration::from_secs(30),
+    };
+    router(state)
+}
+
 /// Builder for tests that need a non-default backend (e.g. one that
 /// panics or sleeps to exercise the resilience middleware) or a
 /// custom request timeout.
@@ -7622,4 +7669,226 @@ async fn transact_write_at_cap_succeeds() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ===== D4: serveable-gate (PLAN-10 KD5) ======================================
+//
+// An unserveable table — drift detected by the reconciler, or DDL in
+// flight — must surface to clients as `ResourceNotFoundException` (not
+// a bespoke variant), with the unserveable reason folded into the
+// response message. This holds for every op type, and for batch /
+// transact ops it fails the whole request if ANY referenced table is
+// unserveable.
+
+async fn expect_rnf_with_reason(resp: axum::response::Response, table_name: &str) -> Value {
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(
+        body["__type"]
+            .as_str()
+            .unwrap()
+            .ends_with("#ResourceNotFoundException"),
+        "expected RNF, got {body}"
+    );
+    let msg = body["message"].as_str().unwrap();
+    assert!(
+        msg.contains("not currently serveable") && msg.contains(table_name),
+        "message should name the unserveable table + signal the reason: {msg}"
+    );
+    body
+}
+
+#[tokio::test]
+async fn put_item_rnf_when_table_unserveable() {
+    let app = app_users_unserveable();
+    let resp = app
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"users","Item":{"id":{"S":"u1"}}}),
+        ))
+        .await
+        .unwrap();
+    expect_rnf_with_reason(resp, "users").await;
+}
+
+#[tokio::test]
+async fn get_item_rnf_when_table_unserveable() {
+    let app = app_users_unserveable();
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"users","Key":{"id":{"S":"u1"}}}),
+        ))
+        .await
+        .unwrap();
+    expect_rnf_with_reason(resp, "users").await;
+}
+
+#[tokio::test]
+async fn delete_item_rnf_when_table_unserveable() {
+    let app = app_users_unserveable();
+    let resp = app
+        .oneshot(ddb_request(
+            "DeleteItem",
+            json!({"TableName":"users","Key":{"id":{"S":"u1"}}}),
+        ))
+        .await
+        .unwrap();
+    expect_rnf_with_reason(resp, "users").await;
+}
+
+#[tokio::test]
+async fn update_item_rnf_when_table_unserveable() {
+    let app = app_users_unserveable();
+    let resp = app
+        .oneshot(ddb_request(
+            "UpdateItem",
+            json!({
+                "TableName":"users",
+                "Key":{"id":{"S":"u1"}},
+                "UpdateExpression":"SET #v = :x",
+                "ExpressionAttributeNames":{"#v":"label"},
+                "ExpressionAttributeValues":{":x":{"S":"y"}}
+            }),
+        ))
+        .await
+        .unwrap();
+    expect_rnf_with_reason(resp, "users").await;
+}
+
+#[tokio::test]
+async fn query_rnf_when_table_unserveable() {
+    let app = app_users_unserveable();
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName":"users",
+                "KeyConditionExpression":"id = :v",
+                "ExpressionAttributeValues":{":v":{"S":"u1"}}
+            }),
+        ))
+        .await
+        .unwrap();
+    expect_rnf_with_reason(resp, "users").await;
+}
+
+#[tokio::test]
+async fn scan_rnf_when_table_unserveable() {
+    let app = app_users_unserveable();
+    let resp = app
+        .oneshot(ddb_request(
+            "Scan",
+            json!({"TableName":"users"}),
+        ))
+        .await
+        .unwrap();
+    expect_rnf_with_reason(resp, "users").await;
+}
+
+/// BatchGetItem: any unserveable referenced table fails the whole
+/// request — KD5. The well-shaped (serveable) `messages` table on its
+/// own would succeed; mixing in `users` poisons the batch.
+#[tokio::test]
+async fn batch_get_rnf_if_any_referenced_table_unserveable() {
+    let app = app_users_unserveable();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchGetItem",
+            json!({"RequestItems":{
+                "users":{"Keys":[{"id":{"S":"u1"}}]},
+                "messages":{"Keys":[{"thread":{"S":"t1"},"ts":{"S":"1"}}]}
+            }}),
+        ))
+        .await
+        .unwrap();
+    expect_rnf_with_reason(resp, "users").await;
+}
+
+#[tokio::test]
+async fn batch_write_rnf_if_any_referenced_table_unserveable() {
+    let app = app_users_unserveable();
+    let resp = app
+        .oneshot(ddb_request(
+            "BatchWriteItem",
+            json!({"RequestItems":{
+                "users":[{"PutRequest":{"Item":{"id":{"S":"u1"}}}}],
+                "messages":[{"PutRequest":{"Item":{"thread":{"S":"t1"},"ts":{"S":"1"}}}}]
+            }}),
+        ))
+        .await
+        .unwrap();
+    expect_rnf_with_reason(resp, "users").await;
+}
+
+#[tokio::test]
+async fn transact_get_rnf_if_any_referenced_table_unserveable() {
+    let app = app_users_unserveable();
+    let resp = app
+        .oneshot(ddb_request(
+            "TransactGetItems",
+            json!({"TransactItems":[
+                {"Get":{"TableName":"messages","Key":{"thread":{"S":"t1"},"ts":{"S":"1"}}}},
+                {"Get":{"TableName":"users","Key":{"id":{"S":"u1"}}}}
+            ]}),
+        ))
+        .await
+        .unwrap();
+    expect_rnf_with_reason(resp, "users").await;
+}
+
+#[tokio::test]
+async fn transact_write_rnf_if_any_referenced_table_unserveable() {
+    let app = app_users_unserveable();
+    let resp = app
+        .oneshot(ddb_request(
+            "TransactWriteItems",
+            json!({"TransactItems":[
+                {"Put":{"TableName":"messages","Item":{"thread":{"S":"t1"},"ts":{"S":"1"}}}},
+                {"Delete":{"TableName":"users","Key":{"id":{"S":"u1"}}}}
+            ]}),
+        ))
+        .await
+        .unwrap();
+    expect_rnf_with_reason(resp, "users").await;
+}
+
+/// Serveable sibling tables still work when one is degraded — drift on
+/// table X doesn't block ops on table Y (PLAN-10 motivation #2).
+#[tokio::test]
+async fn other_tables_still_serve_when_one_is_unserveable() {
+    let app = app_users_unserveable();
+    let resp = app
+        .oneshot(ddb_request(
+            "PutItem",
+            json!({"TableName":"messages","Item":{"thread":{"S":"t1"},"ts":{"S":"1"}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Unknown tables already returned RNF; the gate keeps that contract.
+/// The wire shape stays identical so SDKs that retry on RNF behave
+/// the same for both unknown and unserveable.
+#[tokio::test]
+async fn unknown_table_still_returns_rnf_not_unserveable_message() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "GetItem",
+            json!({"TableName":"nope","Key":{"id":{"S":"u1"}}}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ResourceNotFoundException"));
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("Table not found"));
 }
