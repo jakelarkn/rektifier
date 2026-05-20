@@ -11,6 +11,7 @@ name = "rektifier"
 path = "src/main.rs"
 
 [dependencies]
+rekt-catalog = { path = "../rekt-catalog" }
 rekt-config = { path = "../rekt-config" }
 rekt-meta = { path = "../rekt-meta" }
 rekt-server = { path = "../rekt-server" }

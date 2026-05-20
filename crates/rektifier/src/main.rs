@@ -4,26 +4,30 @@
 //! 1. Initialize structured tracing (`REKTIFIER_LOG` env filter).
 //! 2. Load config from `REKTIFIER_CONFIG` (path to TOML) — hard-exit on parse error.
 //! 3. Build a deadpool-postgres `Pool` against the configured `database_url`.
-//! 4. Verify every declared table's PG schema via `rekt_meta::verify` — hard-exit on mismatch.
-//! 5. Build `HashMap<String, TableSchema>` from the verified configs.
-//! 6. Build `AppState { verifier, backend, schemas }`.
-//! 7. Bind on `listen_addr`, serve `rekt_server::router(state)`.
+//! 4. Verify every TOML-declared table's PG schema via `rekt_meta::verify`
+//!    — hard-exit on mismatch. (Transitional: D3 will replace this with
+//!    the reconciler.)
+//! 5. Ensure `_rektifier_tables` exists; seed TOML `[[tables]]` into it
+//!    via idempotent upsert (transitional through D7; removed in D8).
+//! 6. Read the seeded rows back as the initial catalog snapshot and
+//!    push into `TableCatalog`. (D3 replaces this with the reconciler.)
+//! 7. Build `AppState { verifier, backend, catalog }`.
+//! 8. Bind on `listen_addr`, serve `rekt_server::router(state)`.
 //!
 //! The verifier wired in for MVP is `PermissiveVerifier` — SigV4 signatures
 //! are NOT validated. Don't expose this to untrusted networks until
 //! `StrictVerifier` lands.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use deadpool_postgres::{Manager, Pool};
-use rekt_config::{Config, TableConfig};
+use rekt_catalog::{CatalogSnapshot, TableCatalog};
+use rekt_config::Config;
 use rekt_server::{router, AppState};
 use rekt_sigv4::PermissiveVerifier;
 use rekt_storage_libpq::PgBackend;
-use rekt_translator::TableSchema;
 use tokio_postgres::NoTls;
 use tracing_subscriber::EnvFilter;
 
@@ -57,7 +61,29 @@ async fn main() -> Result<()> {
         .context("schema verification failed — refusing to start")?;
     tracing::info!("all declared tables verified against PG schema");
 
-    let schemas = build_schema_map(&config);
+    rekt_catalog::ensure_metadata_tables(&pool)
+        .await
+        .context("ensuring _rektifier_tables exists")?;
+    let seeded = rekt_catalog::seed_from_config(&pool, &config.tables)
+        .await
+        .context("seeding TOML [[tables]] into _rektifier_tables")?;
+    tracing::info!(
+        seeded,
+        total = config.tables.len(),
+        "seeder upserted TOML tables into _rektifier_tables"
+    );
+
+    let initial_entries = rekt_catalog::load_snapshot(&pool)
+        .await
+        .context("loading initial catalog snapshot from _rektifier_tables")?;
+    tracing::info!(
+        entries = initial_entries.len(),
+        "initial catalog snapshot loaded"
+    );
+    let catalog = Arc::new(TableCatalog::from_snapshot(
+        CatalogSnapshot::from_entries(initial_entries),
+    ));
+
     let backend = PgBackend::new(pool).with_retry_policy(rek_retry_policy(&config));
     tracing::info!(
         max_attempts = config.pg.retry.max_attempts,
@@ -69,7 +95,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         verifier: Arc::new(PermissiveVerifier),
         backend: Arc::new(backend),
-        schemas: Arc::new(schemas),
+        catalog,
         batch_limits: rek_batch_limits(&config),
         request_timeout: std::time::Duration::from_millis(config.server.request_timeout_ms),
     };
@@ -170,22 +196,3 @@ fn rek_retry_policy(config: &Config) -> rekt_storage_libpq::RetryPolicy {
     }
 }
 
-fn build_schema_map(config: &Config) -> HashMap<String, TableSchema> {
-    config
-        .tables
-        .iter()
-        .map(|t| (t.name.clone(), table_config_to_schema(t)))
-        .collect()
-}
-
-fn table_config_to_schema(t: &TableConfig) -> TableSchema {
-    TableSchema {
-        name: t.name.clone(),
-        pg_table: t.pg_table.clone(),
-        pk_attr: t.pk_attr.clone(),
-        pk_type: t.pk_type,
-        sk_attr: t.sk_attr.clone(),
-        sk_type: t.sk_type,
-        jsonb_col: t.jsonb_col.clone(),
-    }
-}

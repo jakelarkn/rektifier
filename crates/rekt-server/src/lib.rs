@@ -34,6 +34,7 @@ use rekt_protocol::{
     TransactWriteItemsRequest, TransactWriteItemsResponse, UpdateItemRequest, UpdateItemResponse,
     WriteRequest,
 };
+use rekt_catalog::TableCatalog;
 use rekt_sigv4::{SigV4Error, Verifier};
 use rekt_storage::{Backend, BackendError, TransactGetOp, TransactWriteOp, UpdateDecision, UpdateOutcome};
 use rekt_translator::{
@@ -67,7 +68,12 @@ const CONTENT_TYPE: &str = "application/x-amz-json-1.0";
 pub struct AppState {
     pub verifier: Arc<dyn Verifier>,
     pub backend: Arc<dyn Backend>,
-    pub schemas: Arc<HashMap<String, TableSchema>>,
+    /// Runtime table catalog: the single source of truth for which
+    /// tables exist and what shape they have. Refreshed by the
+    /// reconciler (PLAN-10 D3) and on local DDL completion. Replaces
+    /// the immutable `Arc<HashMap<String, TableSchema>>` of pre-D2 —
+    /// see PLAN-10 KD4.
+    pub catalog: Arc<TableCatalog>,
     /// Per-call quantity caps on the batch ops. Defaults to DDB
     /// values (100 / 25); operator can override via `[batch_limits]`
     /// in `rektifier.toml`. See `COMPATIBILITY_NOTES.md`.
@@ -460,9 +466,10 @@ async fn handle_put_item(state: &AppState, body: &Bytes) -> Result<Response, Api
     let req: PutItemRequest = parse_request(body, "PutItem")?;
     tracing::Span::current().record("table", req.table_name.as_str());
 
-    let schema = state.schemas.get(&req.table_name).ok_or_else(|| {
+    let entry = state.catalog.get(&req.table_name).ok_or_else(|| {
         ApiError::ResourceNotFound(format!("Table not found: {}", req.table_name))
     })?;
+    let schema = &entry.schema;
 
     let plan = translate_put_item(&req, schema)?;
     let shape = schema.shape();
@@ -531,9 +538,10 @@ async fn handle_get_item(state: &AppState, body: &Bytes) -> Result<Response, Api
     let req: GetItemRequest = parse_request(body, "GetItem")?;
     tracing::Span::current().record("table", req.table_name.as_str());
 
-    let schema = state.schemas.get(&req.table_name).ok_or_else(|| {
+    let entry = state.catalog.get(&req.table_name).ok_or_else(|| {
         ApiError::ResourceNotFound(format!("Table not found: {}", req.table_name))
     })?;
+    let schema = &entry.schema;
 
     let plan = translate_get_item(&req, schema)?;
     let stored = state
@@ -557,9 +565,10 @@ async fn handle_delete_item(state: &AppState, body: &Bytes) -> Result<Response, 
     let req: DeleteItemRequest = parse_request(body, "DeleteItem")?;
     tracing::Span::current().record("table", req.table_name.as_str());
 
-    let schema = state.schemas.get(&req.table_name).ok_or_else(|| {
+    let entry = state.catalog.get(&req.table_name).ok_or_else(|| {
         ApiError::ResourceNotFound(format!("Table not found: {}", req.table_name))
     })?;
+    let schema = &entry.schema;
 
     let plan = translate_delete_item(&req, schema)?;
     let shape = schema.shape();
@@ -591,9 +600,10 @@ async fn handle_update_item(state: &AppState, body: &Bytes) -> Result<Response, 
     let req: UpdateItemRequest = parse_request(body, "UpdateItem")?;
     tracing::Span::current().record("table", req.table_name.as_str());
 
-    let schema = state.schemas.get(&req.table_name).ok_or_else(|| {
+    let entry = state.catalog.get(&req.table_name).ok_or_else(|| {
         ApiError::ResourceNotFound(format!("Table not found: {}", req.table_name))
     })?;
+    let schema = &entry.schema;
 
     let plan = translate_update_item(&req, schema)?;
 
@@ -700,9 +710,10 @@ async fn handle_query(state: &AppState, body: &Bytes) -> Result<Response, ApiErr
         tracing::Span::current().record("consistent_read", cr);
     }
 
-    let schema = state.schemas.get(&req.table_name).ok_or_else(|| {
+    let entry = state.catalog.get(&req.table_name).ok_or_else(|| {
         ApiError::ResourceNotFound(format!("Table not found: {}", req.table_name))
     })?;
+    let schema = &entry.schema;
 
     let plan = translate_query(&req, schema)?;
     let esk_pair = plan
@@ -814,9 +825,10 @@ async fn handle_scan(state: &AppState, body: &Bytes) -> Result<Response, ApiErro
         tracing::Span::current().record("consistent_read", cr);
     }
 
-    let schema = state.schemas.get(&req.table_name).ok_or_else(|| {
+    let entry = state.catalog.get(&req.table_name).ok_or_else(|| {
         ApiError::ResourceNotFound(format!("Table not found: {}", req.table_name))
     })?;
+    let schema = &entry.schema;
 
     let plan = translate_scan(&req, schema)?;
 
@@ -866,9 +878,10 @@ async fn handle_scan(state: &AppState, body: &Bytes) -> Result<Response, ApiErro
 async fn handle_batch_get_item(state: &AppState, body: &Bytes) -> Result<Response, ApiError> {
     let req: BatchGetItemRequest = parse_request(body, "BatchGetItem")?;
 
+    let snapshot = state.catalog.snapshot();
     let plan = translate_batch_get_item(
         &req,
-        state.schemas.as_ref(),
+        &snapshot.schemas,
         state.batch_limits.batch_get_max_keys,
     )?;
 
@@ -883,13 +896,14 @@ async fn handle_batch_get_item(state: &AppState, body: &Bytes) -> Result<Respons
     // pruning helper, the latter as a tracing field only (D7).
     let mut responses: HashMap<String, Vec<Item>> = HashMap::with_capacity(plan.per_table.len());
     for table_plan in &plan.per_table {
-        let schema = state
+        let schema = snapshot
             .schemas
             .get(&table_plan.table_name)
             .ok_or_else(|| {
-                // Translator already validated this; this branch only
-                // fires if the schemas map mutates between translate
-                // and dispatch — not possible in v1, defensive guard.
+                // Translator already validated this against the same
+                // snapshot; this branch is a defensive guard against
+                // the (impossible in v1) case where the snapshot changed
+                // between translate and dispatch.
                 ApiError::ResourceNotFound(format!(
                     "Table not found: {}",
                     table_plan.table_name
@@ -936,9 +950,10 @@ async fn handle_batch_get_item(state: &AppState, body: &Bytes) -> Result<Respons
 async fn handle_batch_write_item(state: &AppState, body: &Bytes) -> Result<Response, ApiError> {
     let req: BatchWriteItemRequest = parse_request(body, "BatchWriteItem")?;
 
+    let snapshot = state.catalog.snapshot();
     let plan = translate_batch_write_item(
         &req,
-        state.schemas.as_ref(),
+        &snapshot.schemas,
         state.batch_limits.batch_write_max_requests,
     )?;
 
@@ -950,7 +965,7 @@ async fn handle_batch_write_item(state: &AppState, body: &Bytes) -> Result<Respo
     // transaction inside `batch_write_raw`; cross-table writes are
     // *not* atomic (matches DDB).
     for table_plan in &plan.per_table {
-        let schema = state
+        let schema = snapshot
             .schemas
             .get(&table_plan.table_name)
             .ok_or_else(|| {
@@ -983,22 +998,24 @@ async fn handle_transact_get_items(
 ) -> Result<Response, ApiError> {
     let req: TransactGetItemsRequest = parse_request(body, "TransactGetItems")?;
 
+    let snapshot = state.catalog.snapshot();
     let plan = translate_transact_get_items(
         &req,
-        state.schemas.as_ref(),
+        &snapshot.schemas,
         state.batch_limits.transact_get_max_items,
     )?;
 
     tracing::Span::current().record("items", plan.items.len());
 
     // Build the storage-layer op list. Each item carries its own
-    // TableShape borrowed from the schemas map; the slice lives for
-    // the duration of the call so the borrow is fine.
+    // TableShape borrowed from the snapshot's schemas map; the
+    // Arc<CatalogSnapshot> keeps the borrow valid for the duration of
+    // the call.
     let shapes: Vec<rekt_storage::TableShape<'_>> = plan
         .items
         .iter()
         .map(|p| {
-            state
+            snapshot
                 .schemas
                 .get(&p.table_name)
                 .map(|s| s.shape())
@@ -1066,20 +1083,21 @@ async fn handle_transact_write_items(
         );
     }
 
+    let snapshot = state.catalog.snapshot();
     let plan = translate_transact_write_items(
         &req,
-        state.schemas.as_ref(),
+        &snapshot.schemas,
         state.batch_limits.transact_write_max_items,
     )?;
     tracing::Span::current().record("items", plan.items.len());
 
     // Build the storage-level ops, attaching ConditionEvalFn closures
-    // per-item. Each shape is borrowed from the schemas map; the
-    // closures own clones of the parsed Condition AST so the
-    // ConditionEvalFn lifetime ('a) is the call's lifetime.
+    // per-item. Each shape is borrowed from the snapshot's schemas
+    // map; the Arc<CatalogSnapshot> keeps the borrow valid for the
+    // call's lifetime, which is also the ConditionEvalFn lifetime ('a).
     let mut ops: Vec<TransactWriteOp<'_>> = Vec::with_capacity(plan.items.len());
     for plan_item in plan.items.into_iter() {
-        let schema = state.schemas.get(&plan_item.table_name).ok_or_else(|| {
+        let schema = snapshot.schemas.get(&plan_item.table_name).ok_or_else(|| {
             ApiError::ResourceNotFound(format!("Table not found: {}", plan_item.table_name))
         })?;
         let shape = schema.shape();

@@ -57,6 +57,13 @@ const DDB_DEFAULT_TRANSACT_WRITE_MAX_ITEMS: u32 = 100;
 /// before the client gives up.
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 
+/// Default reconciler cadence: every 30s a fresh `_rektifier_tables`
+/// snapshot is built and swapped into the catalog cache. PLAN-10 KD3
+/// — also serves as the single cache-refresh mechanism. `0` disables
+/// the periodic timer (only local-DDL invalidation refreshes; debugging
+/// only, see KD4 caveat).
+const DEFAULT_CATALOG_RECONCILE_INTERVAL_MS: u64 = 30_000;
+
 /// Default deadpool max pool size. Matches the previous hard-coded
 /// value so operators upgrading without a `[pg]` block see no change.
 const DEFAULT_PG_MAX_POOL_SIZE: u32 = 16;
@@ -98,6 +105,31 @@ pub struct Config {
     pub tables: Vec<TableConfig>,
     pub batch_limits: BatchLimits,
     pub pg: PgConfig,
+    pub catalog: CatalogConfig,
+}
+
+/// Tunables for the runtime table catalog (PLAN-10 KD4). Sensible
+/// defaults — operators can omit the `[catalog]` block entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogConfig {
+    /// Reconciler cadence in milliseconds. Doubles as the cache-refresh
+    /// interval (the reconciler is the single refresher per KD3). `0`
+    /// disables the periodic timer; only local-DDL invalidation will
+    /// refresh — debugging mode, dangerous in prod.
+    pub reconcile_interval_ms: u64,
+    /// When a rektifier-issued CreateTable / UpdateTable / DeleteTable
+    /// completes, trigger an immediate reconcile so the cache reflects
+    /// the new state before the handler returns. PLAN-10 KD3.
+    pub invalidate_on_local_ddl: bool,
+}
+
+impl CatalogConfig {
+    pub fn defaults() -> Self {
+        Self {
+            reconcile_interval_ms: DEFAULT_CATALOG_RECONCILE_INTERVAL_MS,
+            invalidate_on_local_ddl: true,
+        }
+    }
 }
 
 /// Postgres pool + retry config. All fields have DDB-/deadpool-
@@ -264,7 +296,18 @@ struct RawConfig {
     #[serde(default)]
     pg: Option<RawPg>,
     #[serde(default)]
+    catalog: Option<RawCatalog>,
+    #[serde(default)]
     tables: Vec<RawTable>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCatalog {
+    #[serde(default)]
+    reconcile_interval_ms: Option<u64>,
+    #[serde(default)]
+    invalidate_on_local_ddl: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -548,6 +591,7 @@ impl RawConfig {
         };
 
         let pg = resolve_pg(self.pg.as_ref())?;
+        let catalog = resolve_catalog(self.catalog.as_ref());
 
         Ok(Config {
             server: ServerConfig {
@@ -558,8 +602,23 @@ impl RawConfig {
             tables,
             batch_limits,
             pg,
+            catalog,
         })
     }
+}
+
+fn resolve_catalog(raw: Option<&RawCatalog>) -> CatalogConfig {
+    let mut out = CatalogConfig::defaults();
+    let Some(raw) = raw else { return out };
+    // `reconcile_interval_ms = 0` is meaningful (disables the timer);
+    // accept verbatim instead of treating zero as "use default".
+    if let Some(ms) = raw.reconcile_interval_ms {
+        out.reconcile_interval_ms = ms;
+    }
+    if let Some(b) = raw.invalidate_on_local_ddl {
+        out.invalidate_on_local_ddl = b;
+    }
+    out
 }
 
 /// Apply an optional `RawLimits` block on top of a base `Limits`.

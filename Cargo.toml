@@ -9,6 +9,7 @@ members = [
     "crates/rekt-expressions",
     "crates/rekt-config",
     "crates/rekt-meta",
+    "crates/rekt-catalog",
     "crates/rekt-server",
     "crates/rektifier",
     "crates/rekt-bench",
@@ -53,6 +54,7 @@ hdrhistogram = "7"
 humantime = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 winnow = "0.7"
+arc-swap = "1.7"
 
 [profile.dev]
 opt-level = 0

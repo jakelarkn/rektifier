@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use rekt_expressions::Condition;
+use rekt_catalog::{CatalogSnapshot, TableCatalog, TableEntry, TableStatus};
 use rekt_server::{router, AppState};
 use rekt_sigv4::{PermissiveVerifier, Verifier};
 use rekt_storage::{
@@ -806,6 +807,36 @@ fn schemas() -> HashMap<String, TableSchema> {
     m
 }
 
+/// Build a fully-active catalog from the TableSchema fixtures used by
+/// every dispatch test. Mirrors the post-D2 cache shape: every table
+/// is `ACTIVE` + `serveable = true` so existing tests behave as before.
+/// D4 will add explicit unserveable-gate tests by mutating this.
+fn catalog() -> Arc<TableCatalog> {
+    let mut entries = HashMap::new();
+    for (name, schema) in schemas() {
+        entries.insert(
+            name.clone(),
+            Arc::new(TableEntry {
+                schema,
+                status: TableStatus::Active,
+                serveable: true,
+                unserveable_reason: None,
+                creation_date_ms: 0,
+                last_modified_at_ms: 0,
+                last_modified_by: "dispatch-test-fixture".into(),
+                billing_mode: None,
+                provisioned_rcu: None,
+                provisioned_wcu: None,
+                tags: serde_json::json!({}),
+                gsis: HashMap::new(),
+            }),
+        );
+    }
+    Arc::new(TableCatalog::from_snapshot(CatalogSnapshot::from_entries(
+        entries,
+    )))
+}
+
 fn app() -> axum::Router {
     app_with(MockBackend::default(), std::time::Duration::from_secs(30))
 }
@@ -817,7 +848,7 @@ fn app_with(backend: MockBackend, request_timeout: std::time::Duration) -> axum:
     let state = AppState {
         verifier: Arc::new(PermissiveVerifier) as Arc<dyn Verifier>,
         backend: Arc::new(backend) as Arc<dyn Backend>,
-        schemas: Arc::new(schemas()),
+        catalog: catalog(),
         batch_limits: rekt_server::BatchLimits::default(),
         request_timeout,
     };

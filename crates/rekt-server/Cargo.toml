@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "axum HTTP server dispatching DynamoDB ops to translator + backend"
 
 [dependencies]
+rekt-catalog = { path = "../rekt-catalog" }
 rekt-protocol = { path = "../rekt-protocol" }
 rekt-sigv4 = { path = "../rekt-sigv4" }
 rekt-storage = { path = "../rekt-storage" }
@@ -25,3 +26,4 @@ rekt-expressions = { path = "../rekt-expressions" }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
+serde_json = { workspace = true }
