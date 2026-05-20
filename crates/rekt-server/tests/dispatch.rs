@@ -990,10 +990,17 @@ async fn unknown_table_is_resource_not_found() {
 #[tokio::test]
 async fn unsupported_op_is_unknown_operation() {
     let app = app();
-    // `DescribeTable` is not implemented. Swap this for whatever is
-    // still unsupported as more ops land.
+    // `CreateTable` is not yet implemented (PLAN-10 D6). Swap this for
+    // whatever is still unsupported as more ops land.
     let resp = app
-        .oneshot(ddb_request("DescribeTable", json!({})))
+        .oneshot(ddb_request(
+            "CreateTable",
+            json!({
+                "TableName":"new",
+                "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+                "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}]
+            }),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -7891,4 +7898,201 @@ async fn unknown_table_still_returns_rnf_not_unserveable_message() {
         .as_str()
         .unwrap()
         .contains("Table not found"));
+}
+
+// ===== D5: DescribeTable + ListTables =======================================
+
+#[tokio::test]
+async fn describe_table_returns_arn_status_keyschema() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "DescribeTable",
+            json!({"TableName":"users"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let table = &body["Table"];
+    assert_eq!(table["TableName"], "users");
+    assert_eq!(table["TableStatus"], "ACTIVE");
+    assert_eq!(
+        table["TableArn"],
+        "arn:aws:dynamodb:::rektifier-table/users"
+    );
+    let ks = table["KeySchema"].as_array().unwrap();
+    assert_eq!(ks.len(), 1);
+    assert_eq!(ks[0]["AttributeName"], "id");
+    assert_eq!(ks[0]["KeyType"], "HASH");
+}
+
+/// Composite-key table — KeySchema carries both HASH + RANGE in that
+/// order; AttributeDefinitions covers both attributes.
+#[tokio::test]
+async fn describe_table_composite_key_round_trip() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "DescribeTable",
+            json!({"TableName":"device_events"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let table = &body["Table"];
+    let ks = table["KeySchema"].as_array().unwrap();
+    assert_eq!(ks.len(), 2);
+    assert_eq!(ks[0]["KeyType"], "HASH");
+    assert_eq!(ks[1]["AttributeName"], "ts");
+    assert_eq!(ks[1]["KeyType"], "RANGE");
+    let ad = table["AttributeDefinitions"].as_array().unwrap();
+    assert_eq!(ad.len(), 2);
+    assert!(ad
+        .iter()
+        .any(|d| d["AttributeName"] == "ts" && d["AttributeType"] == "N"));
+}
+
+/// PLAN-10 KD5: DescribeTable on an unserveable table still returns
+/// the description (operators need it to diagnose). Wire status hides
+/// the internal failure per KD6.
+#[tokio::test]
+async fn describe_table_works_on_unserveable_table() {
+    let app = app_users_unserveable();
+    let resp = app
+        .oneshot(ddb_request(
+            "DescribeTable",
+            json!({"TableName":"users"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let table = &body["Table"];
+    // The catalog row carries status=Degraded; KD6 collapses that to ACTIVE.
+    assert_eq!(table["TableStatus"], "ACTIVE");
+    assert_eq!(table["TableName"], "users");
+}
+
+/// Unknown table → RNF (no serveable mention, table truly doesn't exist).
+#[tokio::test]
+async fn describe_table_unknown_returns_rnf() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "DescribeTable",
+            json!({"TableName":"nope"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ResourceNotFoundException"));
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("Table not found"));
+}
+
+#[tokio::test]
+async fn list_tables_returns_sorted_names() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request("ListTables", json!({})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let names: Vec<&str> = body["TableNames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    // Test fixture has six tables; verify sort.
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted, "ListTables must return ASC-sorted names");
+    assert!(body.get("LastEvaluatedTableName").is_none());
+}
+
+/// Pagination: Limit=2 returns first two names + LastEvaluatedTableName
+/// equal to the last returned name. Resumed page starts strictly after.
+#[tokio::test]
+async fn list_tables_pagination() {
+    let app1 = app();
+    let resp = app1
+        .oneshot(ddb_request("ListTables", json!({"Limit": 2})))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let names: Vec<String> = body["TableNames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(names.len(), 2);
+    let last = body["LastEvaluatedTableName"].as_str().unwrap();
+    assert_eq!(last, names.last().unwrap());
+
+    // Resume strictly after the cursor.
+    let app2 = app();
+    let resp = app2
+        .oneshot(ddb_request(
+            "ListTables",
+            json!({"ExclusiveStartTableName": last, "Limit": 2}),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let next_names: Vec<&str> = body["TableNames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(next_names.iter().all(|n| *n > last));
+}
+
+/// Limit=0 and Limit>100 both rejected per DDB's 1..=100 bound.
+#[tokio::test]
+async fn list_tables_invalid_limit_rejected() {
+    let app1 = app();
+    let resp = app1
+        .oneshot(ddb_request("ListTables", json!({"Limit": 0})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let app2 = app();
+    let resp = app2
+        .oneshot(ddb_request("ListTables", json!({"Limit": 101})))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// ListTables includes unserveable tables — same as DDB, which doesn't
+/// filter on internal health. Operators see degraded tables in the
+/// listing and can DescribeTable / read `_rektifier_tables` to diagnose.
+#[tokio::test]
+async fn list_tables_includes_unserveable_entries() {
+    let app = app_users_unserveable();
+    let resp = app
+        .oneshot(ddb_request("ListTables", json!({})))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let names: Vec<&str> = body["TableNames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"users"), "unserveable `users` must appear");
 }

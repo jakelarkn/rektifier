@@ -20,6 +20,8 @@
 //! HTTP status is **400 for almost everything** (per DDB convention) and
 //! **500** only for genuine internal errors.
 
+mod ddl;
+
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -460,7 +462,7 @@ where
 /// the "invalid <Op> body: <reason>" message + structured tracing field
 /// for every handler so a misbehaving SDK shows up in logs even when
 /// the response is just a 4xx SerializationException.
-fn parse_request<T: serde::de::DeserializeOwned>(
+pub(crate) fn parse_request<T: serde::de::DeserializeOwned>(
     body: &Bytes,
     op: &'static str,
 ) -> Result<T, ApiError> {
@@ -526,6 +528,8 @@ async fn dispatch(State(state): State<AppState>, req: Request) -> Result<Respons
         "BatchWriteItem" => handle_batch_write_item(&state, &body).await,
         "TransactGetItems" => handle_transact_get_items(&state, &body).await,
         "TransactWriteItems" => handle_transact_write_items(&state, &body).await,
+        "DescribeTable" => ddl::handle_describe_table(&state, &body).await,
+        "ListTables" => ddl::handle_list_tables(&state, &body).await,
         _ => Err(ApiError::UnknownOperation(format!(
             "operation `{op}` not implemented"
         ))),
@@ -1385,7 +1389,7 @@ async fn dispatch_slow_path(
     )?))
 }
 
-fn json_ok<T: serde::Serialize>(value: &T) -> Response {
+pub(crate) fn json_ok<T: serde::Serialize>(value: &T) -> Response {
     let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
     let mut response = (StatusCode::OK, body).into_response();
     response.headers_mut().insert(
