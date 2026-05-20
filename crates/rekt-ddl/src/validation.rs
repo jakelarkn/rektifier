@@ -3,7 +3,7 @@
 //! request validation" section.
 
 use crate::errors::DdlError;
-use rekt_protocol::CreateTableRequest;
+use rekt_protocol::{CreateTableRequest, UpdateTableRequest};
 use rekt_storage::KeyType;
 use std::collections::{BTreeSet, HashSet};
 
@@ -57,6 +57,57 @@ pub fn validate_create_table(req: &CreateTableRequest) -> Result<CreateTablePlan
         provisioned_wcu: provisioned.map(|p| p.write_capacity_units),
         tags: tags_to_json(req.tags.as_ref()),
     })
+}
+
+/// Cheap re-validation for DeleteTable / UpdateTable. Doesn't enforce
+/// the reserved-prefix rule (the catalog already rejected such names
+/// at CreateTable time, and an operator might be deleting a stray row
+/// they hand-edited via psql).
+pub fn validate_table_name_simple(name: &str) -> Result<(), DdlError> {
+    if name.len() < 3 || name.len() > 255 {
+        return Err(DdlError::Validation(format!(
+            "table name `{name}` must be between 3 and 255 characters"
+        )));
+    }
+    if !name.chars().all(is_valid_table_name_char) {
+        return Err(DdlError::Validation(format!(
+            "table name `{name}` contains characters outside [a-zA-Z0-9_.-]"
+        )));
+    }
+    Ok(())
+}
+
+/// UpdateTable body validation. GSI sub-actions are rejected until
+/// PLAN-9 lands the lifecycle machinery; Streams enabled is rejected
+/// like CreateTable; BillingMode if present must be in the documented
+/// vocabulary.
+pub fn validate_update_table_body(req: &UpdateTableRequest) -> Result<(), DdlError> {
+    if let Some(updates) = req.global_secondary_index_updates.as_ref() {
+        if !updates.is_empty() {
+            return Err(DdlError::Validation(
+                "GlobalSecondaryIndexUpdates is not yet supported \
+                 (PLAN-9 GSI lifecycle pending)"
+                    .into(),
+            ));
+        }
+    }
+    if let Some(spec) = req.stream_specification.as_ref() {
+        if spec.stream_enabled {
+            return Err(DdlError::Validation(
+                "StreamSpecification.StreamEnabled = true is not supported; \
+                 DDB Streams parity is deferred (PLAN-10 D10)"
+                    .into(),
+            ));
+        }
+    }
+    if let Some(bm) = req.billing_mode.as_deref() {
+        if bm != "PROVISIONED" && bm != "PAY_PER_REQUEST" {
+            return Err(DdlError::Validation(format!(
+                "BillingMode `{bm}` is not one of PROVISIONED | PAY_PER_REQUEST"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_table_name(name: &str) -> Result<(), DdlError> {

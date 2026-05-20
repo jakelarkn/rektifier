@@ -553,8 +553,10 @@ async fn dispatch(State(state): State<AppState>, req: Request) -> Result<Respons
         "TransactGetItems" => handle_transact_get_items(&state, &body).await,
         "TransactWriteItems" => handle_transact_write_items(&state, &body).await,
         "CreateTable" => ddl::handle_create_table(&state, &body).await,
+        "DeleteTable" => ddl::handle_delete_table(&state, &body).await,
         "DescribeTable" => ddl::handle_describe_table(&state, &body).await,
         "ListTables" => ddl::handle_list_tables(&state, &body).await,
+        "UpdateTable" => ddl::handle_update_table(&state, &body).await,
         _ => Err(ApiError::UnknownOperation(format!(
             "operation `{op}` not implemented"
         ))),

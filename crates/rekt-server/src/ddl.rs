@@ -13,9 +13,11 @@ use crate::{json_ok, parse_request, ApiError, AppState};
 use bytes::Bytes;
 use rekt_catalog::TableEntry;
 use rekt_protocol::{
-    AttributeDefinition, CreateTableRequest, CreateTableResponse, DescribeTableRequest,
-    DescribeTableResponse, GlobalSecondaryIndexDescription, KeySchemaElement, ListTablesRequest,
-    ListTablesResponse, Projection, ProvisionedThroughputDescription, TableDescription,
+    AttributeDefinition, CreateTableRequest, CreateTableResponse, DeleteTableRequest,
+    DeleteTableResponse, DescribeTableRequest, DescribeTableResponse,
+    GlobalSecondaryIndexDescription, KeySchemaElement, ListTablesRequest, ListTablesResponse,
+    Projection, ProvisionedThroughputDescription, TableDescription, UpdateTableRequest,
+    UpdateTableResponse,
 };
 use rekt_storage::KeyType;
 
@@ -165,6 +167,46 @@ pub(crate) async fn handle_create_table(
     tracing::Span::current().record("table", req.table_name.as_str());
     let description = state.ddl.create_table(&req).await?;
     Ok(json_ok(&CreateTableResponse {
+        table_description: description,
+    }))
+}
+
+// ===== DeleteTable ===========================================================
+
+#[tracing::instrument(
+    level = "debug",
+    skip_all,
+    name = "server.delete_table",
+    fields(table = tracing::field::Empty)
+)]
+pub(crate) async fn handle_delete_table(
+    state: &AppState,
+    body: &Bytes,
+) -> Result<axum::response::Response, ApiError> {
+    let req: DeleteTableRequest = parse_request(body, "DeleteTable")?;
+    tracing::Span::current().record("table", req.table_name.as_str());
+    let description = state.ddl.delete_table(&req).await?;
+    Ok(json_ok(&DeleteTableResponse {
+        table_description: description,
+    }))
+}
+
+// ===== UpdateTable ===========================================================
+
+#[tracing::instrument(
+    level = "debug",
+    skip_all,
+    name = "server.update_table",
+    fields(table = tracing::field::Empty)
+)]
+pub(crate) async fn handle_update_table(
+    state: &AppState,
+    body: &Bytes,
+) -> Result<axum::response::Response, ApiError> {
+    let req: UpdateTableRequest = parse_request(body, "UpdateTable")?;
+    tracing::Span::current().record("table", req.table_name.as_str());
+    let description = state.ddl.update_table(&req).await?;
+    Ok(json_ok(&UpdateTableResponse {
         table_description: description,
     }))
 }

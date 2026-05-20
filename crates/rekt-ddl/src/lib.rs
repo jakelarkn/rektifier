@@ -20,7 +20,9 @@ use rekt_catalog::{
     metadata::{key_type_str, now_ms},
     CatalogError, Reconciler, TableCatalog, TableEntry, TableStatus,
 };
-use rekt_protocol::{CreateTableRequest, TableDescription};
+use rekt_protocol::{
+    CreateTableRequest, DeleteTableRequest, TableDescription, UpdateTableRequest,
+};
 use rekt_translator::TableSchema;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,6 +46,24 @@ pub trait DdlBackend: Send + Sync {
     async fn create_table(
         &self,
         req: &CreateTableRequest,
+    ) -> Result<TableDescription, DdlError>;
+
+    /// Drop a table. PLAN-10 D7 / KD2: on successful drop, the metadata
+    /// row is hard-removed (no `gone` state, no archive). Returns the
+    /// description as-it-was-just-before-delete with wire status
+    /// `DELETING` per KD6 — matches DDB's response shape.
+    async fn delete_table(
+        &self,
+        req: &DeleteTableRequest,
+    ) -> Result<TableDescription, DdlError>;
+
+    /// Mutate non-GSI table-level fields (BillingMode, Provisioned-
+    /// Throughput, Tags). PLAN-10 D7. GSI sub-action dispatch lands
+    /// with PLAN-9 — until then, `GlobalSecondaryIndexUpdates` is
+    /// rejected with `ValidationException`.
+    async fn update_table(
+        &self,
+        req: &UpdateTableRequest,
     ) -> Result<TableDescription, DdlError>;
 }
 
@@ -129,6 +149,24 @@ SELECT 1
   FROM information_schema.tables
  WHERE table_schema = current_schema()
    AND table_name = $1
+";
+
+const DELETE_METADATA_ROW_SQL: &str = "\
+DELETE FROM _rektifier_tables WHERE table_name = $1
+";
+
+/// UPDATE for non-GSI table-level fields. NULL-valued $-bound params
+/// leave the column unchanged (`COALESCE($, col)`); explicit values
+/// replace.
+const UPDATE_TABLE_LEVEL_FIELDS_SQL: &str = "\
+UPDATE _rektifier_tables
+   SET billing_mode      = COALESCE($2, billing_mode),
+       provisioned_rcu   = COALESCE($3, provisioned_rcu),
+       provisioned_wcu   = COALESCE($4, provisioned_wcu),
+       tags              = COALESCE($5::jsonb, tags),
+       last_modified_at_ms = $6,
+       last_modified_by  = 'ddl'
+ WHERE table_name = $1
 ";
 
 #[async_trait]
@@ -284,6 +322,146 @@ impl DdlBackend for PgDdlBackend {
             DdlError::Internal(format!(
                 "post-CreateTable catalog miss for `{}` — reconcile bug?",
                 plan.table_name
+            ))
+        })?;
+        Ok(synthesize_description(&entry))
+    }
+
+    async fn delete_table(
+        &self,
+        req: &DeleteTableRequest,
+    ) -> Result<TableDescription, DdlError> {
+        validation::validate_table_name_simple(&req.table_name)?;
+
+        // Snapshot the entry pre-delete so the response can carry the
+        // table's shape with status flipped to DELETING per KD6.
+        let entry = self.catalog.get(&req.table_name).ok_or_else(|| {
+            DdlError::ResourceNotFound(format!("Table not found: {}", req.table_name))
+        })?;
+        let pg_table = entry.schema.pg_table.clone();
+
+        let mut client = self.pool.get().await.map_err(|e| {
+            DdlError::Catalog(CatalogError::Pool(format!("pool get failed: {e}")))
+        })?;
+        let tx = client.transaction().await?;
+        tx.execute(ACQUIRE_TABLE_LOCK_SQL, &[&req.table_name])
+            .await?;
+
+        // PLAN-9 will add GSI artifact cleanup here ("drop GSI columns/
+        // indexes"). For pre-PLAN-9, the base-table DROP is sufficient.
+        // DROP TABLE IF EXISTS keeps retries idempotent.
+        let drop_sql = format!("DROP TABLE IF EXISTS {pg_table}");
+        if let Err(e) = tx.batch_execute(&drop_sql).await {
+            tx.rollback().await?;
+            return Err(DdlError::Internal(format!(
+                "DROP TABLE failed for `{}`: {e}",
+                req.table_name
+            )));
+        }
+
+        // Hard-delete the metadata row. KD2: no `gone` state, no
+        // archive — operators wanting audit attach a PG audit
+        // extension or rely on rektifier's tracing output.
+        let deleted_rows = tx
+            .execute(DELETE_METADATA_ROW_SQL, &[&req.table_name])
+            .await?;
+        if deleted_rows == 0 {
+            // Catalog had the entry but the row disappeared between
+            // lookup and DELETE — multi-instance race or operator
+            // hand-edit. Surface as ResourceNotFound.
+            tx.rollback().await?;
+            return Err(DdlError::ResourceNotFound(format!(
+                "Table not found at delete time: {}",
+                req.table_name
+            )));
+        }
+        tx.commit().await?;
+        tracing::info!(
+            table = %req.table_name,
+            pg_table = %pg_table,
+            "DeleteTable: DROP TABLE issued + metadata row hard-deleted"
+        );
+
+        if self.invalidate_on_local_ddl {
+            self.reconciler.reconcile_now().await?;
+        }
+
+        // Synthesize a DELETING-status description from the pre-delete
+        // snapshot. The catalog no longer carries the row; the wire
+        // response is the description the SDK polls against until the
+        // table is gone (it will get ResourceNotFound on the next
+        // DescribeTable).
+        let mut description = synthesize_description(&entry);
+        description.table_status = Some(TableStatus::Deleting.to_wire_str().into());
+        Ok(description)
+    }
+
+    async fn update_table(
+        &self,
+        req: &UpdateTableRequest,
+    ) -> Result<TableDescription, DdlError> {
+        validation::validate_table_name_simple(&req.table_name)?;
+        validation::validate_update_table_body(req)?;
+
+        // Confirm the table exists in the catalog before issuing any
+        // PG work. The post-update reread further below picks up the
+        // mutated row.
+        if self.catalog.get(&req.table_name).is_none() {
+            return Err(DdlError::ResourceNotFound(format!(
+                "Table not found: {}",
+                req.table_name
+            )));
+        }
+
+        // Collect the field deltas. Anything left as `None` here will
+        // be COALESCEd in the SQL, leaving the prior value intact.
+        // Tag mutations land later (TagResource / UntagResource —
+        // PLAN-10 D10 deferred); DDB's UpdateTable doesn't carry Tags
+        // directly, so nothing for us to thread.
+        let new_billing = req.billing_mode.clone();
+        let (new_rcu, new_wcu) = match req.provisioned_throughput.as_ref() {
+            Some(pt) => (Some(pt.read_capacity_units), Some(pt.write_capacity_units)),
+            None => (None, None),
+        };
+        let new_tags: Option<serde_json::Value> = None;
+
+        let mut client = self.pool.get().await.map_err(|e| {
+            DdlError::Catalog(CatalogError::Pool(format!("pool get failed: {e}")))
+        })?;
+        let tx = client.transaction().await?;
+        tx.execute(ACQUIRE_TABLE_LOCK_SQL, &[&req.table_name])
+            .await?;
+
+        let now = now_ms();
+        tx.execute(
+            UPDATE_TABLE_LEVEL_FIELDS_SQL,
+            &[
+                &req.table_name,
+                &new_billing,
+                &new_rcu,
+                &new_wcu,
+                &new_tags,
+                &now,
+            ],
+        )
+        .await?;
+        tx.commit().await?;
+        tracing::info!(
+            table = %req.table_name,
+            billing_mode = ?new_billing,
+            provisioned_rcu = ?new_rcu,
+            provisioned_wcu = ?new_wcu,
+            "UpdateTable: non-GSI fields mutated"
+        );
+
+        if self.invalidate_on_local_ddl {
+            self.reconciler.reconcile_now().await?;
+        }
+
+        let entry = self.catalog.get(&req.table_name).ok_or_else(|| {
+            DdlError::Internal(format!(
+                "post-UpdateTable catalog miss for `{}`",
+                req.table_name
             ))
         })?;
         Ok(synthesize_description(&entry))

@@ -7,7 +7,7 @@ use axum::http::{Request, StatusCode};
 use rekt_expressions::Condition;
 use rekt_catalog::{CatalogSnapshot, TableCatalog, TableEntry, TableStatus};
 use rekt_ddl::{DdlBackend, DdlError};
-use rekt_protocol::{CreateTableRequest, TableDescription};
+use rekt_protocol::{CreateTableRequest, DeleteTableRequest, TableDescription, UpdateTableRequest};
 use rekt_server::{router, AppState};
 use rekt_sigv4::{PermissiveVerifier, Verifier};
 use rekt_storage::{
@@ -869,6 +869,48 @@ impl DdlBackend for MockDdlBackend {
         let entry = self.catalog.get(&plan.table_name).unwrap();
         Ok(table_description_from_entry_for_test(&entry))
     }
+
+    async fn delete_table(
+        &self,
+        req: &DeleteTableRequest,
+    ) -> Result<TableDescription, DdlError> {
+        rekt_ddl::validation::validate_table_name_simple(&req.table_name)?;
+        let entry = self.catalog.get(&req.table_name).ok_or_else(|| {
+            DdlError::ResourceNotFound(format!("Table not found: {}", req.table_name))
+        })?;
+        let mut next = self.catalog.snapshot().entries.clone();
+        next.remove(&req.table_name);
+        self.catalog
+            .replace(CatalogSnapshot::from_entries(next));
+        let mut description = table_description_from_entry_for_test(&entry);
+        // KD6: DELETING wire status on the response.
+        description.table_status = Some("DELETING".into());
+        Ok(description)
+    }
+
+    async fn update_table(
+        &self,
+        req: &UpdateTableRequest,
+    ) -> Result<TableDescription, DdlError> {
+        rekt_ddl::validation::validate_table_name_simple(&req.table_name)?;
+        rekt_ddl::validation::validate_update_table_body(req)?;
+        let entry = self.catalog.get(&req.table_name).ok_or_else(|| {
+            DdlError::ResourceNotFound(format!("Table not found: {}", req.table_name))
+        })?;
+        let mut next_entry = (*entry).clone();
+        if let Some(bm) = req.billing_mode.as_ref() {
+            next_entry.billing_mode = Some(bm.clone());
+        }
+        if let Some(pt) = req.provisioned_throughput.as_ref() {
+            next_entry.provisioned_rcu = Some(pt.read_capacity_units);
+            next_entry.provisioned_wcu = Some(pt.write_capacity_units);
+        }
+        let mut next = self.catalog.snapshot().entries.clone();
+        next.insert(req.table_name.clone(), Arc::new(next_entry));
+        self.catalog.replace(CatalogSnapshot::from_entries(next));
+        let entry = self.catalog.get(&req.table_name).unwrap();
+        Ok(table_description_from_entry_for_test(&entry))
+    }
 }
 
 /// Mirror of `rekt_server::ddl::table_description_from_entry`. Inlined
@@ -1075,12 +1117,12 @@ async fn unknown_table_is_resource_not_found() {
 #[tokio::test]
 async fn unsupported_op_is_unknown_operation() {
     let app = app();
-    // `UpdateTable` is not yet implemented (PLAN-10 D7). Swap this for
-    // whatever is still unsupported as more ops land.
+    // `TagResource` is the next-up unsupported op (PLAN-10 D10 deferred).
+    // Swap this for whatever is still unsupported as more ops land.
     let resp = app
         .oneshot(ddb_request(
-            "UpdateTable",
-            json!({"TableName":"users"}),
+            "TagResource",
+            json!({"ResourceArn":"arn:aws:dynamodb:::rektifier-table/x","Tags":[]}),
         ))
         .await
         .unwrap();
@@ -8335,6 +8377,191 @@ async fn create_table_rejects_stream_enabled_true() {
                 "TableName":"WithStreams",
                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
                 "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+                "StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_IMAGE"}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("Streams"));
+}
+
+// ===== D7: DeleteTable + UpdateTable ========================================
+
+#[tokio::test]
+async fn delete_table_round_trip_via_mock() {
+    let app = app();
+    // Pre-existing fixture: `users` is in the catalog.
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "DeleteTable",
+            json!({"TableName":"users"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let td = &body["TableDescription"];
+    assert_eq!(td["TableName"], "users");
+    // KD6: DELETING wire status on the response.
+    assert_eq!(td["TableStatus"], "DELETING");
+
+    // Confirm the row is gone — subsequent DescribeTable yields RNF.
+    let resp = app
+        .oneshot(ddb_request(
+            "DescribeTable",
+            json!({"TableName":"users"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ResourceNotFoundException"));
+}
+
+#[tokio::test]
+async fn delete_table_unknown_returns_rnf() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "DeleteTable",
+            json!({"TableName":"nope"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ResourceNotFoundException"));
+}
+
+/// UpdateTable mutates BillingMode + ProvisionedThroughput. The
+/// DescribeTable response carries the new values.
+#[tokio::test]
+async fn update_table_billing_and_throughput_round_trip() {
+    let app = app();
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "UpdateTable",
+            json!({
+                "TableName":"users",
+                "BillingMode":"PROVISIONED",
+                "ProvisionedThroughput":{
+                    "ReadCapacityUnits": 10,
+                    "WriteCapacityUnits": 20
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(ddb_request(
+            "DescribeTable",
+            json!({"TableName":"users"}),
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let table = &body["Table"];
+    assert_eq!(table["BillingModeSummary"]["BillingMode"], "PROVISIONED");
+    let pt = &table["ProvisionedThroughput"];
+    assert_eq!(pt["ReadCapacityUnits"], 10);
+    assert_eq!(pt["WriteCapacityUnits"], 20);
+}
+
+#[tokio::test]
+async fn update_table_unknown_returns_rnf() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "UpdateTable",
+            json!({"TableName":"nope","BillingMode":"PROVISIONED"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ResourceNotFoundException"));
+}
+
+/// GSI mutations rejected until PLAN-9 lands. Validation message
+/// names the missing prerequisite so operator can correlate.
+#[tokio::test]
+async fn update_table_rejects_gsi_until_plan9() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "UpdateTable",
+            json!({
+                "TableName":"users",
+                "AttributeDefinitions":[
+                    {"AttributeName":"tier","AttributeType":"S"}
+                ],
+                "GlobalSecondaryIndexUpdates":[{
+                    "Create":{
+                        "IndexName":"by_tier",
+                        "KeySchema":[{"AttributeName":"tier","KeyType":"HASH"}],
+                        "Projection":{"ProjectionType":"ALL"}
+                    }
+                }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ValidationException"));
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("GlobalSecondaryIndexUpdates"));
+}
+
+/// Empty GSI updates array accepted (some SDKs always emit the field).
+#[tokio::test]
+async fn update_table_accepts_empty_gsi_updates_list() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "UpdateTable",
+            json!({
+                "TableName":"users",
+                "GlobalSecondaryIndexUpdates":[]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Streams rejection mirrors CreateTable's rule.
+#[tokio::test]
+async fn update_table_rejects_stream_enabled_true() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "UpdateTable",
+            json!({
+                "TableName":"users",
                 "StreamSpecification":{"StreamEnabled":true,"StreamViewType":"NEW_IMAGE"}
             }),
         ))
