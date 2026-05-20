@@ -3,11 +3,12 @@
 //! request validation" section.
 
 use crate::errors::DdlError;
-use rekt_protocol::{CreateTableRequest, UpdateTableRequest};
+use rekt_protocol::{CreateTableRequest, GlobalSecondaryIndex, UpdateTableRequest};
 use rekt_storage::KeyType;
 use std::collections::{BTreeSet, HashSet};
 
-/// DDB's documented table-name regex: `[a-zA-Z0-9_.-]{3,255}`.
+/// DDB's documented table-name regex: `[a-zA-Z0-9_.-]{3,255}`. Also
+/// applied to GSI IndexName, which shares the same grammar.
 fn is_valid_table_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-'
 }
@@ -16,6 +17,21 @@ fn is_valid_table_name_char(c: char) -> bool {
 /// starting with this so operators can't shadow `_rektifier_tables` or
 /// any sibling internal table.
 const RESERVED_PREFIX: &str = "_rektifier_";
+
+/// DDB documents attribute names as 1..=255 *bytes* (UTF-8). Applies to
+/// every entry in AttributeDefinitions and every KeySchema element.
+/// Past 255 bytes is a hard rejection; the previous validation pipeline
+/// would silently truncate at the PG-identifier layer (since
+/// `sanitize_pg_table_name` only operates on the *table* name, not on
+/// attribute names) — so this is a parity gap closure, not just a
+/// politeness check.
+const MIN_ATTR_NAME_BYTES: usize = 1;
+const MAX_ATTR_NAME_BYTES: usize = 255;
+
+/// DDB caps KeySchema at 2 entries (HASH + optional RANGE). More than
+/// that is malformed; rejecting up front gives a clearer message than
+/// "more than one HASH" / "more than one RANGE" fired ad-hoc.
+const MAX_KEY_SCHEMA_LEN: usize = 2;
 
 /// What survives validation: a derived plan ready for the worker.
 /// Carries the inputs in their post-validation typed form so the SQL
@@ -38,8 +54,12 @@ pub struct CreateTablePlan {
 
 pub fn validate_create_table(req: &CreateTableRequest) -> Result<CreateTablePlan, DdlError> {
     validate_table_name(&req.table_name)?;
+    validate_attribute_definitions_nonempty(&req.table_name, req)?;
+    validate_attribute_names(&req.table_name, req)?;
+    validate_key_schema_shape(&req.table_name, &req.key_schema)?;
     let (pk_attr, pk_type, sk_attr, sk_type) =
         validate_key_schema_and_attrs(&req.table_name, req)?;
+    validate_gsi_structures(&req.table_name, req)?;
     validate_lsi_not_supported(req)?;
     validate_stream_not_enabled(req)?;
     validate_billing_mode(req)?;
@@ -77,12 +97,33 @@ pub fn validate_table_name_simple(name: &str) -> Result<(), DdlError> {
     Ok(())
 }
 
-/// UpdateTable body validation. GSI sub-actions are rejected until
-/// PLAN-9 lands the lifecycle machinery; Streams enabled is rejected
-/// like CreateTable; BillingMode if present must be in the documented
-/// vocabulary.
+/// UpdateTable body validation. GSI sub-actions are validated for
+/// shape (exactly-one-of Create/Update/Delete per entry) before being
+/// rejected pending PLAN-9 — that way operators get the *structural*
+/// rejection back even today, so SDK callers integrating against
+/// rektifier can iron out malformed requests now and have the
+/// behavior flip-to-success when PLAN-9 lands without intermediate
+/// surprises.
 pub fn validate_update_table_body(req: &UpdateTableRequest) -> Result<(), DdlError> {
     if let Some(updates) = req.global_secondary_index_updates.as_ref() {
+        for (idx, u) in updates.iter().enumerate() {
+            // DDB documents: exactly one of Create/Update/Delete must be
+            // set per entry. Anything else is a malformed request.
+            let set_count = [
+                u.create.is_some(),
+                u.update.is_some(),
+                u.delete.is_some(),
+            ]
+            .iter()
+            .filter(|b| **b)
+            .count();
+            if set_count != 1 {
+                return Err(DdlError::Validation(format!(
+                    "GlobalSecondaryIndexUpdates[{idx}]: exactly one of Create / \
+                     Update / Delete must be set (got {set_count})"
+                )));
+            }
+        }
         if !updates.is_empty() {
             return Err(DdlError::Validation(
                 "GlobalSecondaryIndexUpdates is not yet supported \
@@ -106,6 +147,198 @@ pub fn validate_update_table_body(req: &UpdateTableRequest) -> Result<(), DdlErr
                 "BillingMode `{bm}` is not one of PROVISIONED | PAY_PER_REQUEST"
             )));
         }
+    }
+    if let Some(pt) = req.provisioned_throughput.as_ref() {
+        if pt.read_capacity_units < 1 || pt.write_capacity_units < 1 {
+            return Err(DdlError::Validation(format!(
+                "ProvisionedThroughput.ReadCapacityUnits and \
+                 .WriteCapacityUnits must be >= 1 (got {} / {})",
+                pt.read_capacity_units, pt.write_capacity_units
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// AttributeDefinitions must carry at least one entry — anything else
+/// guarantees KeySchema is malformed downstream. Surface this up front
+/// with a precise message so the operator doesn't have to read the
+/// downstream "KeySchema references attribute X" error and infer the
+/// real problem.
+fn validate_attribute_definitions_nonempty(
+    table_name: &str,
+    req: &CreateTableRequest,
+) -> Result<(), DdlError> {
+    if req.attribute_definitions.is_empty() {
+        return Err(DdlError::Validation(format!(
+            "table `{table_name}`: AttributeDefinitions must contain at least one entry"
+        )));
+    }
+    Ok(())
+}
+
+/// DDB: attribute names are 1..=255 UTF-8 bytes. Both the
+/// AttributeDefinitions entries and the KeySchema entries are checked;
+/// a KeySchema attribute that points at a definition with a too-long
+/// name would otherwise pass the cross-reference check and only fail
+/// at PG-bind time with a less actionable error.
+fn validate_attribute_names(
+    table_name: &str,
+    req: &CreateTableRequest,
+) -> Result<(), DdlError> {
+    for ad in &req.attribute_definitions {
+        check_attr_name(table_name, &ad.attribute_name)?;
+    }
+    for kse in &req.key_schema {
+        check_attr_name(table_name, &kse.attribute_name)?;
+    }
+    if let Some(gsis) = req.global_secondary_indexes.as_ref() {
+        for gsi in gsis {
+            for kse in &gsi.key_schema {
+                check_attr_name(table_name, &kse.attribute_name)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_attr_name(table_name: &str, name: &str) -> Result<(), DdlError> {
+    let bytes = name.len();
+    if !(MIN_ATTR_NAME_BYTES..=MAX_ATTR_NAME_BYTES).contains(&bytes) {
+        return Err(DdlError::Validation(format!(
+            "table `{table_name}`: attribute name `{name}` must be \
+             {MIN_ATTR_NAME_BYTES}..={MAX_ATTR_NAME_BYTES} bytes (got {bytes})"
+        )));
+    }
+    Ok(())
+}
+
+/// Coarse-grained KeySchema shape check: empty / over-long array.
+/// Cardinality of HASH and RANGE entries (and the actual attribute
+/// cross-reference) lives in `validate_key_schema_and_attrs` — this
+/// helper just catches the malformed-up-front cases with a precise
+/// message before the per-entry walk surfaces a noisier one.
+fn validate_key_schema_shape(
+    table_name: &str,
+    key_schema: &[rekt_protocol::KeySchemaElement],
+) -> Result<(), DdlError> {
+    if key_schema.is_empty() {
+        return Err(DdlError::Validation(format!(
+            "table `{table_name}`: KeySchema must contain at least one entry \
+             (a HASH partition key is required)"
+        )));
+    }
+    if key_schema.len() > MAX_KEY_SCHEMA_LEN {
+        return Err(DdlError::Validation(format!(
+            "table `{table_name}`: KeySchema has {} entries; the maximum is \
+             {MAX_KEY_SCHEMA_LEN} (HASH + optional RANGE)",
+            key_schema.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Per-GSI structural rules. Same grammar as base-table validation, but
+/// reported with the GSI-name context so the operator can correlate.
+/// Full enforcement (cross-referencing GSI key attrs against
+/// AttributeDefinitions) lives in `validate_key_schema_and_attrs` which
+/// already walks the GSI key entries.
+fn validate_gsi_structures(
+    table_name: &str,
+    req: &CreateTableRequest,
+) -> Result<(), DdlError> {
+    let Some(gsis) = req.global_secondary_indexes.as_ref() else {
+        return Ok(());
+    };
+    let mut seen_names: HashSet<&str> = HashSet::new();
+    for gsi in gsis {
+        validate_gsi_index_name(table_name, &gsi.index_name)?;
+        if !seen_names.insert(gsi.index_name.as_str()) {
+            return Err(DdlError::Validation(format!(
+                "table `{table_name}`: GlobalSecondaryIndexes has duplicate \
+                 IndexName `{}`",
+                gsi.index_name
+            )));
+        }
+        validate_gsi_key_schema(table_name, gsi)?;
+    }
+    Ok(())
+}
+
+fn validate_gsi_index_name(table_name: &str, name: &str) -> Result<(), DdlError> {
+    if name.len() < 3 || name.len() > 255 {
+        return Err(DdlError::Validation(format!(
+            "table `{table_name}`: GSI IndexName `{name}` must be between \
+             3 and 255 characters"
+        )));
+    }
+    if !name.chars().all(is_valid_table_name_char) {
+        return Err(DdlError::Validation(format!(
+            "table `{table_name}`: GSI IndexName `{name}` contains \
+             characters outside [a-zA-Z0-9_.-]"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_gsi_key_schema(
+    table_name: &str,
+    gsi: &GlobalSecondaryIndex,
+) -> Result<(), DdlError> {
+    if gsi.key_schema.is_empty() {
+        return Err(DdlError::Validation(format!(
+            "table `{table_name}`: GSI `{}`: KeySchema must contain at least one \
+             entry (HASH required)",
+            gsi.index_name
+        )));
+    }
+    if gsi.key_schema.len() > MAX_KEY_SCHEMA_LEN {
+        return Err(DdlError::Validation(format!(
+            "table `{table_name}`: GSI `{}`: KeySchema has {} entries; the \
+             maximum is {MAX_KEY_SCHEMA_LEN} (HASH + optional RANGE)",
+            gsi.index_name,
+            gsi.key_schema.len()
+        )));
+    }
+    let mut saw_hash = false;
+    let mut saw_range = false;
+    for kse in &gsi.key_schema {
+        match kse.key_type.as_str() {
+            "HASH" => {
+                if saw_hash {
+                    return Err(DdlError::Validation(format!(
+                        "table `{table_name}`: GSI `{}`: KeySchema has more than \
+                         one HASH entry",
+                        gsi.index_name
+                    )));
+                }
+                saw_hash = true;
+            }
+            "RANGE" => {
+                if saw_range {
+                    return Err(DdlError::Validation(format!(
+                        "table `{table_name}`: GSI `{}`: KeySchema has more than \
+                         one RANGE entry",
+                        gsi.index_name
+                    )));
+                }
+                saw_range = true;
+            }
+            other => {
+                return Err(DdlError::Validation(format!(
+                    "table `{table_name}`: GSI `{}`: KeySchema KeyType must be \
+                     HASH or RANGE (got `{other}`)",
+                    gsi.index_name
+                )));
+            }
+        }
+    }
+    if !saw_hash {
+        return Err(DdlError::Validation(format!(
+            "table `{table_name}`: GSI `{}`: KeySchema must contain exactly one \
+             HASH entry",
+            gsi.index_name
+        )));
     }
     Ok(())
 }
@@ -283,6 +516,18 @@ fn validate_billing_mode(req: &CreateTableRequest) -> Result<(), DdlError> {
         if bm != "PROVISIONED" && bm != "PAY_PER_REQUEST" {
             return Err(DdlError::Validation(format!(
                 "BillingMode `{bm}` is not one of PROVISIONED | PAY_PER_REQUEST"
+            )));
+        }
+    }
+    // DDB rejects ProvisionedThroughput with RCU<1 or WCU<1. We surface
+    // the same check before stamping the row so the catalog can't carry
+    // a half-formed throughput config.
+    if let Some(pt) = req.provisioned_throughput.as_ref() {
+        if pt.read_capacity_units < 1 || pt.write_capacity_units < 1 {
+            return Err(DdlError::Validation(format!(
+                "ProvisionedThroughput.ReadCapacityUnits and \
+                 .WriteCapacityUnits must be >= 1 (got {} / {})",
+                pt.read_capacity_units, pt.write_capacity_units
             )));
         }
     }
@@ -523,5 +768,307 @@ mod tests {
         r.billing_mode = Some("WEIRD".into());
         let err = validate_create_table(&r).unwrap_err();
         assert!(matches!(err, DdlError::Validation(m) if m.contains("PAY_PER_REQUEST")));
+    }
+
+    // ===== D9 polish ========================================================
+
+    /// D9: empty AttributeDefinitions gets a precise up-front rejection
+    /// rather than the noisier downstream "KeySchema references
+    /// attribute X" cascade.
+    #[test]
+    fn rejects_empty_attribute_definitions() {
+        let mut r = req("Orders");
+        r.attribute_definitions.clear();
+        let err = validate_create_table(&r).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(
+                    m.contains("AttributeDefinitions") && m.contains("at least one"),
+                    "got: {m}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// D9: empty KeySchema rejected with a specific HASH-required hint
+    /// (used to surface as "must contain exactly one HASH" from the
+    /// downstream walk).
+    #[test]
+    fn rejects_empty_key_schema() {
+        let mut r = req("Orders");
+        r.key_schema.clear();
+        let err = validate_create_table(&r).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(m.contains("KeySchema") && m.contains("HASH"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// D9: KeySchema with >2 entries rejected with the precise
+    /// "HASH + optional RANGE" cardinality message.
+    #[test]
+    fn rejects_oversized_key_schema() {
+        let mut r = req("Orders");
+        r.key_schema.push(KeySchemaElement {
+            attribute_name: "x".into(),
+            key_type: "RANGE".into(),
+        });
+        r.key_schema.push(KeySchemaElement {
+            attribute_name: "y".into(),
+            key_type: "RANGE".into(),
+        });
+        let err = validate_create_table(&r).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(
+                    m.contains("3 entries") || m.contains("entries"),
+                    "got: {m}"
+                );
+                assert!(m.contains("maximum is 2"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// D9: attribute names >255 bytes rejected. Previously this slipped
+    /// past validation and surfaced as a PG bind error downstream.
+    #[test]
+    fn rejects_long_attribute_name() {
+        let mut r = req("Orders");
+        let long = "x".repeat(256);
+        r.attribute_definitions[0].attribute_name = long.clone();
+        r.key_schema[0].attribute_name = long;
+        let err = validate_create_table(&r).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(m.contains("attribute name"), "got: {m}");
+                assert!(m.contains("255"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// D9: zero-byte attribute names rejected (DDB minimum is 1 byte).
+    #[test]
+    fn rejects_empty_attribute_name() {
+        let mut r = req("Orders");
+        r.attribute_definitions[0].attribute_name = String::new();
+        r.key_schema[0].attribute_name = String::new();
+        let err = validate_create_table(&r).unwrap_err();
+        assert!(matches!(err, DdlError::Validation(_)));
+    }
+
+    /// D9: GSI IndexName follows the same grammar as TableName
+    /// (3..=255, [a-zA-Z0-9_.-]).
+    #[test]
+    fn rejects_short_gsi_index_name() {
+        let mut r = req("Orders");
+        r.attribute_definitions.push(AttributeDefinition {
+            attribute_name: "tier".into(),
+            attribute_type: "S".into(),
+        });
+        r.global_secondary_indexes = Some(vec![GlobalSecondaryIndex {
+            index_name: "xy".into(), // too short
+            key_schema: vec![KeySchemaElement {
+                attribute_name: "tier".into(),
+                key_type: "HASH".into(),
+            }],
+            projection: Projection {
+                projection_type: Some("ALL".into()),
+                non_key_attributes: None,
+            },
+            provisioned_throughput: None,
+            on_demand_throughput: None,
+        }]);
+        let err = validate_create_table(&r).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(m.contains("GSI IndexName") && m.contains("3 and 255"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_gsi_index_name_with_bad_chars() {
+        let mut r = req("Orders");
+        r.attribute_definitions.push(AttributeDefinition {
+            attribute_name: "tier".into(),
+            attribute_type: "S".into(),
+        });
+        r.global_secondary_indexes = Some(vec![GlobalSecondaryIndex {
+            index_name: "by tier".into(), // space disallowed
+            key_schema: vec![KeySchemaElement {
+                attribute_name: "tier".into(),
+                key_type: "HASH".into(),
+            }],
+            projection: Projection {
+                projection_type: Some("ALL".into()),
+                non_key_attributes: None,
+            },
+            provisioned_throughput: None,
+            on_demand_throughput: None,
+        }]);
+        let err = validate_create_table(&r).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(m.contains("GSI IndexName"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// D9: duplicate GSI IndexName rejected — within a single
+    /// CreateTable, every index has to be uniquely named.
+    #[test]
+    fn rejects_duplicate_gsi_index_name() {
+        let mut r = req("Orders");
+        r.attribute_definitions.push(AttributeDefinition {
+            attribute_name: "tier".into(),
+            attribute_type: "S".into(),
+        });
+        let gsi = GlobalSecondaryIndex {
+            index_name: "by_tier".into(),
+            key_schema: vec![KeySchemaElement {
+                attribute_name: "tier".into(),
+                key_type: "HASH".into(),
+            }],
+            projection: Projection {
+                projection_type: Some("ALL".into()),
+                non_key_attributes: None,
+            },
+            provisioned_throughput: None,
+            on_demand_throughput: None,
+        };
+        r.global_secondary_indexes = Some(vec![gsi.clone(), gsi]);
+        let err = validate_create_table(&r).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(m.contains("duplicate IndexName"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// D9: GSI KeySchema without HASH rejected with a per-index message.
+    #[test]
+    fn rejects_gsi_without_hash() {
+        let mut r = req("Orders");
+        r.attribute_definitions.push(AttributeDefinition {
+            attribute_name: "tier".into(),
+            attribute_type: "S".into(),
+        });
+        r.global_secondary_indexes = Some(vec![GlobalSecondaryIndex {
+            index_name: "by_tier".into(),
+            key_schema: vec![KeySchemaElement {
+                attribute_name: "tier".into(),
+                key_type: "RANGE".into(), // RANGE only — no HASH
+            }],
+            projection: Projection {
+                projection_type: Some("ALL".into()),
+                non_key_attributes: None,
+            },
+            provisioned_throughput: None,
+            on_demand_throughput: None,
+        }]);
+        let err = validate_create_table(&r).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(
+                    m.contains("GSI `by_tier`") && m.contains("HASH"),
+                    "got: {m}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// D9: ProvisionedThroughput RCU/WCU < 1 rejected on CreateTable.
+    #[test]
+    fn rejects_zero_provisioned_throughput() {
+        let mut r = req("Orders");
+        r.provisioned_throughput = Some(rekt_protocol::ProvisionedThroughput {
+            read_capacity_units: 0,
+            write_capacity_units: 5,
+        });
+        let err = validate_create_table(&r).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(m.contains("ProvisionedThroughput"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// D9: UpdateTable: GlobalSecondaryIndexUpdates entry with zero of
+    /// Create/Update/Delete set is malformed.
+    #[test]
+    fn rejects_malformed_gsi_update_entry_none_set() {
+        let req = UpdateTableRequest {
+            table_name: "Orders".into(),
+            global_secondary_index_updates: Some(vec![
+                rekt_protocol::GlobalSecondaryIndexUpdate::default(),
+            ]),
+            ..Default::default()
+        };
+        let err = validate_update_table_body(&req).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(m.contains("exactly one"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// D9: UpdateTable: GlobalSecondaryIndexUpdates entry with multiple
+    /// of Create/Update/Delete set is malformed.
+    #[test]
+    fn rejects_malformed_gsi_update_entry_multiple_set() {
+        let req = UpdateTableRequest {
+            table_name: "Orders".into(),
+            global_secondary_index_updates: Some(vec![
+                rekt_protocol::GlobalSecondaryIndexUpdate {
+                    create: Some(GlobalSecondaryIndex {
+                        index_name: "x".into(),
+                        ..Default::default()
+                    }),
+                    delete: Some(rekt_protocol::DeleteGlobalSecondaryIndexAction {
+                        index_name: "x".into(),
+                    }),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        let err = validate_update_table_body(&req).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(m.contains("exactly one"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// D9: UpdateTable ProvisionedThroughput < 1 rejected.
+    #[test]
+    fn update_table_rejects_zero_provisioned_throughput() {
+        let req = UpdateTableRequest {
+            table_name: "Orders".into(),
+            provisioned_throughput: Some(rekt_protocol::ProvisionedThroughput {
+                read_capacity_units: 5,
+                write_capacity_units: 0,
+            }),
+            ..Default::default()
+        };
+        let err = validate_update_table_body(&req).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(m.contains("ProvisionedThroughput"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
     }
 }
