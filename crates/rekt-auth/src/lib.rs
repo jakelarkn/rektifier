@@ -13,12 +13,17 @@
 
 use std::sync::OnceLock;
 
+pub mod api_token;
 pub mod crypto;
 pub mod jwt;
 pub mod master_key;
 pub mod permissive;
 pub mod sigv4;
 
+pub use api_token::{
+    ensure_api_tokens_table, insert_token_hash, mint as mint_api_token, ApiTokenVerifier,
+    TokenCache, TokenKind,
+};
 pub use jwt::{JwksCache, JwtIssuerConfig, JwtVerifier, PrincipalFormat};
 pub use master_key::{MasterKeyError, MasterKeySource};
 pub use permissive::PermissiveVerifier;
