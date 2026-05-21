@@ -479,9 +479,11 @@ reading absolute latencies.
 | PutGenGsi | 1,973 | 7.81 ms | 10,556 | 1.47 ms | 5.4× |
 | PutDwGsi | 1,905 | 8.02 ms | 10,413 | 1.47 ms | 5.5× |
 | PutMultiDwGsi (3 GSIs) | 1,891 | 7.96 ms | 10,131 | 1.51 ms | 5.3× |
-| QueryLsi | 2,080 | 7.36 ms | 11,908 | 1.27 ms | 5.8× |
-| QueryGenGsi | 251 | 62.40 ms | 895 | 17.26 ms | 3.6× |
+| QueryLsi | 2,253 | 6.87 ms | 11,908 | 1.27 ms | 5.4× |
+| QueryGenGsi | 1,748 | 8.89 ms | 895 | 17.26 ms | **0.51×** ✓ |
+| QueryDwGsi | 1,669 | 9.22 ms | 881 | 17.47 ms | **0.53×** ✓ |
 
+✓ extenddb wins on GSI Query throughput — see [Index workloads](#index-workloads).
 
 (`extenddb p50` ratios are extenddb / rektifier — higher means
 extenddb is slower.)
@@ -507,6 +509,26 @@ are async-eligible." That's a routing fix on extenddb's side,
 not an architectural difference: GSI work is queued via
 `gsi_queue` on extenddb (so per-GSI cost is ~zero, as expected)
 but the request still pays a transactional envelope.
+
+**Indexed Query on a GSI is ~2× faster on extenddb.** This is the
+only workload class in the comparison where extenddb wins on
+absolute throughput, and it's exactly the architectural
+prediction: rektifier's GSI is a btree on the base table, so a
+50-row GSI Query does 50 base-table heap fetches; extenddb's GSI
+is a separate `_ddb_<idx_uuid>` table with the projected items
+already there, so the same Query is one sequential scan of 50
+rows. extenddb Query-on-GSI ran at ~1,700 ops/sec / ~9 ms p50;
+rektifier at ~890 ops/sec / ~17 ms p50. CT-time vs UpdateTable
+GSI is indistinguishable on read for both stacks. Wider results
+(100s–1000s of rows per Query) should make the gap larger — the
+rektifier cost scales with N (heap fetches) while extenddb stays
+flat (sequential scan). A partition-size sweep is future work.
+
+LSI Query stays in the same 5.4× band as every other extenddb
+bounded read; the LSI advantage doesn't apply because rektifier's
+LSI hits a composite-PK-like btree on the base table without the
+random-fetch penalty.
+
 
 ### Where the gap comes from
 
