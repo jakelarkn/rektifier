@@ -39,11 +39,11 @@ DDB SDK or CLI can talk, unmodified, to data living in Postgres.
 | `BatchWriteItem`     | Implemented                                      |
 | `TransactGetItems`   | Implemented                                      |
 | `TransactWriteItems` | Implemented (Put / Delete / Update / Condition)  |
-| `CreateTable`        | Implemented (GSI/LSI deferred — PLAN-9)          |
+| `CreateTable`        | Implemented (LSIs + GSIs at create time)         |
 | `DeleteTable`        | Implemented                                      |
 | `DescribeTable`      | Implemented                                      |
 | `ListTables`         | Implemented                                      |
-| `UpdateTable`        | Implemented (metadata fields; GSI ops PLAN-9)    |
+| `UpdateTable`        | Implemented (metadata + GSI Create/Delete, online) |
 | Streams              | Deferred                                         |
 | Backups / TTL / Tags | Deferred                                         |
 
@@ -147,9 +147,12 @@ shipping a wider feature set: built-in IAM, mandatory SigV4 + TLS,
 daemon lifecycle, management console, and Streams/TTL/Import-Export.
 Keys are extracted by the engine into typed columns; GSIs are
 separate PG tables with optional async maintenance. Rektifier extracts
-keys via `GENERATED ALWAYS AS` and runs roughly 3–5× lower per-request
-latency on the same PG 17 host, with the largest gaps on ALL_OLD
-returns and single-statement UpdateItem paths. Full breakdown:
+keys via `GENERATED ALWAYS AS` (for CreateTable-time GSIs/LSIs) or via
+a dual-write SQL path + async chunked backfill + `CREATE INDEX
+CONCURRENTLY` (for GSIs added later via `UpdateTable`) — both online.
+Per-request latency runs roughly 3–5× lower than ExtendDB on the same
+PG 17 host, with the largest gaps on ALL_OLD returns and single-
+statement UpdateItem paths. Full breakdown:
 [`docs/COMPARISON_VS_EXTENDDB.md`](./docs/COMPARISON_VS_EXTENDDB.md).
 
 ## Testing

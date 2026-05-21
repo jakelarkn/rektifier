@@ -86,7 +86,7 @@ they take divergent paths.
 | FilterExpression | yes | yes |
 | ProjectionExpression | yes | yes |
 | UpdateExpression (SET, REMOVE, ADD, DELETE) | yes | yes (Phase 3a/3b/4c/4d/4e/5) |
-| GSI / LSI | yes (separate PG tables, sync or async) | partial (per PLAN) |
+| GSI / LSI | yes (separate PG tables, sync or async) | yes (LSI at create time; GSI at create time or online via UpdateTable) |
 | Streams | yes (ListStreams, GetRecords, GetShardIterator) | planned (PLAN-X) |
 | TTL | yes (background sweeper) | planned |
 | Import / Export | yes (S3-shaped wire API; local-FS implementation) | no |
@@ -172,10 +172,14 @@ One Postgres table per declared DDB table, named by the operator
 ```sql
 CREATE TABLE users (
     item JSONB NOT NULL,
-    -- generated columns derived from item:
+    -- generated columns derived from item (PK/SK + LSI sort cols +
+    -- CreateTable-time GSI cols):
     pk    text    GENERATED ALWAYS AS (item->>'id')               STORED,
     sk_n  numeric GENERATED ALWAYS AS ((item->>'ts')::numeric)    STORED,  -- if N sort key
-    gsi1_pk text  GENERATED ALWAYS AS (item->>'email')            STORED,  -- per-GSI
+    gsi1_pk text  GENERATED ALWAYS AS (item->>'email')            STORED,  -- per-CT-time GSI
+    -- GSIs added later via UpdateTable are regular columns,
+    -- populated by dual-write SQL on every INSERT/UPDATE:
+    gsi_late_pk text NULL,  -- per-UpdateTable-time GSI
     PRIMARY KEY (pk[, sk_*])
 );
 ```
@@ -245,11 +249,11 @@ the row's data and key columns disagree and PG cannot detect it.
 
 #### What this trades
 
-| | extenddb (engine-extracts) | rektifier (PG-derives) |
+| | extenddb (engine-extracts) | rektifier (PG-derives at CT; SQL-derives at UpdateTable) |
 |---|---|---|
-| Invariant enforcement | engine code (testable, not load-bearing in PG) | PG schema (load-bearing, free) |
-| Adding a GSI on a large table | `CREATE TABLE _ddb_<idx_uuid>` + backfill | `ALTER TABLE ADD COLUMN ... GENERATED ALWAYS AS` — full table rewrite |
-| Schemaless attribute that's also a key | OK — engine converts whatever's there | hard fail at write time — generated-column cast errors out |
+| Invariant enforcement | engine code (testable, not load-bearing in PG) | PG schema for CT-time GSIs/LSIs/PK-SK; same INSERT statement for UpdateTable-time GSIs |
+| Adding a GSI on a large table | `CREATE TABLE _ddb_<idx_uuid>` + backfill | `ALTER TABLE ADD COLUMN x text NULL` (catalog-only) + async chunked backfill + `CREATE INDEX CONCURRENTLY` — online |
+| Schemaless attribute that's also a key | OK — engine converts whatever's there | sparse — items missing the attribute leave the column NULL; cast errors only when the attribute is present with the wrong DDB type |
 | Renaming a table | catalog row update, O(1) | requires rewriting the PG table name |
 | Multi-tenancy on shared PG | free — each account's tables live under unique UUIDs | name collisions in shared catalog |
 | Per-row physical size | larger (typed-col triplets, base_pk on indexes) | smaller (one JSONB + generated leaves) |
@@ -264,13 +268,25 @@ density.
 Both stacks treat GSIs as projections of the base table, but they
 materialize the projection differently.
 
-**Rektifier**: a GSI is one or more `GENERATED ALWAYS AS` columns
-plus a Postgres `CREATE INDEX` on the base table. The GSI key
-materializes into a btree page set; reading via the GSI is a btree
-index scan followed by a heap fetch into the base row for any
-non-key attribute. KEYS_ONLY and INCLUDE projections don't materially
-help — the read still goes through the base heap unless PG's
-index-only-scan kicks in via the visibility map.
+**Rektifier**: a GSI is one or more PG columns on the base table
+plus a `CREATE INDEX` on those columns. Two modes, selected by origin:
+
+- *CreateTable-time GSIs* use `GENERATED ALWAYS AS … STORED` columns
+  (PG owns the JSONB→column invariant). Synchronous; ACTIVE before
+  CreateTable returns.
+- *UpdateTable.Create GSIs* use regular nullable columns populated
+  by a dual-write SQL fragment (`($1::jsonb #>> '{attr,T}')`) inside
+  the same INSERT/UPDATE that writes JSONB — equivalent semantics to
+  GENERATED, but living in the statement rather than the column
+  definition so `ADD COLUMN` stays catalog-only. Async lifecycle:
+  chunked backfill on existing rows + `CREATE INDEX CONCURRENTLY` →
+  ACTIVE; pre-ACTIVE Query returns RNF (matches DDB).
+
+Reading via either mode is identical: a btree index scan followed by
+a heap fetch into the base row for any non-key attribute. KEYS_ONLY
+and INCLUDE projections don't materially help — the read still goes
+through the base heap unless PG's index-only-scan kicks in via the
+visibility map.
 
 **ExtendDB**: a GSI is a **separate PG table**, `_ddb_<index_uuid>`,
 with the GSI keys as its primary identifier, the base table's keys
@@ -300,20 +316,24 @@ contract**, not by table shape:
   eventually consistent" semantics and lets the base write commit
   fast.
 
-Rektifier's GSI maintenance is implicit (PG btree update on every
-write); there is no equivalent of the GSI queue knob.
+Rektifier's per-write GSI maintenance is implicit (PG btree update +
+either the GENERATED expression or the dual-write SQL fragment runs
+in the same statement as the JSONB write). The async piece exists
+only at GSI *creation* on a populated table — chunked backfill of
+the new column, then `CREATE INDEX CONCURRENTLY`. There is no
+steady-state queue.
 
 #### Trade summary for GSI
 
 | | extenddb | rektifier |
 |---|---|---|
 | Storage per GSI (ALL projection) | full base item, duplicated | btree leaves only, heap shared |
-| Add a GSI on N-row table | `CREATE TABLE` + backfill (online) | `ALTER TABLE ADD COLUMN ... STORED` (table rewrite, blocking) |
+| Add a GSI on N-row table | `CREATE TABLE` + backfill (online) | `ALTER TABLE ADD COLUMN x text NULL` (catalog-only) + async chunked backfill + `CREATE INDEX CONCURRENTLY` (online) |
 | Write amplification (3 GSIs sync) | 1 base + 3 (delete+insert) = up to 7 statements | 1 statement, 3 btree updates inline |
-| Write amplification (3 GSIs async) | 1 base + 1 queue insert | not available |
+| Write amplification (3 GSIs async) | 1 base + 1 queue insert | n/a — rektifier has no steady-state async path (only the one-shot backfill at GSI creation) |
 | Read on GSI w/ ALL projection | index scan → JSONB at index | index scan → btree → base heap fetch |
 | Strong-consistency GSI read | depends on sync mode | always (same MVCC snapshot) |
-| Sparse index support | yes (engine no-ops when keys missing) | requires `WHERE` clause on the generated index |
+| Sparse index support | yes (engine no-ops when keys missing) | yes — sparse semantics fall out of nullable columns + the `data#>>` extraction returning NULL when the attribute is absent |
 
 The architectural cost is real on extenddb's side: writes that touch
 many GSIs do meaningfully more work. The benefit is also real:
