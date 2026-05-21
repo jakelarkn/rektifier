@@ -17,9 +17,11 @@
 //! the persisted phase on boot.
 
 pub mod backfill;
+pub mod index;
 pub mod state;
 
 pub use backfill::{run_backfill, BackfillConfig};
+pub use index::{run_index_creation, IndexConfig};
 pub use state::{
     create_gsi_state_table, fetch_state, fetch_states_by_phase, insert_state_row, update_phase,
     GsiPhase, GsiState, OrchestratorError,
@@ -138,4 +140,73 @@ fn key_type_sql(t: rekt_storage::KeyType) -> &'static str {
         rekt_storage::KeyType::N => "numeric",
         rekt_storage::KeyType::B => "bytea",
     }
+}
+
+/// PLAN-9 G5+G6 coordinator. Runs the full DualWrite lifecycle from
+/// the current state-row phase to `active`:
+/// - From `backfilling`: backfill chunks → indexing → CONCURRENTLY → active.
+/// - From `indexing`: skip backfill; CONCURRENTLY → active.
+///
+/// Any failure marks the state row `failed` with the error message
+/// preserved in the row's `error` column. Caller drives retries
+/// (operator-driven via CLI for now; rebuild support lands in G8).
+pub async fn run_lifecycle_to_active(pool: Pool, gsi_id: String) {
+    let backfill_cfg = backfill::BackfillConfig::default();
+    let index_cfg = index::IndexConfig::default();
+    if let Err(e) = backfill::run_backfill(&pool, &gsi_id, backfill_cfg).await {
+        tracing::error!(gsi_id = %gsi_id, error = %e, "GSI backfill failed");
+        // Mark as failed; ignore secondary error if we can't even write.
+        if let Ok(client) = pool.get().await {
+            let _ = state::update_phase(
+                &client,
+                &gsi_id,
+                state::GsiPhase::Failed,
+                Some(format!("backfill: {e}")),
+            )
+            .await;
+        }
+        return;
+    }
+    if let Err(e) = index::run_index_creation(&pool, &gsi_id, index_cfg).await {
+        tracing::error!(gsi_id = %gsi_id, error = %e, "GSI index build failed");
+        // `run_index_creation` already marks the state row `failed`
+        // before returning; nothing more to do here.
+    }
+}
+
+/// Spawn the lifecycle coordinator as a background tokio task. Returns
+/// immediately; the lifecycle runs to completion (or failure) without
+/// blocking the caller. Used by:
+/// - UpdateTable.Create handler (post-commit, to drive the just-created
+///   DualWrite GSI to ACTIVE without making the SDK client wait).
+/// - Boot-time resume (one spawn per non-terminal state row).
+pub fn spawn_lifecycle_to_active(pool: Pool, gsi_id: String) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_lifecycle_to_active(pool, gsi_id))
+}
+
+/// PLAN-9 G5+G6 boot-time recovery. Scan `_rektifier_gsi_state` for
+/// any row in a non-terminal phase and spawn a lifecycle coordinator
+/// per row. Called once at server startup; subsequent spawns happen
+/// per UpdateTable.Create.
+pub async fn boot_resume_in_flight(pool: &Pool) -> Result<Vec<tokio::task::JoinHandle<()>>, OrchestratorError> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| OrchestratorError::Pool(format!("pool get: {e}")))?;
+    let rows = state::fetch_states_by_phase(
+        &client,
+        &[
+            state::GsiPhase::Declared,
+            state::GsiPhase::AddingColumn,
+            state::GsiPhase::Backfilling,
+            state::GsiPhase::Indexing,
+        ],
+    )
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for st in rows {
+        tracing::info!(gsi_id = %st.gsi_id, phase = st.phase.as_str(), "resuming in-flight GSI lifecycle");
+        out.push(spawn_lifecycle_to_active(pool.clone(), st.gsi_id));
+    }
+    Ok(out)
 }

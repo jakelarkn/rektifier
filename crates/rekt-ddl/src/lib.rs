@@ -567,6 +567,17 @@ impl DdlBackend for PgDdlBackend {
             "UpdateTable: applied"
         );
 
+        // PLAN-9 G5+G6: spawn the lifecycle coordinator for every new
+        // DualWrite GSI. The coordinator runs the backfill + CREATE
+        // INDEX CONCURRENTLY in the background; the client sees the
+        // UpdateTable response (with IndexStatus=CREATING via the
+        // catalog) immediately. SDK waiters poll DescribeTable until
+        // IndexStatus=ACTIVE, matching DDB.
+        for gsi in &new_gsi_specs {
+            let gsi_id = rekt_gsi::state::gsi_id(&req.table_name, &gsi.name);
+            rekt_gsi::spawn_lifecycle_to_active(self.pool.clone(), gsi_id);
+        }
+
         if self.invalidate_on_local_ddl {
             self.reconciler.reconcile_now().await?;
         }

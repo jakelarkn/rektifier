@@ -64,6 +64,14 @@ async fn main() -> Result<()> {
         .await
         .context("ensuring _rektifier_gsi_state exists")?;
 
+    // PLAN-9 G5+G6: any DualWrite GSI in a non-terminal phase resumes
+    // here. The lifecycle coordinator picks up from the persisted
+    // `last_pk_copied` (backfilling) or from the recorded `indexing`
+    // phase and drives the GSI to ACTIVE.
+    let _ = rekt_gsi::boot_resume_in_flight(&pool)
+        .await
+        .context("resuming in-flight GSI lifecycles")?;
+
     let catalog = Arc::new(TableCatalog::empty());
     let reconciler = Arc::new(Reconciler::new(
         pool.clone(),
