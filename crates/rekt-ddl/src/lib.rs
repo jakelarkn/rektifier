@@ -455,6 +455,27 @@ impl DdlBackend for PgDdlBackend {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        // PLAN-9 G9. Collect GSI Delete entries; per-mode dispatch in
+        // the tx body resolves them against the catalog's existing
+        // GsiSpec list.
+        let gsi_deletes: Vec<String> = req
+            .global_secondary_index_updates
+            .as_deref()
+            .map(|us| {
+                us.iter()
+                    .filter_map(|u| u.delete.as_ref().map(|d| d.index_name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Reject Delete of an unknown GSI before opening the tx.
+        for name in &gsi_deletes {
+            if !entry.gsis.contains_key(name) {
+                return Err(DdlError::ResourceNotFound(format!(
+                    "GSI not found on table `{}`: {name}",
+                    req.table_name
+                )));
+            }
+        }
         let mut new_gsi_specs: Vec<rekt_catalog::GsiSpec> = Vec::new();
         if !gsi_creates.is_empty() {
             let existing: std::collections::HashSet<&str> =
@@ -526,18 +547,93 @@ impl DdlBackend for PgDdlBackend {
         )
         .await?;
 
-        // PLAN-9 G2b. Persist new DualWrite GsiSpecs into
-        // `_rektifier_tables.gsi_specs` and run the orchestrator's
-        // synchronous transitions (insert state row + ALTER TABLE ADD
-        // COLUMN + phase → backfilling). All four side effects land in
-        // this single tx, so a mid-flow failure rolls back atomically.
-        if !new_gsi_specs.is_empty() {
-            let mut merged: Vec<rekt_catalog::GsiSpec> =
-                entry.gsis.values().cloned().collect();
+        // PLAN-9 G9. Handle GSI Deletes per recorded mode.
+        // - Generated: DROP INDEX + DROP COLUMN inside this tx; remove
+        //   the entry from gsi_specs. Atomic.
+        // - DualWrite: transition state row to `removing_index` +
+        //   flip catalog spec serveable=false. The async removal
+        //   worker takes over after commit (DROP INDEX CONCURRENTLY +
+        //   DROP COLUMN + archive state row).
+        let mut spawn_dual_write_removal: Vec<String> = Vec::new();
+        for gsi_name in &gsi_deletes {
+            let gsi_spec = entry.gsis.get(gsi_name).cloned().ok_or_else(|| {
+                DdlError::Internal(format!(
+                    "GSI `{gsi_name}` vanished from catalog between pre-check and tx"
+                ))
+            })?;
+            match gsi_spec.mode {
+                rekt_catalog::GsiMode::Generated => {
+                    // D9 refcount: collect siblings (all OTHER GSIs)
+                    // and LSI sort columns.
+                    let siblings: Vec<rekt_catalog::GsiSpec> = entry
+                        .gsis
+                        .values()
+                        .filter(|g| g.name != *gsi_name)
+                        .cloned()
+                        .collect();
+                    let lsi_cols: Vec<&str> = entry
+                        .lsis
+                        .iter()
+                        .map(|l| l.sort_pg_col.as_str())
+                        .collect();
+                    rekt_gsi::drop_generated_gsi_in_tx(
+                        &tx,
+                        &entry.schema.pg_table,
+                        &gsi_spec,
+                        &siblings,
+                        &entry.schema.pk_attr,
+                        entry.schema.sk_attr.as_deref(),
+                        &lsi_cols,
+                    )
+                    .await
+                    .map_err(|e| {
+                        DdlError::Internal(format!("GSI drop (Generated): {e}"))
+                    })?;
+                }
+                rekt_catalog::GsiMode::DualWrite => {
+                    let gsi_id = rekt_gsi::state::gsi_id(&req.table_name, gsi_name);
+                    rekt_gsi::start_dual_write_removal(&tx, &gsi_id)
+                        .await
+                        .map_err(|e| {
+                            DdlError::Internal(format!("GSI drop (DualWrite): {e}"))
+                        })?;
+                    spawn_dual_write_removal.push(gsi_id);
+                }
+            }
+        }
+
+        // Compose the final gsi_specs jsonb: existing minus deletes +
+        // any newly-added DualWrite specs (G2b).
+        let needs_spec_update =
+            !gsi_deletes.is_empty() || !new_gsi_specs.is_empty();
+        if needs_spec_update {
+            let mut merged: Vec<rekt_catalog::GsiSpec> = entry
+                .gsis
+                .values()
+                .filter(|g| {
+                    // Generated-mode deletes are removed from the
+                    // spec immediately. DualWrite-mode deletes flip
+                    // serveable=false here; the worker removes the
+                    // entry when it reaches Gone.
+                    if gsi_deletes.contains(&g.name)
+                        && matches!(g.mode, rekt_catalog::GsiMode::Generated)
+                    {
+                        return false;
+                    }
+                    true
+                })
+                .cloned()
+                .map(|mut g| {
+                    if gsi_deletes.contains(&g.name)
+                        && matches!(g.mode, rekt_catalog::GsiMode::DualWrite)
+                    {
+                        g.serveable = false;
+                        g.unserveable_reason = Some("GSI removal in progress".into());
+                    }
+                    g
+                })
+                .collect();
             merged.extend(new_gsi_specs.iter().cloned());
-            // Sort by name for deterministic JSON ordering — round-trips
-            // through CatalogSnapshot would be order-independent anyway,
-            // but stable output is nicer for operators reading the row.
             merged.sort_by(|a, b| a.name.cmp(&b.name));
             let merged_json = rekt_catalog::gsi_specs_to_json(&merged);
             tx.execute(
@@ -545,16 +641,22 @@ impl DdlBackend for PgDdlBackend {
                 &[&req.table_name, &merged_json, &now],
             )
             .await?;
-            for gsi in &new_gsi_specs {
-                rekt_gsi::create_dual_write_gsi_in_tx(
-                    &tx,
-                    &req.table_name,
-                    &entry.schema.pg_table,
-                    gsi,
-                )
-                .await
-                .map_err(|e| DdlError::Internal(format!("GSI orchestrator: {e}")))?;
-            }
+        }
+
+        // PLAN-9 G2b. For each new DualWrite GsiSpec, run the
+        // orchestrator's synchronous transitions (insert state row +
+        // ALTER TABLE ADD COLUMN + phase → backfilling). The catalog
+        // spec write already happened in the needs_spec_update block
+        // above; this loop is only the orchestrator-side work.
+        for gsi in &new_gsi_specs {
+            rekt_gsi::create_dual_write_gsi_in_tx(
+                &tx,
+                &req.table_name,
+                &entry.schema.pg_table,
+                gsi,
+            )
+            .await
+            .map_err(|e| DdlError::Internal(format!("GSI orchestrator: {e}")))?;
         }
 
         tx.commit().await?;
@@ -576,6 +678,13 @@ impl DdlBackend for PgDdlBackend {
         for gsi in &new_gsi_specs {
             let gsi_id = rekt_gsi::state::gsi_id(&req.table_name, &gsi.name);
             rekt_gsi::spawn_lifecycle_to_active(self.pool.clone(), gsi_id);
+        }
+        // PLAN-9 G9: spawn the async removal worker for every
+        // DualWrite GSI Delete. The worker runs DROP INDEX CONCURRENTLY
+        // and the column drop after commit so SDK clients see
+        // IndexStatus=DELETING immediately.
+        for gsi_id in spawn_dual_write_removal {
+            rekt_gsi::spawn_removal_to_gone(self.pool.clone(), gsi_id);
         }
 
         if self.invalidate_on_local_ddl {

@@ -415,20 +415,13 @@ pub fn validate_update_table_body(req: &UpdateTableRequest) -> Result<(), DdlErr
                      Update / Delete must be set (got {set_count})"
                 )));
             }
-            // PLAN-9 G2b: Create is now supported. Update + Delete still
-            // pending (G9 for Delete; provisioned-throughput-on-existing-
-            // GSI updates not in scope until G9-followup).
+            // PLAN-9 G2b + G9: Create + Delete are supported. Update
+            // (provisioned-throughput mutation on existing GSI) is
+            // not in scope.
             if u.update.is_some() {
                 return Err(DdlError::Validation(
                     "GlobalSecondaryIndexUpdates[].Update (provisioned-throughput \
                      mutation on existing GSI) is not yet supported"
-                        .into(),
-                ));
-            }
-            if u.delete.is_some() {
-                return Err(DdlError::Validation(
-                    "GlobalSecondaryIndexUpdates[].Delete is not yet supported \
-                     (PLAN-9 G9 pending; recovery is DeleteTable + CreateTable)"
                         .into(),
                 ));
             }

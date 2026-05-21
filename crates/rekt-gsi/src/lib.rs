@@ -18,11 +18,16 @@
 
 pub mod backfill;
 pub mod index;
+pub mod remove;
 pub mod state;
 pub mod verify;
 
 pub use backfill::{run_backfill, BackfillConfig};
 pub use index::{run_index_creation, IndexConfig};
+pub use remove::{
+    drop_generated_gsi_in_tx, run_removal_to_gone, spawn_removal_to_gone,
+    start_dual_write_removal,
+};
 pub use verify::{run_drift_check, DriftMismatch, DriftReport};
 pub use state::{
     create_gsi_state_table, fetch_state, fetch_states_by_phase, insert_state_row, update_phase,
@@ -202,13 +207,34 @@ pub async fn boot_resume_in_flight(pool: &Pool) -> Result<Vec<tokio::task::JoinH
             state::GsiPhase::AddingColumn,
             state::GsiPhase::Backfilling,
             state::GsiPhase::Indexing,
+            state::GsiPhase::RemovingIndex,
+            state::GsiPhase::RemovingColumn,
         ],
     )
     .await?;
     let mut out = Vec::with_capacity(rows.len());
     for st in rows {
-        tracing::info!(gsi_id = %st.gsi_id, phase = st.phase.as_str(), "resuming in-flight GSI lifecycle");
-        out.push(spawn_lifecycle_to_active(pool.clone(), st.gsi_id));
+        let handle = match st.phase {
+            state::GsiPhase::Declared
+            | state::GsiPhase::AddingColumn
+            | state::GsiPhase::Backfilling
+            | state::GsiPhase::Indexing => {
+                tracing::info!(
+                    gsi_id = %st.gsi_id, phase = st.phase.as_str(),
+                    "resuming in-flight GSI lifecycle (create path)"
+                );
+                spawn_lifecycle_to_active(pool.clone(), st.gsi_id)
+            }
+            state::GsiPhase::RemovingIndex | state::GsiPhase::RemovingColumn => {
+                tracing::info!(
+                    gsi_id = %st.gsi_id, phase = st.phase.as_str(),
+                    "resuming in-flight GSI lifecycle (removal path)"
+                );
+                remove::spawn_removal_to_gone(pool.clone(), st.gsi_id)
+            }
+            _ => continue,
+        };
+        out.push(handle);
     }
     Ok(out)
 }

@@ -974,6 +974,40 @@ impl DdlBackend for MockDdlBackend {
                 );
                 next_entry.gsis.insert(plan.name.clone(), spec);
             }
+            // PLAN-9 G9. Mirror Delete: drop the catalog entry for
+            // Generated mode; for DualWrite, flip serveable=false so
+            // dispatch's gate kicks in. (Mock doesn't actually run
+            // the async DROP INDEX CONCURRENTLY worker.)
+            for u in updates {
+                let Some(del) = u.delete.as_ref() else {
+                    continue;
+                };
+                let name = &del.index_name;
+                let Some(existing) = next_entry.gsis.get(name).cloned() else {
+                    return Err(DdlError::ResourceNotFound(format!(
+                        "GSI not found on table `{}`: {name}",
+                        req.table_name
+                    )));
+                };
+                match existing.mode {
+                    rekt_catalog::GsiMode::Generated => {
+                        next_entry.gsis.remove(name);
+                        next_entry.schema.gsis.remove(name);
+                    }
+                    rekt_catalog::GsiMode::DualWrite => {
+                        if let Some(g) = next_entry.gsis.get_mut(name) {
+                            g.serveable = false;
+                            g.unserveable_reason =
+                                Some("GSI removal in progress".into());
+                        }
+                        if let Some(s) = next_entry.schema.gsis.get_mut(name) {
+                            s.serveable = false;
+                            s.unserveable_reason =
+                                Some("GSI removal in progress".into());
+                        }
+                    }
+                }
+            }
         }
         let mut next = self.catalog.snapshot().entries.clone();
         next.insert(req.table_name.clone(), Arc::new(next_entry));
@@ -8604,9 +8638,10 @@ async fn update_table_accepts_gsi_create() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
-/// PLAN-9 G9 pending — Delete sub-action still rejected at validation.
+/// PLAN-9 G9: Delete of an unknown GSI returns RNF (validation passes
+/// shape; dispatch realizes the named GSI isn't present).
 #[tokio::test]
-async fn update_table_rejects_gsi_delete_until_g9() {
+async fn update_table_delete_unknown_gsi_returns_rnf() {
     let app = app();
     let resp = app
         .oneshot(ddb_request(
@@ -8614,7 +8649,7 @@ async fn update_table_rejects_gsi_delete_until_g9() {
             json!({
                 "TableName":"users",
                 "GlobalSecondaryIndexUpdates":[{
-                    "Delete":{"IndexName":"by_tier"}
+                    "Delete":{"IndexName":"nonexistent_idx"}
                 }]
             }),
         ))
@@ -8625,8 +8660,7 @@ async fn update_table_rejects_gsi_delete_until_g9() {
     assert!(body["__type"]
         .as_str()
         .unwrap()
-        .ends_with("#ValidationException"));
-    assert!(body["message"].as_str().unwrap().contains("Delete"));
+        .ends_with("#ResourceNotFoundException"));
 }
 
 /// PLAN-9 — Update sub-action (provisioned-throughput on existing GSI)

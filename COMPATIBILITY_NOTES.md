@@ -429,35 +429,30 @@ for re-creating the column + index in-place; not in v1 scope.
 
 ## Global Secondary Indexes (GSIs)
 
-Tracked-implemented for the CreateTable-time case (PLAN-9 G1+G2+G7).
-GSIs declared inside `CreateTable.GlobalSecondaryIndexes` land as
-`GENERATED ALWAYS AS ... STORED` columns plus a composite btree, all
-in the same DDL transaction. Online add via `UpdateTable` is deferred.
+Two GSI modes per PLAN-9 D17, selected by request origin:
 
-### GSI lifecycle: only `CreateTable`-time declaration is supported — Strict
+- **Generated mode** (CreateTable.GlobalSecondaryIndexes): synchronous
+  `GENERATED ALWAYS AS ... STORED` column + `CREATE INDEX IF NOT EXISTS`
+  inside the CreateTable DDL transaction. ACTIVE before CreateTable
+  returns.
+- **DualWrite mode** (UpdateTable.GlobalSecondaryIndexUpdates.Create):
+  regular column populated by rektifier's dual-write SQL on every
+  INSERT/UPDATE + chunked backfill on existing rows +
+  `CREATE INDEX CONCURRENTLY` outside any transaction. CREATING →
+  ACTIVE asynchronously; Query against a CREATING GSI returns RNF
+  (matches DDB).
 
-DDB's full GSI surface includes `UpdateTable.GlobalSecondaryIndexUpdates`
-for online add / mutate / delete on populated tables. Rektifier
-currently rejects all three of those subactions with a
-`ValidationException` whose message names PLAN-9 G2/G5/G6/G9 as the
-deferred work. Operators who need an additional GSI after table birth
-must `DeleteTable` + `CreateTable` (same recovery procedure as LSI
-mutation).
+Both modes converge in storage (column + btree) and Query routing.
 
-**Effect:** SDK code that calls `UpdateTable` with
-`GlobalSecondaryIndexUpdates.Create` / `.Update` / `.Delete` fails
-against rektifier where it would succeed against DDB. Migration risk
-for clients that automate runtime GSI mutation.
+### GSI `UpdateTable.GlobalSecondaryIndexUpdates.Update` rejected — Strict
 
-**Design departure from PLAN-9 D1:** PLAN-9's headline choice was
-regular columns + async backfill specifically so online add could
-happen without rewriting the table. Because rektifier is
-pre-production with no populated tables, the CreateTable-only path
-uses `GENERATED STORED` columns instead (same mechanism as LSIs, same
-mechanism as the base PK/SK). When online add becomes a real need,
-the new code path either co-exists with the CreateTable-time path or
-migrates this code to regular columns; PLAN-9 G3+G5+G6 carry that
-work.
+Provisioned-throughput mutation on an existing GSI is not supported;
+rektifier returns `ValidationException`. DDB accepts the sub-action;
+clients depending on it must skip the Update step. Throughput fields
+are accepted at create time and round-trip through DescribeTable, but
+mutating them post-create is not in scope (rektifier has no
+provisioned-throughput cost model — the fields are stored for parity
+only).
 
 ### GSI `Projection` always behaves as `ALL` — Lenient
 
@@ -470,10 +465,11 @@ regardless of declared `Projection`. Round-tripped through
 
 DDB's GSIs are *eventually consistent* even when ACTIVE — a PutItem
 returns before the GSI reflects the write. Rektifier writes the
-JSONB and the GSI's GENERATED columns in the same row, in the same
-PG statement; reads see one MVCC snapshot. Code that depends on
-observing eventual-consistency lag (unusual) won't reproduce it
-against rektifier.
+JSONB and the GSI column in the same row, in the same PG statement
+(Generated mode: GENERATED expression; DualWrite mode: dual-write SQL
+extracting from the same `$1::jsonb` bind); reads see one MVCC
+snapshot. Code that depends on observing eventual-consistency lag
+(unusual) won't reproduce it against rektifier.
 
 ### GSI drift demotes only the GSI, not the base table — Documented divergence
 
