@@ -16,9 +16,10 @@ pub mod validation;
 
 use async_trait::async_trait;
 use deadpool_postgres::Pool;
+use crate::naming::derive_lsi_index_name;
 use rekt_catalog::{
     metadata::{key_type_str, now_ms},
-    CatalogError, Reconciler, TableCatalog, TableEntry, TableStatus,
+    CatalogError, LsiSpec, Reconciler, TableCatalog, TableEntry, TableStatus,
 };
 use rekt_protocol::{
     CreateTableRequest, DeleteTableRequest, TableDescription, UpdateTableRequest,
@@ -109,12 +110,14 @@ INSERT INTO _rektifier_tables (
     table_name, pg_table, jsonb_col, pk_attr, pk_type,
     sk_attr, sk_type, status, serveable,
     creation_date_ms, last_modified_at_ms, last_modified_by,
-    tags, billing_mode, provisioned_rcu, provisioned_wcu
+    tags, billing_mode, provisioned_rcu, provisioned_wcu,
+    lsi_specs
 ) VALUES (
     $1, $2, $3, $4, $5,
     $6, $7, 'CREATING', false,
     $8, $8, 'ddl',
-    $9, $10, $11, $12
+    $9, $10, $11, $12,
+    $13::jsonb
 )
 ";
 
@@ -221,6 +224,11 @@ impl DdlBackend for PgDdlBackend {
         let now = now_ms();
         let pk_type = key_type_str(plan.pk_type);
         let sk_type = plan.sk_type.map(key_type_str);
+        // PLAN-11 L3. Materialize the validator's LsiPlan list into the
+        // catalog's LsiSpec shape (serveable=false until the reconciler
+        // confirms the underlying column + index exist post-DDL).
+        let lsi_specs = build_lsi_specs(&plan, &pg_table);
+        let lsi_specs_json = rekt_catalog::lsi_specs_to_json(&lsi_specs);
         let insert_rows = tx
             .execute(
                 INSERT_CREATING_SQL,
@@ -237,6 +245,7 @@ impl DdlBackend for PgDdlBackend {
                     &plan.billing_mode,
                     &plan.provisioned_rcu,
                     &plan.provisioned_wcu,
+                    &lsi_specs_json,
                 ],
             )
             .await;
@@ -468,11 +477,36 @@ impl DdlBackend for PgDdlBackend {
     }
 }
 
+/// PLAN-11 L3. Materialize the validator's typed `LsiPlan` list into the
+/// catalog's persistence-friendly `LsiSpec` shape. `serveable` defaults
+/// to true because the in-line CREATE TABLE/CREATE INDEX block emits
+/// the column + index atomically (DDL succeeds → both exist), and the
+/// reconciler will demote per-LSI on any subsequent drift.
+pub fn build_lsi_specs(plan: &CreateTablePlan, pg_table: &str) -> Vec<LsiSpec> {
+    plan.lsis
+        .iter()
+        .map(|l| LsiSpec {
+            name: l.name.clone(),
+            sort_attr: l.sort_attr.clone(),
+            sort_type: l.sort_type,
+            // Matches the create.rs convention: column name = raw sort
+            // attribute name.
+            sort_pg_col: l.sort_attr.clone(),
+            index_name: derive_lsi_index_name(pg_table, &l.name),
+            projection_type: l.projection_type.clone(),
+            projection_non_key_attrs: l.projection_non_key_attrs.clone(),
+            serveable: true,
+            unserveable_reason: None,
+        })
+        .collect()
+}
+
 /// Helper exposed for in-memory `DdlBackend` implementations (and tests).
 /// Builds a freshly-`ACTIVE` `TableEntry` for the given plan so the
 /// dispatch test fixture can mutate its catalog without touching PG.
 pub fn entry_for_new_table(plan: &CreateTablePlan) -> TableEntry {
     let pg_table = derive_pg_table(plan);
+    let lsis = build_lsi_specs(plan, &pg_table);
     let now = now_ms();
     TableEntry {
         schema: TableSchema {
@@ -495,6 +529,7 @@ pub fn entry_for_new_table(plan: &CreateTablePlan) -> TableEntry {
         provisioned_wcu: plan.provisioned_wcu,
         tags: plan.tags.clone(),
         gsis: HashMap::new(),
+        lsis,
     }
 }
 

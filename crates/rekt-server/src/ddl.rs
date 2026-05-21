@@ -344,6 +344,7 @@ mod tests {
             provisioned_wcu: None,
             tags: serde_json::json!({}),
             gsis: HashMap::new(),
+            lsis: Vec::new(),
         }
     }
 

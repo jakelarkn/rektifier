@@ -831,6 +831,7 @@ fn catalog() -> Arc<TableCatalog> {
                 provisioned_wcu: None,
                 tags: serde_json::json!({}),
                 gsis: HashMap::new(),
+                lsis: Vec::new(),
             }),
         );
     }
@@ -996,6 +997,7 @@ fn app_users_unserveable() -> axum::Router {
                 provisioned_wcu: None,
                 tags: serde_json::json!({}),
                 gsis: HashMap::new(),
+                lsis: Vec::new(),
             }),
         );
     }

@@ -27,12 +27,13 @@ pub mod metadata;
 pub mod reconciler;
 
 use arc_swap::ArcSwap;
+use rekt_storage::KeyType;
 use rekt_translator::TableSchema;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 pub use bootstrap::ensure_metadata_tables;
-pub use metadata::{load_snapshot, MetadataRow};
+pub use metadata::{load_snapshot, lsi_specs_from_json, lsi_specs_to_json, MetadataRow};
 pub use reconciler::{ReconcileVerdict, Reconciler};
 
 #[derive(Debug, thiserror::Error)]
@@ -142,6 +143,38 @@ pub struct TableEntry {
     pub tags: serde_json::Value,
     /// Per-GSI cache state. Empty until PLAN-9 lands.
     pub gsis: HashMap<String, GsiCacheEntry>,
+    /// PLAN-11 L3. Per-LSI cache state, populated from
+    /// `_rektifier_tables.lsi_specs` at every catalog refresh. Empty for
+    /// tables that declared no LSIs at CreateTable time. Each LSI carries
+    /// its own `serveable` bit (PLAN-11 open Q4) so drift on one LSI
+    /// doesn't render the base table unserveable.
+    pub lsis: Vec<LsiSpec>,
+}
+
+/// Post-validation, persistence-friendly form of an LSI declaration as
+/// it lives in the catalog. The `name`, `sort_attr`, and `sort_type`
+/// echo the validator's output; the rest is reconciler-driven state.
+///
+/// `sort_pg_col` is intentionally distinct from `sort_attr` even though
+/// today they always agree (same as PK/SK — rektifier uses the raw DDB
+/// attribute name verbatim). Keeping them separate lets a future rename
+/// or column-collision-suffix scheme land without touching every
+/// consumer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LsiSpec {
+    pub name: String,
+    pub sort_attr: String,
+    pub sort_type: KeyType,
+    pub sort_pg_col: String,
+    pub index_name: String,
+    pub projection_type: Option<String>,
+    pub projection_non_key_attrs: Option<Vec<String>>,
+    /// Reconciler verdict for this LSI. `false` when the column or
+    /// index is missing / shape-mismatched. Base-table Queries are
+    /// unaffected — only Query/Scan with `IndexName` targeting this
+    /// LSI return ResourceNotFoundException at the dispatch gate.
+    pub serveable: bool,
+    pub unserveable_reason: Option<String>,
 }
 
 /// Per-GSI cache state placeholder; PLAN-9 owns the real shape.
@@ -259,6 +292,7 @@ mod tests {
             provisioned_wcu: None,
             tags: serde_json::json!({}),
             gsis: HashMap::new(),
+            lsis: Vec::new(),
         })
     }
 
