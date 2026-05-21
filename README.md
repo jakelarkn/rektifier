@@ -140,6 +140,18 @@ instance, `PermissiveVerifier` bypasses SigV4, 256-byte items.
 Production deployments will hit PG-tuning ceilings well before
 rektifier itself becomes the bottleneck.
 
+## Comparison with ExtendDB
+
+ExtendDB (v0.1.0, May 2026) is another Rust DDB-over-Postgres project
+shipping a wider feature set: built-in IAM, mandatory SigV4 + TLS,
+daemon lifecycle, management console, and Streams/TTL/Import-Export.
+Keys are extracted by the engine into typed columns; GSIs are
+separate PG tables with optional async maintenance. Rektifier extracts
+keys via `GENERATED ALWAYS AS` and runs roughly 3–5× lower per-request
+latency on the same PG 17 host, with the largest gaps on ALL_OLD
+returns and single-statement UpdateItem paths. Full breakdown:
+[`docs/COMPARISON_VS_EXTENDDB.md`](./docs/COMPARISON_VS_EXTENDDB.md).
+
 ## Testing
 
 Four parallel test surfaces:
