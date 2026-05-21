@@ -94,9 +94,10 @@ they take divergent paths.
 | Tagging | yes | partial |
 | DescribeEndpoints / DescribeLimits | yes | yes |
 | CreateTable / DeleteTable / UpdateTable | yes (engine-owned DDL) | yes (PLAN-10) — was operator-owned via TOML pre-D8 |
-| **SigV4 verification** | mandatory, full | optional via `PermissiveVerifier` |
+| **SigV4 verification** | mandatory, full | full (strict) when `[auth.sigv4]` enabled; opt-in permissive for dev |
+| **Other auth schemes** | SigV4 only | JWT-with-JWKS (GCP / Azure / Snowflake / Databricks / Neon / Cognito presets), opaque API tokens (`rekt_pat_…` / `rekt_svc_…`) |
 | **TLS** | mandatory, self-signed cert auto-generated | not enforced; runs HTTP by default |
-| **Auth: IAM users/groups/roles/policies** | full implementation | none |
+| **Auth: IAM users/groups/roles/policies** | full implementation | none (authentication only, not authorization) |
 | Permissions boundaries | yes | none |
 | Access keys with rotation | yes | none |
 | **Multi-account isolation** | yes (`account_id` scopes everything) | none (one namespace) |
@@ -109,9 +110,10 @@ they take divergent paths.
 | Compile-time storage backend selection | yes (cargo feature) | n/a (single backend) |
 
 The asymmetry is large and intentional. Rektifier is a translation
-layer that assumes the operator runs the operational surface
-(database, auth, TLS termination, monitoring). ExtendDB is a product
-that takes ownership of all of those.
+layer that authenticates clients but expects authorization (who can
+do what) and TLS termination to be provided at a higher layer.
+ExtendDB is a product that takes ownership of authn + authz + TLS +
+the database lifecycle as one bundle.
 
 ## Architecture
 
@@ -139,8 +141,8 @@ backends could be added without touching the engine or server.
 rektifier (bin)             wires libpq backend + axum server + bench
   └─ rekt-server            axum routes; dispatches op → translator → backend
        ├─ rekt-protocol     AttributeValue + JSON wire framing
-       ├─ rekt-sigv4        SigV4 verification (or permissive)
-       ├─ rekt-config       TOML config loader
+       ├─ rekt-auth         SigV4 + JWT-with-JWKS + opaque-token verifiers + AuthChain
+       ├─ rekt-config       TOML config loader (incl. [auth.*] schema)
        ├─ rekt-catalog      runtime table catalog + reconciler
        ├─ rekt-ddl          CreateTable / DescribeTable / DDL emission
        ├─ rekt-translator   DDB op + AST → SQL fragment + bound params
@@ -356,49 +358,79 @@ constantly`) work well on either stack.
 
 ### Authentication and authorization
 
-**Rektifier**: SigV4 verification via `rekt-sigv4` (131 lines —
-thin), with a `PermissiveVerifier` mode that accepts any signature
-value. The default is permissive in the dev/test paths. There is no
-IAM model, no policy evaluator, no user/group/role concept.
-Operators handle authentication via whatever sits in front
-(application gateway, mTLS, internal network only). The bench uses
-`Signature=deadbeef` and it works.
+The two stacks landed on different scopes here. **Both ship
+full SigV4 verification**; rektifier additionally accepts non-AWS
+ecosystems' tokens; ExtendDB additionally evaluates IAM policy.
+Neither subsumes the other.
 
-**ExtendDB**: SigV4 is mandatory and full. The auth crate has 5
-modules including a policy evaluator
+**Rektifier (PLAN-13)**: three production auth primitives composed
+in an `AuthChain` that routes by `Authorization` header prefix:
+
+- **Strict SigV4** — credentials live AES-GCM-encrypted in
+  `_rektifier_aws_credentials`, decrypted once on cache miss and
+  held in an in-memory `SecretCache` (positive + negative TTL).
+  HMAC verification runs against the cached secret on every
+  request — no STS round trip, no per-request KMS call. The master
+  key is HKDF-derived into purpose-specific subkeys so the SigV4
+  AES key never shares material with the API-token pepper.
+- **JWT-with-JWKS** — multi-issuer Bearer JWT validation with
+  per-JWKS-key algorithm pinning (kills the HS256-with-RSA-pubkey
+  alg-confusion class), HTTPS-only JWKS URLs, boot-time warm-up
+  (fail-startup if any issuer is unreachable), stale-while-
+  revalidate with single-flight on unknown-kid. Presets for GCP,
+  Microsoft Entra (Azure), Snowflake, Databricks, Neon, AWS
+  Cognito; `generic` for Auth0 / Keycloak / Okta / homegrown OIDC.
+- **Opaque API tokens** — type-prefixed (`rekt_pat_…` / `rekt_svc_…`)
+  bearer tokens, HMAC-peppered with the master key's HKDF subkey,
+  stored hash-only in `_rektifier_api_tokens`. Prefix is
+  secret-scanner-compatible and cheap-rejects malformed bearers
+  before any HMAC or DB lookup.
+- **PermissiveVerifier** for dev/test, gated by D10 guardrails
+  (loopback-bind hard-fail + `REKTIFIER_ALLOW_UNSAFE_AUTH=
+  I_UNDERSTAND_THIS_IS_UNSAFE` env var double opt-in).
+
+What rektifier **does not** ship: an IAM-style authorization layer.
+There is no policy evaluator, no users/groups/roles/permissions-
+boundary concept, no per-request "is this principal allowed to
+PutItem on this table" check. The validated `Identity` flows
+through to a `RequestContext` and into the per-request audit log
+line; downstream authz (if needed) sits above rektifier in the
+operator's stack. Configuration is entirely TOML-driven —
+operators enable verifiers via `[auth.*]` blocks in
+`rektifier.toml` with no code edits required.
+
+**ExtendDB**: SigV4 only on the wire, but the auth path additionally
+runs full DDB IAM authorization on every request. The auth crate
+has 5 modules including a policy evaluator
 (`crates/auth/src/policy/evaluator.rs`), signing key derivation,
 canonical request construction, and timestamp validation. The full
-DDB IAM evaluation algorithm runs on every request: explicit deny →
+DDB IAM evaluation algorithm runs per request: explicit deny →
 permissions boundary → session policy → identity allow → implicit
-deny. Credentials live encrypted in PG (`access_keys` table, AES-GCM
-per-key encryption with a master key in the `settings` table); the
-secret key never persists in plaintext. Constant-time failure paths
-prevent timing side-channels between "key doesn't exist," "key
-inactive," and "signature mismatch." See `crates/auth/src/lib.rs`
-and the `S-5` design comment around credential lookup.
+deny. Credentials live encrypted in PG (`access_keys` table,
+AES-GCM per-key encryption with a master key in the `settings`
+table); constant-time failure paths prevent timing side-channels
+between "key doesn't exist," "key inactive," and "signature
+mismatch." See `crates/auth/src/lib.rs` and the `S-5` design
+comment around credential lookup.
 
 Auth is so deeply integrated that the server **refuses to start
 with `auth.provider = "none"`** (`crates/bin/src/cmd_serve.rs:57`).
 
-We added a **benchmarking bypass** in this branch (also documented
-in `docs/perf/extenddb-bench-2026-05-21.md`):
+For apples-to-apples benchmarking, extenddb has a bypass mode
+(`EXTENDDB_BYPASS_SIGV4=1`) that short-circuits both authentication
+and authorization. Rektifier's equivalent is `[auth.permissive]`
+in the bench config. Production deployments on either stack do not
+use these — the comparison numbers below run rektifier with
+permissive auth and extenddb with `EXTENDDB_BYPASS_SIGV4=1` to
+isolate the storage-layer comparison from the auth-layer scope
+difference.
 
-- `EXTENDDB_BYPASS_SIGV4=1` short-circuits all of: Authorization
-  parsing, credential lookup, timestamp validation, signature
-  verification.
-- `EXTENDDB_BYPASS_ACCOUNT_ID=<id>` (default `bench`) names the
-  synthetic account that bypassed requests act as.
-- The IAM authorization layer
-  (`crates/server/src/authorization.rs`) early-returns `Ok(())`
-  when bypass is on.
-- The server bootstraps the synthetic account row in the catalog at
-  startup so `CreateTable` doesn't fail on the `accounts` FK.
-- A loud `tracing::warn!` fires at server start and at every
-  `BuiltinAuthProvider::new()` call.
-
-This is the equivalent of rektifier's `PermissiveVerifier` — only
-for apples-to-apples benchmarking. Production deployments do not
-set this env var.
+**Net of the two scopes**: ExtendDB authenticates + authorizes
+inside the protocol layer. Rektifier authenticates inside the
+protocol layer (across a wider set of ecosystems) and expects
+authorization to live above it. Both have a role; pick by whether
+you want IAM-at-the-wire (extenddb) or wider-authentication-with-
+authz-elsewhere (rektifier).
 
 ### Operational model
 
@@ -448,15 +480,18 @@ The numbers in this section are from the bench captures in:
 Both stacks ran against the **same Postgres 17 docker container**
 on the same host. Closed-loop driver, concurrency=16, 256 B items,
 1000-key working set, 10s run + 2s warmup. ExtendDB ran with
-`EXTENDDB_BYPASS_SIGV4=1` to remove crypto from the hot path,
-matching rektifier's `PermissiveVerifier`. TLS stays on for
+`EXTENDDB_BYPASS_SIGV4=1` to remove auth crypto + IAM evaluation
+from the hot path; rektifier ran with `[auth.permissive]` configured
+so the equivalent path is also out. This isolates the storage-layer
+comparison from the auth-layer scope asymmetry. TLS stays on for
 extenddb (mandatory); the bench passes `--ca-bundle` to trust the
 self-signed cert through the AWS SDK's hyper-rustls client.
 
 Bench drivers are different:
 
 - **Rektifier**: hand-rolled `rekt-bench` using `reqwest` directly.
-  Sends DDB JSON-1.0 with a fake `Signature=deadbeef` header.
+  Sends DDB JSON-1.0 with a fake `Signature=deadbeef` header (the
+  permissive verifier accepts it without validation).
 - **ExtendDB**: `extenddb-bench` (this tree) using the official
   AWS Rust SDK (`aws-sdk-dynamodb` 1.112). Real SigV4 signing
   happens client-side then the bypass discards it server-side.
@@ -627,13 +662,16 @@ extraction, account-scoped catalog lookup, IAM bypass overhead).
   per-frame TLS cost (encryption + frame mac) that shows up on
   reads with large response bodies. Bigger items would
   proportionally hurt extenddb more.
-- **Constant-time auth path runs even when bypassed.** When
-  `EXTENDDB_BYPASS_SIGV4` is not set, every request additionally
-  pays: credential lookup in PG (cached, but still goes through
-  the pool), AES-GCM decrypt of the secret key, SigV4 canonical
-  request construction, HMAC-SHA256 derive×4 chain, hash compare.
-  Production-mode latency is meaningfully higher than the bypass
-  numbers in this doc.
+- **Auth path costs differ when both stacks run in their
+  production-equivalent modes.** Rektifier's strict SigV4 path is
+  hot-path-cached: SecretCache hit + HMAC verify, ~10 µs.
+  ExtendDB additionally evaluates IAM policy per request on top of
+  the same signature path. Both pay credential lookup + AES-GCM
+  decrypt on first request per AKID; rektifier amortizes via the
+  in-memory cache, extenddb via its connection-pool-backed
+  credential cache. Production-mode latency for both stacks runs
+  somewhat higher than these bypass numbers; the gap between them
+  stays roughly proportional.
 
 ### Workloads where the GSI-table shape could still win
 
@@ -672,10 +710,11 @@ A pithy summary:
 >
 > Rektifier optimizes for a thin sidecar over Postgres-you-already-
 > have: generated columns let PG enforce key invariants, the
-> translator pipeline keeps the codebase backend-neutral, and a
-> permissive auth mode keeps the dev loop fast. The cost is
-> operational surface area that the operator has to provide:
-> auth, TLS, account isolation, GSI migrations.
+> translator pipeline keeps the codebase backend-neutral, and the
+> auth surface accepts SigV4 + JWT + opaque tokens via TOML
+> configuration. The cost is operational surface area the operator
+> has to provide: TLS termination, authorization (rektifier
+> authenticates but doesn't authorize), account isolation.
 
 **Pick extenddb when:**
 
@@ -709,8 +748,13 @@ A pithy summary:
   extenddb does).
 - You want a future migration path to a `pgrx` Postgres extension
   — the type system enforces backend-neutrality from day one.
-- You're OK terminating TLS and authenticating users at a layer
-  above the DDB protocol.
+- Your clients live outside AWS — JWT presets for GCP / Azure /
+  Snowflake / Databricks / Neon / Cognito mean workloads native to
+  those ecosystems authenticate with their own bearer tokens, no
+  synthetic AWS-style keys required.
+- You're OK terminating TLS at a layer above the DDB protocol and
+  doing authorization (who-can-do-what) above rektifier rather than
+  inside it.
 
 **Pick neither when:**
 
@@ -719,12 +763,16 @@ A pithy summary:
   stacks ship "DynamoDB-compatible" but not "DynamoDB-equivalent."
 - Latency-critical workloads where 1–5 ms p50 isn't tight enough.
 
-To run extenddb in production-equivalent mode (no bypass), drop the
-`EXTENDDB_BYPASS_SIGV4=1` env var, provision real credentials via
-`devtools/provision-test-credentials`, and use those as the SDK's
-AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY. Expect another 200–500 µs
-of per-request latency from credential lookup + AES-GCM decrypt +
-SigV4 canonicalization + HMAC chain + policy evaluation.
+To run either stack in production-equivalent mode: on extenddb,
+drop `EXTENDDB_BYPASS_SIGV4=1` and provision credentials via
+`devtools/provision-test-credentials`. On rektifier, swap
+`[auth.permissive]` for `[auth.sigv4]` (or `[[auth.jwt.issuer]]` /
+`[auth.api_token]`) in `rektifier.toml` and provision credentials
+via the `rekt-auth` helpers documented in `docs/auth/runbook.md`.
+Both stacks add some hundreds of µs per request from the real
+signature/token verification path; rektifier's in-memory
+SecretCache + TokenCache cap the cost at one HMAC verify on the
+hot path.
 
 ## References
 
@@ -758,7 +806,11 @@ SigV4 canonicalization + HMAC chain + policy evaluation.
 | `crates/rekt-storage-libpq/src/put_delete.rs` | PutItem / DeleteItem SQL (CTE for ALL_OLD) |
 | `crates/rekt-storage-libpq/src/update.rs` | UpdateItem direct + tx paths |
 | `crates/rekt-catalog/src/lib.rs` | Runtime catalog with ArcSwap snapshots |
-| `crates/rekt-sigv4/src/lib.rs` | SigV4 verification (and `PermissiveVerifier`) |
+| `crates/rekt-auth/src/sigv4/` | SigV4 strict verifier + SecretCache + AES-GCM credential store |
+| `crates/rekt-auth/src/jwt/` | Multi-issuer JWT verifier + JWKS cache + ecosystem presets |
+| `crates/rekt-auth/src/api_token/` | Opaque API tokens (prefix + HMAC pepper + TokenCache) |
+| `crates/rekt-auth/src/lib.rs` | `AuthChain` + `Identity` + header-prefix routing |
+| `crates/rektifier/src/auth_wiring.rs` | TOML `[auth.*]` → `AuthChain` builder (D10 guardrails) |
 | `crates/rekt-bench/src/main.rs` | The other bench driver |
 | `CONTEXT.md` | Decision log: sidecar-vs-extension, data model, implementation order |
 | `CLAUDE.md` | Project conventions including plan-document discipline |

@@ -102,9 +102,15 @@ routes by prefix:
 - **API tokens** — type-prefixed bearer (`rekt_pat_…` / `rekt_svc_…`),
   HMAC-peppered in `_rektifier_api_tokens`.
 
-Secret material derives from one operator-supplied master key
-(`master_key_env` / `master_key_file` / `master_key_kms`). See
-[`docs/auth/runbook.md`](./docs/auth/runbook.md) for workflows and
+Configuration is entirely TOML-driven — operators enable verifiers
+via `[auth.sigv4]` / `[[auth.jwt.issuer]]` / `[auth.api_token]` /
+`[auth.permissive]` blocks in `rektifier.toml`. No code edits or
+custom builds required. Secret material derives from one operator-
+supplied master key (`master_key_env` / `master_key_file` /
+`master_key_kms`). See
+[`rektifier.toml.example`](./rektifier.toml.example) for the full
+schema, [`docs/auth/runbook.md`](./docs/auth/runbook.md) for
+workflows, and
 [`docs/auth/role_separation.sql`](./docs/auth/role_separation.sql)
 for the PG-role lockdown script.
 
@@ -161,15 +167,20 @@ Worth highlighting:
 - **Zero errors at any tested concurrency.**
 
 Numbers are honest about pre-prod realities: single host, single PG
-instance, `PermissiveVerifier` bypasses SigV4, 256-byte items.
-Production deployments will hit PG-tuning ceilings well before
-rektifier itself becomes the bottleneck.
+instance, bench runs with `[auth.permissive]` so signature
+verification is out of the hot path, 256-byte items. Production
+deployments will hit PG-tuning ceilings well before rektifier itself
+becomes the bottleneck.
 
 ## Comparison with ExtendDB
 
 ExtendDB (v0.1.0, May 2026) is another Rust DDB-over-Postgres project
-shipping a wider feature set: built-in IAM, mandatory SigV4 + TLS,
-daemon lifecycle, management console, and Streams/TTL/Import-Export.
+shipping a different feature mix: built-in IAM authorization,
+mandatory TLS, daemon lifecycle, management console, and
+Streams/TTL/Import-Export. Rektifier authenticates clients via
+SigV4 / JWT / opaque API tokens (PLAN-13) but does not include an
+IAM-style authorization layer — that sits above the DDB protocol in
+rektifier's model.
 Keys are extracted by the engine into typed columns; GSIs are
 separate PG tables with optional async maintenance. Rektifier extracts
 keys via `GENERATED ALWAYS AS` (for CreateTable-time GSIs/LSIs) or via
