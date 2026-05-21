@@ -1,5 +1,27 @@
-//! SigV4 helpers shared by PermissiveVerifier (A1) and the strict
-//! `Sigv4Verifier` (A2). The strict verifier itself lands in A2.
+//! SigV4 strict verification (PLAN-13 D5 / A2).
+//!
+//! The verifier reconstructs the canonical SigV4 string-to-sign from
+//! the inbound request, derives the signing key from the operator-
+//! stored secret (decrypted via the AES-GCM master key, cached in
+//! memory), recomputes the signature, and compares it constant-time
+//! with the signature in the Authorization header.
+//!
+//! What is *not* in scope here: server-side IAM lookups, STS
+//! federation (rejected — see PLAN-13 "Rejected alternatives"), or
+//! key rotation tooling. Operators rotate by inserting a new row
+//! and deleting the old; the cache TTL bounds the propagation
+//! window.
+
+pub mod cache;
+pub mod canonical;
+pub mod store;
+pub mod verifier;
+
+pub use cache::{CachedSecret, SecretCache};
+pub use store::{
+    ensure_credentials_table, fetch_credential_row, insert_credential_row, CredentialRow,
+};
+pub use verifier::Sigv4Verifier;
 
 /// Parse the AKID out of an AWS4-HMAC-SHA256 `Authorization` header.
 /// Returns `None` if the header isn't a SigV4 header or the `Credential`

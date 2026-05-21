@@ -13,6 +13,24 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# A2 — SigV4 strict + pattern-3 secret cache.
+aes-gcm = "0.10"
+base64 = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+dashmap = "6"
+deadpool-postgres = { workspace = true }
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
+percent-encoding = "2"
+rand = "0.8"
+sha2 = "0.10"
+subtle = "2"
+tokio-postgres = { workspace = true }
 
 [dev-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+http = { workspace = true }
 tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+deadpool-postgres = { workspace = true }

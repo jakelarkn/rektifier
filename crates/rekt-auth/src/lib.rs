@@ -13,10 +13,17 @@
 
 use std::sync::OnceLock;
 
+pub mod crypto;
+pub mod master_key;
 pub mod permissive;
 pub mod sigv4;
 
+pub use master_key::{MasterKeyError, MasterKeySource};
 pub use permissive::PermissiveVerifier;
+pub use sigv4::{
+    ensure_credentials_table, fetch_credential_row, insert_credential_row, CredentialRow,
+    SecretCache, Sigv4Verifier,
+};
 
 /// Successful verification produces an [`Identity`]. The dispatcher
 /// records `scheme` + `principal` on the request span and (in A6) hands
