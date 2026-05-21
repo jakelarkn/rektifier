@@ -118,18 +118,37 @@ async fn execute_puts(
         Some(sk_col) => format!("{pk_col}, {}", quote_ident(sk_col)),
     };
 
-    // Build the `($1::jsonb), ($2::jsonb), …` value list.
-    let mut values_clause = String::with_capacity(puts.len() * 12);
+    // PLAN-9 G4. DualWrite-column widening for the multi-row INSERT:
+    // each row's VALUES tuple expands by one extraction expr per
+    // DualWrite column; the column list expands by the columns.
+    let dwc_insert_cols: String = shape
+        .dual_write_cols
+        .iter()
+        .map(|c| format!(", {}", quote_ident(c.col)))
+        .collect();
+    let dwc_set_excluded: String = shape
+        .dual_write_cols
+        .iter()
+        .map(|c| format!(", {}", crate::shape::dual_write_set_excluded(c, shape.jsonb_col)))
+        .collect();
+
+    // Build the `($1::jsonb, extract($1)…), ($2::jsonb, extract($2)…), …` list.
+    let mut values_clause = String::with_capacity(puts.len() * 16);
     for i in 0..puts.len() {
         if i > 0 {
             values_clause.push_str(", ");
         }
-        values_clause.push_str(&format!("(${}::jsonb)", i + 1));
+        let param = i + 1;
+        values_clause.push_str(&format!("(${param}::jsonb"));
+        for c in shape.dual_write_cols {
+            values_clause.push_str(&format!(", {}", crate::shape::dual_write_extract_expr(param, c)));
+        }
+        values_clause.push(')');
     }
     let sql = format!(
-        "INSERT INTO {table} ({jsonb_col}) VALUES {values_clause} \
+        "INSERT INTO {table} ({jsonb_col}{dwc_insert_cols}) VALUES {values_clause} \
          ON CONFLICT ({conflict_target}) \
-         DO UPDATE SET {jsonb_col} = EXCLUDED.{jsonb_col}"
+         DO UPDATE SET {jsonb_col} = EXCLUDED.{jsonb_col}{dwc_set_excluded}"
     );
     let param_types: Vec<Type> = vec![Type::JSONB; puts.len()];
 
