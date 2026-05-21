@@ -16,8 +16,10 @@
 //! observable side effect, so a crash mid-step is recovered by reading
 //! the persisted phase on boot.
 
+pub mod backfill;
 pub mod state;
 
+pub use backfill::{run_backfill, BackfillConfig};
 pub use state::{
     create_gsi_state_table, fetch_state, fetch_states_by_phase, insert_state_row, update_phase,
     GsiPhase, GsiState, OrchestratorError,
