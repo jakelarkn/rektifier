@@ -24,6 +24,7 @@ rektifier perf captures (in `../rektifier/docs/perf/`).
   - [Authentication and authorization](#authentication-and-authorization)
   - [Operational model](#operational-model)
 - [Performance](#performance) — measured numbers and what they mean
+  - [Index workloads](#index-workloads)
 - [Tradeoffs and when to pick which](#tradeoffs-and-when-to-pick-which)
 - [Repro notes](#repro-notes)
 - [References](#references)
@@ -474,9 +475,38 @@ reading absolute latencies.
 | ScanLimit (20) | 3,585 | 4.27 ms | 11,125 | 1.34 ms | 3.2× |
 | QueryPkOnly | 3,108 | 4.75 ms | 11,231 | 1.33 ms | 3.6× |
 | QuerySkRange | 4,038 | 3.78 ms | 13,536 | 1.11 ms | 3.4× |
+| PutLsi | 1,857 | 8.29 ms | 10,437 | 1.48 ms | 5.6× |
+| PutGenGsi | 1,973 | 7.81 ms | 10,556 | 1.47 ms | 5.4× |
+| PutDwGsi | 1,905 | 8.02 ms | 10,413 | 1.47 ms | 5.5× |
+| PutMultiDwGsi (3 GSIs) | 1,891 | 7.96 ms | 10,131 | 1.51 ms | 5.3× |
+| QueryLsi | 2,080 | 7.36 ms | 11,908 | 1.27 ms | 5.8× |
+| QueryGenGsi | 251 | 62.40 ms | 895 | 17.26 ms | 3.6× |
+
 
 (`extenddb p50` ratios are extenddb / rektifier — higher means
 extenddb is slower.)
+
+### Index workloads
+
+Numbers pair `docs/perf/index-bench.md` (rektifier) with a
+matching capture against extenddb on the same Postgres container.
+Same shapes: `bench_lsi`, `bench_gen_gsi`, `bench_dw_gsi`,
+`bench_multi_dw_gsi`. Two shape-level findings, both consistent
+with the architectural differences described above.
+
+**Indexed Put cost is fixed-overhead on extenddb, per-index on
+rektifier.** Adding *any* index drops extenddb Put throughput
+from ~2,826 to ~1,900 ops/sec; the number of GSIs after that
+barely moves the line (single LSI = 1,857; one CT-time GSI =
+1,973; three UpdateTable GSIs = 1,891). Rektifier's PLAN-9 D15
+budget holds — single-GSI Puts stay within ~5% of the no-index
+baseline, three-GSI within ~7%. The extenddb pattern looks like
+"every indexed-table Put goes through a transactional /
+sync-maintenance routing path regardless of whether the GSIs
+are async-eligible." That's a routing fix on extenddb's side,
+not an architectural difference: GSI work is queued via
+`gsi_queue` on extenddb (so per-GSI cost is ~zero, as expected)
+but the request still pays a transactional envelope.
 
 ### Where the gap comes from
 
