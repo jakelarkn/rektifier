@@ -10,6 +10,7 @@ members = [
     "crates/rekt-config",
     "crates/rekt-catalog",
     "crates/rekt-ddl",
+    "crates/rekt-gsi",
     "crates/rekt-server",
     "crates/rektifier",
     "crates/rekt-bench",

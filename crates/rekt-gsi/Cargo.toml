@@ -1,24 +1,19 @@
 [package]
-name = "rekt-ddl"
+name = "rekt-gsi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "DDL orchestration for rektifier: CreateTable/DeleteTable/UpdateTable workers"
+description = "Async GSI lifecycle orchestrator: state machine, backfill, online index creation (PLAN-9 DualWrite mode)"
 
 [dependencies]
-async-trait = { workspace = true }
 deadpool-postgres = { workspace = true }
 rekt-catalog = { path = "../rekt-catalog" }
-rekt-gsi = { path = "../rekt-gsi" }
-rekt-protocol = { path = "../rekt-protocol" }
 rekt-storage = { path = "../rekt-storage" }
-rekt-translator = { path = "../rekt-translator" }
 serde_json = { workspace = true }
-sha1 = "0.10"
 thiserror = { workspace = true }
+tokio = { workspace = true }
 tokio-postgres = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }

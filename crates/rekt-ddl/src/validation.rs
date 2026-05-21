@@ -4,7 +4,8 @@
 
 use crate::errors::DdlError;
 use rekt_protocol::{
-    CreateTableRequest, GlobalSecondaryIndex, LocalSecondaryIndex, UpdateTableRequest,
+    AttributeDefinition, CreateTableRequest, GlobalSecondaryIndex, LocalSecondaryIndex,
+    UpdateTableRequest,
 };
 use rekt_storage::KeyType;
 use std::collections::{BTreeSet, HashSet};
@@ -144,6 +145,117 @@ pub fn validate_create_table(req: &CreateTableRequest) -> Result<CreateTablePlan
 /// (HASH/RANGE cardinality, IndexName grammar, no duplicates); this
 /// pass produces the typed form downstream consumers (catalog, DDL
 /// emitter) use.
+/// PLAN-9 G2b. Per-Create-entry validator used by UpdateTable. Mirrors
+/// the body of `validate_gsi_plans` but operates on a single Create
+/// payload + an externally-supplied "existing GSI names" set (existing
+/// GSI lookups come from the catalog, not from the request).
+pub fn validate_update_table_gsi_create(
+    table_name: &str,
+    gsi: &GlobalSecondaryIndex,
+    attribute_definitions: Option<&[AttributeDefinition]>,
+    base_pk_attr: &str,
+    base_sk_attr: Option<&str>,
+    existing_gsi_names: &HashSet<&str>,
+) -> Result<GsiPlan, DdlError> {
+    validate_gsi_index_name(table_name, &gsi.index_name)?;
+    if existing_gsi_names.contains(gsi.index_name.as_str()) {
+        return Err(DdlError::Validation(format!(
+            "table `{table_name}`: GSI `{}` already exists",
+            gsi.index_name
+        )));
+    }
+    validate_gsi_key_schema(table_name, gsi)?;
+
+    // Build the attribute-type lookup from the (optional) UpdateTable
+    // AttributeDefinitions. DDB requires AttributeDefinitions to be
+    // supplied when GSI Create references attributes not already
+    // present in the table's schema; for the GSI's HASH + optional
+    // RANGE attrs we look them up here.
+    let mut defs: std::collections::HashMap<&str, KeyType> = Default::default();
+    if let Some(ads) = attribute_definitions {
+        for ad in ads {
+            let kt = parse_attribute_type(table_name, &ad.attribute_name, &ad.attribute_type)?;
+            defs.insert(ad.attribute_name.as_str(), kt);
+        }
+    }
+
+    let mut partition_attr: Option<&str> = None;
+    let mut sort_attr: Option<&str> = None;
+    for kse in &gsi.key_schema {
+        match kse.key_type.as_str() {
+            "HASH" => partition_attr = Some(&kse.attribute_name),
+            "RANGE" => sort_attr = Some(&kse.attribute_name),
+            _ => unreachable!("validate_gsi_key_schema already rejected non-HASH/RANGE"),
+        }
+    }
+    let partition_attr = partition_attr.ok_or_else(|| {
+        DdlError::Validation(format!(
+            "table `{table_name}`: GSI `{}`: KeySchema must contain a HASH entry",
+            gsi.index_name
+        ))
+    })?;
+    let partition_type = *defs.get(partition_attr).ok_or_else(|| {
+        DdlError::Validation(format!(
+            "table `{table_name}`: GSI `{}` partition attribute `{partition_attr}` \
+             has no AttributeDefinitions entry in the UpdateTable request",
+            gsi.index_name
+        ))
+    })?;
+    let sort_info = if let Some(s) = sort_attr {
+        let st = *defs.get(s).ok_or_else(|| {
+            DdlError::Validation(format!(
+                "table `{table_name}`: GSI `{}` sort attribute `{s}` \
+                 has no AttributeDefinitions entry in the UpdateTable request",
+                gsi.index_name
+            ))
+        })?;
+        Some((s.to_string(), st))
+    } else {
+        None
+    };
+
+    if let Some(pt) = gsi.projection.projection_type.as_deref() {
+        if pt != "ALL" && pt != "KEYS_ONLY" && pt != "INCLUDE" {
+            return Err(DdlError::Validation(format!(
+                "table `{table_name}`: GSI `{}` Projection.ProjectionType `{pt}` \
+                 is not one of ALL | KEYS_ONLY | INCLUDE",
+                gsi.index_name
+            )));
+        }
+    }
+
+    if partition_attr == base_pk_attr && sort_info.is_none() {
+        return Err(DdlError::Validation(format!(
+            "table `{table_name}`: GSI `{}` has the same hash-only KeySchema as the \
+             base table — would be a redundant index",
+            gsi.index_name
+        )));
+    }
+    if partition_attr == base_pk_attr
+        && sort_info.as_ref().map(|(s, _)| s.as_str()) == base_sk_attr
+    {
+        return Err(DdlError::Validation(format!(
+            "table `{table_name}`: GSI `{}` KeySchema equals the base table's KeySchema \
+             — would be a redundant index",
+            gsi.index_name
+        )));
+    }
+
+    let (sort_attr_str, sort_type) = match sort_info {
+        None => (None, None),
+        Some((s, t)) => (Some(s), Some(t)),
+    };
+    Ok(GsiPlan {
+        name: gsi.index_name.clone(),
+        partition_attr: partition_attr.to_string(),
+        partition_type,
+        sort_attr: sort_attr_str,
+        sort_type,
+        projection_type: gsi.projection.projection_type.clone(),
+        projection_non_key_attrs: gsi.projection.non_key_attributes.clone(),
+    })
+}
+
 fn validate_gsi_plans(
     table_name: &str,
     req: &CreateTableRequest,
@@ -303,13 +415,23 @@ pub fn validate_update_table_body(req: &UpdateTableRequest) -> Result<(), DdlErr
                      Update / Delete must be set (got {set_count})"
                 )));
             }
-        }
-        if !updates.is_empty() {
-            return Err(DdlError::Validation(
-                "GlobalSecondaryIndexUpdates is not yet supported \
-                 (PLAN-9 GSI lifecycle pending)"
-                    .into(),
-            ));
+            // PLAN-9 G2b: Create is now supported. Update + Delete still
+            // pending (G9 for Delete; provisioned-throughput-on-existing-
+            // GSI updates not in scope until G9-followup).
+            if u.update.is_some() {
+                return Err(DdlError::Validation(
+                    "GlobalSecondaryIndexUpdates[].Update (provisioned-throughput \
+                     mutation on existing GSI) is not yet supported"
+                        .into(),
+                ));
+            }
+            if u.delete.is_some() {
+                return Err(DdlError::Validation(
+                    "GlobalSecondaryIndexUpdates[].Delete is not yet supported \
+                     (PLAN-9 G9 pending; recovery is DeleteTable + CreateTable)"
+                        .into(),
+                ));
+            }
         }
     }
     if let Some(spec) = req.stream_specification.as_ref() {

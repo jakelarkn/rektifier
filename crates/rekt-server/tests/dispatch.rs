@@ -918,6 +918,62 @@ impl DdlBackend for MockDdlBackend {
             next_entry.provisioned_rcu = Some(pt.read_capacity_units);
             next_entry.provisioned_wcu = Some(pt.write_capacity_units);
         }
+        // PLAN-9 G2b. Mirror the real backend's GSI Create path: each
+        // newly-created DualWrite-mode GSI lands in the in-memory
+        // catalog as a serveable=false spec (matches the real backend's
+        // pre-active state). Mock doesn't run the orchestrator state
+        // machine; that's PG-live test territory.
+        if let Some(updates) = req.global_secondary_index_updates.as_ref() {
+            let existing_names: std::collections::HashSet<String> =
+                next_entry.gsis.keys().cloned().collect();
+            let existing_refs: std::collections::HashSet<&str> =
+                existing_names.iter().map(|s| s.as_str()).collect();
+            for u in updates {
+                let Some(gsi_create) = u.create.as_ref() else {
+                    continue;
+                };
+                let plan = rekt_ddl::validation::validate_update_table_gsi_create(
+                    &req.table_name,
+                    gsi_create,
+                    req.attribute_definitions.as_deref(),
+                    &next_entry.schema.pk_attr,
+                    next_entry.schema.sk_attr.as_deref(),
+                    &existing_refs,
+                )?;
+                let spec = rekt_catalog::GsiSpec {
+                    name: plan.name.clone(),
+                    partition_attr: plan.partition_attr.clone(),
+                    partition_type: plan.partition_type,
+                    partition_pg_col: plan.partition_attr.clone(),
+                    sort_attr: plan.sort_attr.clone(),
+                    sort_type: plan.sort_type,
+                    sort_pg_col: plan.sort_attr.clone(),
+                    index_name: format!("mock_{}_gsi_{}_idx", next_entry.schema.pg_table, plan.name),
+                    projection_type: plan.projection_type.clone(),
+                    projection_non_key_attrs: plan.projection_non_key_attrs.clone(),
+                    mode: rekt_catalog::GsiMode::DualWrite,
+                    serveable: false,
+                    unserveable_reason: Some("DualWrite GSI in CREATING phase".into()),
+                };
+                // Also mirror onto the translator-side schema map so the
+                // dispatch gate sees the GSI on subsequent Query attempts.
+                next_entry.schema.gsis.insert(
+                    plan.name.clone(),
+                    rekt_translator::GsiSchema {
+                        name: plan.name.clone(),
+                        partition_attr: plan.partition_attr.clone(),
+                        partition_type: plan.partition_type,
+                        partition_pg_col: plan.partition_attr.clone(),
+                        sort_attr: plan.sort_attr.clone(),
+                        sort_type: plan.sort_type,
+                        sort_pg_col: plan.sort_attr.clone(),
+                        serveable: false,
+                        unserveable_reason: Some("DualWrite GSI in CREATING phase".into()),
+                    },
+                );
+                next_entry.gsis.insert(plan.name.clone(), spec);
+            }
+        }
         let mut next = self.catalog.snapshot().entries.clone();
         next.insert(req.table_name.clone(), Arc::new(next_entry));
         self.catalog.replace(CatalogSnapshot::from_entries(next));
@@ -8523,7 +8579,7 @@ async fn update_table_unknown_returns_rnf() {
 /// GSI mutations rejected until PLAN-9 lands. Validation message
 /// names the missing prerequisite so operator can correlate.
 #[tokio::test]
-async fn update_table_rejects_gsi_until_plan9() {
+async fn update_table_accepts_gsi_create() {
     let app = app();
     let resp = app
         .oneshot(ddb_request(
@@ -8544,16 +8600,63 @@ async fn update_table_rejects_gsi_until_plan9() {
         ))
         .await
         .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// PLAN-9 G9 pending — Delete sub-action still rejected at validation.
+#[tokio::test]
+async fn update_table_rejects_gsi_delete_until_g9() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "UpdateTable",
+            json!({
+                "TableName":"users",
+                "GlobalSecondaryIndexUpdates":[{
+                    "Delete":{"IndexName":"by_tier"}
+                }]
+            }),
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = body_json(resp).await;
     assert!(body["__type"]
         .as_str()
         .unwrap()
         .ends_with("#ValidationException"));
-    assert!(body["message"]
+    assert!(body["message"].as_str().unwrap().contains("Delete"));
+}
+
+/// PLAN-9 — Update sub-action (provisioned-throughput on existing GSI)
+/// still rejected.
+#[tokio::test]
+async fn update_table_rejects_gsi_update_sub_action() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "UpdateTable",
+            json!({
+                "TableName":"users",
+                "GlobalSecondaryIndexUpdates":[{
+                    "Update":{
+                        "IndexName":"by_tier",
+                        "ProvisionedThroughput":{
+                            "ReadCapacityUnits":1,"WriteCapacityUnits":1
+                        }
+                    }
+                }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
         .as_str()
         .unwrap()
-        .contains("GlobalSecondaryIndexUpdates"));
+        .ends_with("#ValidationException"));
+    assert!(body["message"].as_str().unwrap().contains("Update"));
 }
 
 /// Empty GSI updates array accepted (some SDKs always emit the field).

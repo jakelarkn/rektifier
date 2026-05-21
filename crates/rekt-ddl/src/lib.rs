@@ -75,6 +75,7 @@ pub struct PgDdlBackend {
     catalog: Arc<TableCatalog>,
     reconciler: Arc<Reconciler>,
     invalidate_on_local_ddl: bool,
+    gsi_orchestrator: rekt_gsi::GsiOrchestrator,
 }
 
 impl PgDdlBackend {
@@ -84,12 +85,18 @@ impl PgDdlBackend {
         reconciler: Arc<Reconciler>,
         invalidate_on_local_ddl: bool,
     ) -> Self {
+        let gsi_orchestrator = rekt_gsi::GsiOrchestrator::new(pool.clone(), catalog.clone());
         Self {
             pool,
             catalog,
             reconciler,
             invalidate_on_local_ddl,
+            gsi_orchestrator,
         }
+    }
+
+    pub fn gsi_orchestrator(&self) -> &rekt_gsi::GsiOrchestrator {
+        &self.gsi_orchestrator
     }
 }
 
@@ -169,6 +176,18 @@ UPDATE _rektifier_tables
        tags              = COALESCE($5::jsonb, tags),
        last_modified_at_ms = $6,
        last_modified_by  = 'ddl'
+ WHERE table_name = $1
+";
+
+/// PLAN-9 G2b. Replace `gsi_specs` wholesale when UpdateTable.Create
+/// adds new GSIs. Caller assembles the new array (existing + new
+/// DualWrite specs) and writes it back. Last-modified provenance
+/// matches the table-level update path.
+const UPDATE_GSI_SPECS_SQL: &str = "\
+UPDATE _rektifier_tables
+   SET gsi_specs           = $2::jsonb,
+       last_modified_at_ms = $3,
+       last_modified_by    = 'ddl'
  WHERE table_name = $1
 ";
 
@@ -419,11 +438,59 @@ impl DdlBackend for PgDdlBackend {
         // Confirm the table exists in the catalog before issuing any
         // PG work. The post-update reread further below picks up the
         // mutated row.
-        if self.catalog.get(&req.table_name).is_none() {
-            return Err(DdlError::ResourceNotFound(format!(
-                "Table not found: {}",
-                req.table_name
-            )));
+        let entry = self.catalog.get(&req.table_name).ok_or_else(|| {
+            DdlError::ResourceNotFound(format!("Table not found: {}", req.table_name))
+        })?;
+
+        // PLAN-9 G2b. Pre-validate every GSI Create entry against the
+        // current table schema before opening the tx, so a malformed
+        // sub-action doesn't poison the lock + partially-applied side
+        // effects.
+        let gsi_creates = req
+            .global_secondary_index_updates
+            .as_deref()
+            .map(|us| {
+                us.iter()
+                    .filter_map(|u| u.create.as_ref())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut new_gsi_specs: Vec<rekt_catalog::GsiSpec> = Vec::new();
+        if !gsi_creates.is_empty() {
+            let existing: std::collections::HashSet<&str> =
+                entry.gsis.keys().map(|s| s.as_str()).collect();
+            for gsi_create in &gsi_creates {
+                let plan = validation::validate_update_table_gsi_create(
+                    &req.table_name,
+                    gsi_create,
+                    req.attribute_definitions.as_deref(),
+                    &entry.schema.pk_attr,
+                    entry.schema.sk_attr.as_deref(),
+                    &existing,
+                )?;
+                let new_spec = rekt_catalog::GsiSpec {
+                    name: plan.name.clone(),
+                    partition_attr: plan.partition_attr.clone(),
+                    partition_type: plan.partition_type,
+                    partition_pg_col: plan.partition_attr.clone(),
+                    sort_attr: plan.sort_attr.clone(),
+                    sort_type: plan.sort_type,
+                    sort_pg_col: plan.sort_attr.clone(),
+                    index_name: crate::naming::derive_gsi_index_name(
+                        &entry.schema.pg_table,
+                        &plan.name,
+                    ),
+                    projection_type: plan.projection_type.clone(),
+                    projection_non_key_attrs: plan.projection_non_key_attrs.clone(),
+                    mode: GsiMode::DualWrite,
+                    // Per D16: serveable stays false until phase = active
+                    // (G6 promotes once the index is VALID). Query against
+                    // this GSI returns RNF in the meantime.
+                    serveable: false,
+                    unserveable_reason: Some("DualWrite GSI in CREATING phase".into()),
+                };
+                new_gsi_specs.push(new_spec);
+            }
         }
 
         // Collect the field deltas. Anything left as `None` here will
@@ -458,13 +525,46 @@ impl DdlBackend for PgDdlBackend {
             ],
         )
         .await?;
+
+        // PLAN-9 G2b. Persist new DualWrite GsiSpecs into
+        // `_rektifier_tables.gsi_specs` and run the orchestrator's
+        // synchronous transitions (insert state row + ALTER TABLE ADD
+        // COLUMN + phase → backfilling). All four side effects land in
+        // this single tx, so a mid-flow failure rolls back atomically.
+        if !new_gsi_specs.is_empty() {
+            let mut merged: Vec<rekt_catalog::GsiSpec> =
+                entry.gsis.values().cloned().collect();
+            merged.extend(new_gsi_specs.iter().cloned());
+            // Sort by name for deterministic JSON ordering — round-trips
+            // through CatalogSnapshot would be order-independent anyway,
+            // but stable output is nicer for operators reading the row.
+            merged.sort_by(|a, b| a.name.cmp(&b.name));
+            let merged_json = rekt_catalog::gsi_specs_to_json(&merged);
+            tx.execute(
+                UPDATE_GSI_SPECS_SQL,
+                &[&req.table_name, &merged_json, &now],
+            )
+            .await?;
+            for gsi in &new_gsi_specs {
+                rekt_gsi::create_dual_write_gsi_in_tx(
+                    &tx,
+                    &req.table_name,
+                    &entry.schema.pg_table,
+                    gsi,
+                )
+                .await
+                .map_err(|e| DdlError::Internal(format!("GSI orchestrator: {e}")))?;
+            }
+        }
+
         tx.commit().await?;
         tracing::info!(
             table = %req.table_name,
             billing_mode = ?new_billing,
             provisioned_rcu = ?new_rcu,
             provisioned_wcu = ?new_wcu,
-            "UpdateTable: non-GSI fields mutated"
+            new_gsis = new_gsi_specs.len(),
+            "UpdateTable: applied"
         );
 
         if self.invalidate_on_local_ddl {

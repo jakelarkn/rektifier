@@ -60,6 +60,9 @@ async fn main() -> Result<()> {
     rekt_catalog::ensure_metadata_tables(&pool)
         .await
         .context("ensuring _rektifier_tables exists")?;
+    rekt_gsi::create_gsi_state_table(&pool)
+        .await
+        .context("ensuring _rektifier_gsi_state exists")?;
 
     let catalog = Arc::new(TableCatalog::empty());
     let reconciler = Arc::new(Reconciler::new(
