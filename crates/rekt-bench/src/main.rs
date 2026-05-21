@@ -50,6 +50,16 @@ enum Cmd {
         #[arg(long, default_value = "users")]
         table: String,
     },
+    /// PLAN-9 / PLAN-11. Create the index-bench tables on rektifier:
+    /// `bench_lsi` (LSI), `bench_gen_gsi` (CT-time GSI), `bench_dw_gsi`
+    /// (UpdateTable-time GSI), `bench_multi_dw_gsi` (3 UpdateTable-time
+    /// GSIs). Waits for every index to reach IndexStatus=ACTIVE.
+    /// Idempotent: existing tables / indexes are reused; missing GSIs
+    /// are added via UpdateTable.
+    SetupIndexTables {
+        #[arg(long, default_value = "http://localhost:9000")]
+        rektifier_url: String,
+    },
 }
 
 #[derive(Parser, Clone)]
@@ -188,6 +198,38 @@ enum Workload {
     /// always matches half the seeded rows. Measures filter +
     /// Count/ScannedCount divergence under realistic load.
     QueryFiltered,
+    /// PLAN-11. Put into a table with one LSI declared. Measures the
+    /// per-write cost of one additional GENERATED-column extraction
+    /// vs the baseline Put (no LSI). Table: `bench_lsi` (composite
+    /// PK `(id,ts)` + LSI on `score`). Item populates id+ts+score.
+    PutLsi,
+    /// PLAN-9 Generated mode. Put into a table with one CreateTable-time
+    /// GSI. Same on-PG mechanism as LSI (GENERATED column + btree);
+    /// pairing with `PutLsi` confirms equivalent cost. Table:
+    /// `bench_gen_gsi` (composite PK + GSI on `(tier, score)`).
+    PutGenGsi,
+    /// PLAN-9 DualWrite mode. Put into a table whose GSI was added
+    /// via UpdateTable on a populated table. PG owns the JSONB write;
+    /// rektifier's INSERT SQL extracts the GSI column value from
+    /// `$N::jsonb`. Measures the per-write cost of the dual-write
+    /// SQL fragment vs the GENERATED column. Table: `bench_dw_gsi`.
+    PutDwGsi,
+    /// PLAN-9 DualWrite mode with 3 GSIs. Linear-scaling check —
+    /// each additional DualWrite GSI adds one SQL extraction + one
+    /// btree update per write. Table: `bench_multi_dw_gsi`.
+    PutMultiDwGsi,
+    /// PLAN-11. Query through an LSI: KeyConditionExpression
+    /// `device_id = :pk AND score BETWEEN :lo AND :hi`. Hits the LSI
+    /// composite btree (`(device_id, score)`). Table: `bench_lsi`.
+    QueryLsi,
+    /// PLAN-9 Generated. Query through a Generated-mode GSI:
+    /// `tier = :t AND score BETWEEN :lo AND :hi`. Hits the GSI's
+    /// composite btree. Table: `bench_gen_gsi`.
+    QueryGenGsi,
+    /// PLAN-9 DualWrite. Query through a DualWrite-mode GSI. Same
+    /// read shape as `QueryGenGsi` — both modes converge on the same
+    /// btree. Table: `bench_dw_gsi`.
+    QueryDwGsi,
 }
 
 impl Workload {
@@ -219,6 +261,17 @@ impl Workload {
             // Query workloads seed a fresh composite partition; see
             // `seed_query_partition` invoked from `run`.
             Self::QueryPkOnly | Self::QuerySkRange | Self::QueryFiltered => false,
+            // PLAN-9/11 indexed bench workloads use their own bench
+            // tables (`bench_lsi` etc.); the default `users` working
+            // set isn't relevant. Indexed-read workloads seed the
+            // partition via `needs_index_partition()` instead.
+            Self::PutLsi
+            | Self::PutGenGsi
+            | Self::PutDwGsi
+            | Self::PutMultiDwGsi
+            | Self::QueryLsi
+            | Self::QueryGenGsi
+            | Self::QueryDwGsi => false,
         }
     }
 
@@ -230,6 +283,25 @@ impl Workload {
             self,
             Self::QueryPkOnly | Self::QuerySkRange | Self::QueryFiltered
         )
+    }
+
+    /// PLAN-9/11. Indexed-bench workloads target their own bench
+    /// tables (not the default `users` / `device_events`). Returns
+    /// the table name the workload writes to / queries.
+    fn index_table(self) -> Option<&'static str> {
+        match self {
+            Self::PutLsi | Self::QueryLsi => Some("bench_lsi"),
+            Self::PutGenGsi | Self::QueryGenGsi => Some("bench_gen_gsi"),
+            Self::PutDwGsi | Self::QueryDwGsi => Some("bench_dw_gsi"),
+            Self::PutMultiDwGsi => Some("bench_multi_dw_gsi"),
+            _ => None,
+        }
+    }
+
+    /// True if the indexed-bench workload reads (so the setup step
+    /// must populate the partition first).
+    fn needs_index_partition(self) -> bool {
+        matches!(self, Self::QueryLsi | Self::QueryGenGsi | Self::QueryDwGsi)
     }
 }
 
@@ -325,6 +397,35 @@ trait Target: Send + Sync {
     /// `flag` attribute alternating "on"/"off" so `QueryFiltered`
     /// drops about half.
     async fn seed_query_partition(&self, pk: &str, n: usize) -> Result<()>;
+
+    /// PLAN-9/11. Put an item into one of the indexed bench tables.
+    /// `table` is `bench_lsi` / `bench_gen_gsi` / `bench_dw_gsi` /
+    /// `bench_multi_dw_gsi`; `device_id`/`ts` are the base PK/SK;
+    /// the item also carries `tier`, `score`, and (for multi-GSI)
+    /// `region`, `bucket` so every declared index column has a value.
+    async fn put_indexed(&self, table: &str, device: &str, ts: i64) -> Result<()>;
+
+    /// PLAN-11. Query a populated partition through the LSI on
+    /// `bench_lsi`: KeyConditionExpression
+    /// `device_id = :pk AND score BETWEEN :lo AND :hi`.
+    async fn query_lsi(&self, table: &str, pk: &str, lo: i64, hi: i64) -> Result<()>;
+
+    /// PLAN-9. Query through a GSI (both modes share the same shape):
+    /// IndexName=`by_tier_score`, KCE `tier = :t AND score BETWEEN :lo AND :hi`.
+    async fn query_gsi(
+        &self,
+        table: &str,
+        index_name: &str,
+        tier: &str,
+        lo: i64,
+        hi: i64,
+    ) -> Result<()>;
+
+    /// PLAN-9/11. Seed `n` rows in one partition of an indexed bench
+    /// table. Each row has a `tier` rotating among 4 values and a
+    /// `score` monotonically increasing — so range scans on the index
+    /// hit a known fraction.
+    async fn seed_indexed_partition(&self, table: &str, pk: &str, n: usize) -> Result<()>;
 }
 
 // (We pull `async-trait` only as a transitive macro through reqwest's tower;
@@ -562,6 +663,61 @@ impl Target for HttpTarget {
                 "flag": {"S": flag},
             });
             let body = json!({"TableName": BENCH_QUERY_TABLE, "Item": item});
+            self.post("DynamoDB_20120810.PutItem", &body).await?;
+        }
+        Ok(())
+    }
+
+    async fn put_indexed(&self, table: &str, device: &str, ts: i64) -> Result<()> {
+        let item = indexed_item(device, ts);
+        let body = json!({"TableName": table, "Item": item});
+        self.post("DynamoDB_20120810.PutItem", &body).await
+    }
+
+    async fn query_lsi(&self, table: &str, pk: &str, lo: i64, hi: i64) -> Result<()> {
+        let body = json!({
+            "TableName": table,
+            "IndexName": "by_device_score",
+            "KeyConditionExpression": "device_id = :pk AND score BETWEEN :lo AND :hi",
+            "ExpressionAttributeValues": {
+                ":pk": {"S": pk},
+                ":lo": {"N": lo.to_string()},
+                ":hi": {"N": hi.to_string()},
+            },
+        });
+        self.post("DynamoDB_20120810.Query", &body).await
+    }
+
+    async fn query_gsi(
+        &self,
+        table: &str,
+        index_name: &str,
+        tier: &str,
+        lo: i64,
+        hi: i64,
+    ) -> Result<()> {
+        let body = json!({
+            "TableName": table,
+            "IndexName": index_name,
+            "KeyConditionExpression": "tier = :t AND score BETWEEN :lo AND :hi",
+            "ExpressionAttributeValues": {
+                ":t":  {"S": tier},
+                ":lo": {"N": lo.to_string()},
+                ":hi": {"N": hi.to_string()},
+            },
+        });
+        self.post("DynamoDB_20120810.Query", &body).await
+    }
+
+    async fn seed_indexed_partition(
+        &self,
+        table: &str,
+        pk: &str,
+        n: usize,
+    ) -> Result<()> {
+        for i in 0..n {
+            let item = indexed_item_seed(pk, i as i64);
+            let body = json!({"TableName": table, "Item": item});
             self.post("DynamoDB_20120810.PutItem", &body).await?;
         }
         Ok(())
@@ -1075,6 +1231,36 @@ impl Target for PgTarget {
         }
         Ok(())
     }
+
+    // Indexed-bench workloads are rektifier-only — the DDL surface
+    // (LSI / GSI declarations, UpdateTable.Create) lives there. Issue
+    // them against DirectPg or DDB-local would mean reimplementing
+    // rektifier's GSI mechanics, which defeats the purpose of the
+    // measurement. Stub these out with an explicit error.
+    async fn put_indexed(&self, _table: &str, _device: &str, _ts: i64) -> Result<()> {
+        bail!("indexed bench workloads are rektifier-only (use --target rektifier)")
+    }
+    async fn query_lsi(&self, _t: &str, _pk: &str, _l: i64, _h: i64) -> Result<()> {
+        bail!("indexed bench workloads are rektifier-only (use --target rektifier)")
+    }
+    async fn query_gsi(
+        &self,
+        _t: &str,
+        _i: &str,
+        _tier: &str,
+        _l: i64,
+        _h: i64,
+    ) -> Result<()> {
+        bail!("indexed bench workloads are rektifier-only (use --target rektifier)")
+    }
+    async fn seed_indexed_partition(
+        &self,
+        _t: &str,
+        _pk: &str,
+        _n: usize,
+    ) -> Result<()> {
+        bail!("indexed bench workloads are rektifier-only (use --target rektifier)")
+    }
 }
 
 impl PgTarget {
@@ -1176,6 +1362,49 @@ fn seeded_payload(target_bytes: usize) -> Value {
     })
 }
 
+/// Item shape used by every indexed-bench Put. Carries the base PK/SK
+/// plus every attribute the indexes reference (tier, score, region,
+/// bucket) so the same item shape works against `bench_lsi`,
+/// `bench_gen_gsi`, `bench_dw_gsi`, and `bench_multi_dw_gsi`. The
+/// rotating `tier` / monotonic `score` keep range scans deterministic.
+fn indexed_item(device: &str, ts: i64) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    m.insert("device_id".into(), json!({"S": device}));
+    m.insert("ts".into(), json!({"N": ts.to_string()}));
+    m.insert("score".into(), json!({"N": ts.to_string()}));
+    m.insert("tier".into(), json!({"S": tier_for_ts(ts)}));
+    m.insert("region".into(), json!({"S": region_for_ts(ts)}));
+    m.insert("bucket".into(), json!({"N": (ts % 16).to_string()}));
+    m
+}
+
+/// Seed item — same shape as live Puts but with a stable device PK so
+/// the partition is queryable.
+fn indexed_item_seed(device: &str, i: i64) -> serde_json::Map<String, Value> {
+    indexed_item(device, i)
+}
+
+fn tier_for_ts(ts: i64) -> &'static str {
+    match ts.rem_euclid(4) {
+        0 => "bronze",
+        1 => "silver",
+        2 => "gold",
+        _ => "platinum",
+    }
+}
+fn region_for_ts(ts: i64) -> &'static str {
+    match ts.rem_euclid(3) {
+        0 => "us-east",
+        1 => "eu-west",
+        _ => "ap-south",
+    }
+}
+
+/// Fixed bench partition for indexed reads/writes.
+const BENCH_INDEX_PK: &str = "bench-idx-pk";
+/// Seed size per indexed-bench partition.
+const BENCH_INDEX_PARTITION_SIZE: usize = 200;
+
 // ============================== Bench runner ===================================
 
 struct Stats {
@@ -1230,6 +1459,20 @@ async fn run(args: RunArgs) -> Result<()> {
             .seed_query_partition(BENCH_QUERY_PK, BENCH_QUERY_PARTITION_SIZE)
             .await
             .context("seeding query partition")?;
+    }
+    if args.workload.needs_index_partition() {
+        let table = args
+            .workload
+            .index_table()
+            .expect("needs_index_partition implies index_table");
+        eprintln!(
+            "seeding index partition `{}` with {} composite rows on `{}`...",
+            BENCH_INDEX_PK, BENCH_INDEX_PARTITION_SIZE, table
+        );
+        target
+            .seed_indexed_partition(table, BENCH_INDEX_PK, BENCH_INDEX_PARTITION_SIZE)
+            .await
+            .context("seeding indexed partition")?;
     }
 
     // Build per-worker state.
@@ -1444,6 +1687,32 @@ async fn dispatch_op(
             target.query_sk_range(BENCH_QUERY_PK, 15, 34).await
         }
         Workload::QueryFiltered => target.query_filtered(BENCH_QUERY_PK).await,
+        Workload::PutLsi
+        | Workload::PutGenGsi
+        | Workload::PutDwGsi
+        | Workload::PutMultiDwGsi => {
+            let table = workload.index_table().expect("index_table set");
+            // Fresh device per (worker, counter) so the upsert path
+            // doesn't hot-spot on one row. `ts` rotates through the
+            // tier/region/score lookups so every index column gets
+            // representative data.
+            let device = format!("dev-w{worker_id:02}-{}", counter / 1024);
+            let ts = counter as i64;
+            target.put_indexed(table, &device, ts).await
+        }
+        Workload::QueryLsi => {
+            let table = workload.index_table().expect("index_table set");
+            // 20-wide range over the 200-row partition.
+            target.query_lsi(table, BENCH_INDEX_PK, 80, 99).await
+        }
+        Workload::QueryGenGsi => {
+            let table = workload.index_table().expect("index_table set");
+            target.query_gsi(table, "by_tier_score", "gold", 0, 199).await
+        }
+        Workload::QueryDwGsi => {
+            let table = workload.index_table().expect("index_table set");
+            target.query_gsi(table, "by_tier_score", "gold", 0, 199).await
+        }
     }
 }
 
@@ -1526,6 +1795,13 @@ fn workload_label(w: Workload) -> &'static str {
         Workload::QueryPkOnly => "Query (pk-only)",
         Workload::QuerySkRange => "Query (sk range)",
         Workload::QueryFiltered => "Query (pk + filter)",
+        Workload::PutLsi => "PutItem (table with 1 LSI)",
+        Workload::PutGenGsi => "PutItem (table with 1 CT-time GSI)",
+        Workload::PutDwGsi => "PutItem (table with 1 DualWrite GSI)",
+        Workload::PutMultiDwGsi => "PutItem (table with 3 DualWrite GSIs)",
+        Workload::QueryLsi => "Query (LSI by_device_score)",
+        Workload::QueryGenGsi => "Query (Generated GSI by_tier_score)",
+        Workload::QueryDwGsi => "Query (DualWrite GSI by_tier_score)",
     }
 }
 
@@ -1599,11 +1875,293 @@ async fn setup_ddb_local(endpoint: &str, table: &str) -> Result<()> {
     Ok(())
 }
 
+/// PLAN-9/11 index-bench setup. Idempotently creates four tables on
+/// rektifier, waiting until every declared / requested index reaches
+/// IndexStatus=ACTIVE:
+/// - `bench_lsi`: composite PK `(device_id S, ts N)` + LSI
+///   `by_device_score` on sort attr `score N`.
+/// - `bench_gen_gsi`: composite PK `(device_id S, ts N)` + CT-time
+///   GSI `by_tier_score` on `(tier S, score N)`.
+/// - `bench_dw_gsi`: composite PK `(device_id S, ts N)`. The GSI
+///   `by_tier_score` is added via UpdateTable.Create after the table
+///   exists (so the GSI rides the DualWrite path).
+/// - `bench_multi_dw_gsi`: same shape; UpdateTable.Create adds three
+///   GSIs (`by_tier_score`, `by_region_score`, `by_bucket_score`).
+async fn setup_index_tables(rektifier_url: &str) -> Result<()> {
+    let client = http_client();
+    // Helper for raw DDB call.
+    async fn call(
+        client: &reqwest::Client,
+        url: &str,
+        target: &str,
+        body: &Value,
+    ) -> Result<(reqwest::StatusCode, String)> {
+        let resp = client
+            .post(url)
+            .header("X-Amz-Target", target)
+            .header("Content-Type", "application/x-amz-json-1.0")
+            .header(
+                "Authorization",
+                "AWS4-HMAC-SHA256 Credential=local/20260101/us-east-1/dynamodb/aws4_request, \
+                 SignedHeaders=content-type;host;x-amz-target, Signature=deadbeef",
+            )
+            .body(body.to_string())
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        Ok((status, text))
+    }
+    // CreateTable idempotently. ResourceInUseException is benign.
+    async fn create_table(
+        client: &reqwest::Client,
+        url: &str,
+        body: &Value,
+    ) -> Result<()> {
+        let (st, text) = call(client, url, "DynamoDB_20120810.CreateTable", body).await?;
+        if st.is_success()
+            || text.contains("ResourceInUseException")
+            || text.contains("already exists")
+        {
+            return Ok(());
+        }
+        bail!("CreateTable failed ({st}): {text}");
+    }
+    // UpdateTable.GlobalSecondaryIndexUpdates.Create idempotently.
+    async fn add_dw_gsis(
+        client: &reqwest::Client,
+        url: &str,
+        table: &str,
+        gsis: Vec<Value>,
+        attr_defs: Vec<Value>,
+    ) -> Result<()> {
+        // DDB's UpdateTable accepts a single Create per call; loop one
+        // by one and ignore "already exists" responses.
+        for gsi in gsis {
+            let body = json!({
+                "TableName": table,
+                "AttributeDefinitions": attr_defs.clone(),
+                "GlobalSecondaryIndexUpdates": [{"Create": gsi}],
+            });
+            let (st, text) = call(client, url, "DynamoDB_20120810.UpdateTable", &body).await?;
+            if st.is_success()
+                || text.contains("already exists")
+                || text.contains("ResourceInUseException")
+            {
+                continue;
+            }
+            bail!("UpdateTable.Create failed ({st}): {text}");
+        }
+        Ok(())
+    }
+    async fn wait_active(
+        client: &reqwest::Client,
+        url: &str,
+        table: &str,
+        gsi_names: &[&str],
+    ) -> Result<()> {
+        for _ in 0..60 {
+            let body = json!({"TableName": table});
+            let (st, text) =
+                call(client, url, "DynamoDB_20120810.DescribeTable", &body).await?;
+            if !st.is_success() {
+                bail!("DescribeTable failed ({st}): {text}");
+            }
+            let v: Value = serde_json::from_str(&text)?;
+            let table_v = &v["Table"];
+            let table_status = table_v["TableStatus"].as_str().unwrap_or("");
+            let all_gsis_active = gsi_names.iter().all(|name| {
+                table_v["GlobalSecondaryIndexes"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter().any(|g| {
+                            g["IndexName"].as_str() == Some(*name)
+                                && g["IndexStatus"].as_str() == Some("ACTIVE")
+                        })
+                    })
+                    .unwrap_or(false)
+            });
+            if table_status == "ACTIVE" && all_gsis_active {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        bail!("waited 30s for `{table}` + GSIs {gsi_names:?} to reach ACTIVE");
+    }
+
+    eprintln!("setup-index-tables: creating bench_lsi…");
+    create_table(
+        &client,
+        rektifier_url,
+        &json!({
+            "TableName": "bench_lsi",
+            "AttributeDefinitions": [
+                {"AttributeName":"device_id","AttributeType":"S"},
+                {"AttributeName":"ts","AttributeType":"N"},
+                {"AttributeName":"score","AttributeType":"N"},
+            ],
+            "KeySchema": [
+                {"AttributeName":"device_id","KeyType":"HASH"},
+                {"AttributeName":"ts","KeyType":"RANGE"},
+            ],
+            "LocalSecondaryIndexes": [{
+                "IndexName": "by_device_score",
+                "KeySchema": [
+                    {"AttributeName":"device_id","KeyType":"HASH"},
+                    {"AttributeName":"score","KeyType":"RANGE"},
+                ],
+                "Projection": {"ProjectionType":"ALL"},
+            }],
+            "BillingMode": "PAY_PER_REQUEST",
+        }),
+    )
+    .await?;
+    wait_active(&client, rektifier_url, "bench_lsi", &[]).await?;
+
+    eprintln!("setup-index-tables: creating bench_gen_gsi…");
+    create_table(
+        &client,
+        rektifier_url,
+        &json!({
+            "TableName": "bench_gen_gsi",
+            "AttributeDefinitions": [
+                {"AttributeName":"device_id","AttributeType":"S"},
+                {"AttributeName":"ts","AttributeType":"N"},
+                {"AttributeName":"tier","AttributeType":"S"},
+                {"AttributeName":"score","AttributeType":"N"},
+            ],
+            "KeySchema": [
+                {"AttributeName":"device_id","KeyType":"HASH"},
+                {"AttributeName":"ts","KeyType":"RANGE"},
+            ],
+            "GlobalSecondaryIndexes": [{
+                "IndexName": "by_tier_score",
+                "KeySchema": [
+                    {"AttributeName":"tier","KeyType":"HASH"},
+                    {"AttributeName":"score","KeyType":"RANGE"},
+                ],
+                "Projection": {"ProjectionType":"ALL"},
+            }],
+            "BillingMode": "PAY_PER_REQUEST",
+        }),
+    )
+    .await?;
+    wait_active(&client, rektifier_url, "bench_gen_gsi", &["by_tier_score"]).await?;
+
+    eprintln!("setup-index-tables: creating bench_dw_gsi (base table, no GSI yet)…");
+    create_table(
+        &client,
+        rektifier_url,
+        &json!({
+            "TableName": "bench_dw_gsi",
+            "AttributeDefinitions": [
+                {"AttributeName":"device_id","AttributeType":"S"},
+                {"AttributeName":"ts","AttributeType":"N"},
+            ],
+            "KeySchema": [
+                {"AttributeName":"device_id","KeyType":"HASH"},
+                {"AttributeName":"ts","KeyType":"RANGE"},
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+        }),
+    )
+    .await?;
+    eprintln!("setup-index-tables: UpdateTable.Create on bench_dw_gsi (DualWrite mode)…");
+    add_dw_gsis(
+        &client,
+        rektifier_url,
+        "bench_dw_gsi",
+        vec![json!({
+            "IndexName": "by_tier_score",
+            "KeySchema": [
+                {"AttributeName":"tier","KeyType":"HASH"},
+                {"AttributeName":"score","KeyType":"RANGE"},
+            ],
+            "Projection": {"ProjectionType":"ALL"},
+        })],
+        vec![
+            json!({"AttributeName":"tier","AttributeType":"S"}),
+            json!({"AttributeName":"score","AttributeType":"N"}),
+        ],
+    )
+    .await?;
+    wait_active(&client, rektifier_url, "bench_dw_gsi", &["by_tier_score"]).await?;
+
+    eprintln!("setup-index-tables: creating bench_multi_dw_gsi…");
+    create_table(
+        &client,
+        rektifier_url,
+        &json!({
+            "TableName": "bench_multi_dw_gsi",
+            "AttributeDefinitions": [
+                {"AttributeName":"device_id","AttributeType":"S"},
+                {"AttributeName":"ts","AttributeType":"N"},
+            ],
+            "KeySchema": [
+                {"AttributeName":"device_id","KeyType":"HASH"},
+                {"AttributeName":"ts","KeyType":"RANGE"},
+            ],
+            "BillingMode": "PAY_PER_REQUEST",
+        }),
+    )
+    .await?;
+    eprintln!("setup-index-tables: UpdateTable.Create x3 on bench_multi_dw_gsi…");
+    add_dw_gsis(
+        &client,
+        rektifier_url,
+        "bench_multi_dw_gsi",
+        vec![
+            json!({
+                "IndexName": "by_tier_score",
+                "KeySchema": [
+                    {"AttributeName":"tier","KeyType":"HASH"},
+                    {"AttributeName":"score","KeyType":"RANGE"},
+                ],
+                "Projection": {"ProjectionType":"ALL"},
+            }),
+            json!({
+                "IndexName": "by_region_score",
+                "KeySchema": [
+                    {"AttributeName":"region","KeyType":"HASH"},
+                    {"AttributeName":"score","KeyType":"RANGE"},
+                ],
+                "Projection": {"ProjectionType":"ALL"},
+            }),
+            json!({
+                "IndexName": "by_bucket_score",
+                "KeySchema": [
+                    {"AttributeName":"bucket","KeyType":"HASH"},
+                    {"AttributeName":"score","KeyType":"RANGE"},
+                ],
+                "Projection": {"ProjectionType":"ALL"},
+            }),
+        ],
+        vec![
+            json!({"AttributeName":"tier","AttributeType":"S"}),
+            json!({"AttributeName":"region","AttributeType":"S"}),
+            json!({"AttributeName":"bucket","AttributeType":"N"}),
+            json!({"AttributeName":"score","AttributeType":"N"}),
+        ],
+    )
+    .await?;
+    wait_active(
+        &client,
+        rektifier_url,
+        "bench_multi_dw_gsi",
+        &["by_tier_score", "by_region_score", "by_bucket_score"],
+    )
+    .await?;
+
+    eprintln!("setup-index-tables: all four tables ready");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Run(args) => run(args).await,
         Cmd::SetupDdbLocal { endpoint, table } => setup_ddb_local(&endpoint, &table).await,
+        Cmd::SetupIndexTables { rektifier_url } => setup_index_tables(&rektifier_url).await,
     }
 }

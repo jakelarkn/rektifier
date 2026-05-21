@@ -235,6 +235,45 @@ bench-query-scan: bench-build
     ./target/release/rekt-bench run --target rektifier  --workload query-filtered --concurrency 16 --duration 10s --warmup 2s
     ./target/release/rekt-bench run --target ddb-local  --workload query-filtered --concurrency 16 --duration 10s --warmup 2s
 
+# Bench: index overhead (PLAN-9 GSI + PLAN-11 LSI). Sets up four
+# bench tables on rektifier and runs Put + Query workloads against
+# them. Rektifier-only — DDB-local / DirectPg don't model the LSI/GSI
+# DDL surface. Requires rektifier running on :9000.
+bench-index: bench-build
+    ./target/release/rekt-bench setup-index-tables
+    @echo "=========================================="
+    @echo "PutItem (no index) — baseline"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target rektifier --workload put --concurrency 16 --duration 10s --warmup 3s --working-set 200
+    @echo "=========================================="
+    @echo "PutItem (table with 1 LSI, GENERATED column)"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target rektifier --workload put-lsi --concurrency 16 --duration 10s --warmup 3s --working-set 200
+    @echo "=========================================="
+    @echo "PutItem (table with 1 CT-time GSI, GENERATED column)"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target rektifier --workload put-gen-gsi --concurrency 16 --duration 10s --warmup 3s --working-set 200
+    @echo "=========================================="
+    @echo "PutItem (table with 1 UpdateTable GSI, DualWrite mode)"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target rektifier --workload put-dw-gsi --concurrency 16 --duration 10s --warmup 3s --working-set 200
+    @echo "=========================================="
+    @echo "PutItem (table with 3 DualWrite GSIs)"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target rektifier --workload put-multi-dw-gsi --concurrency 16 --duration 10s --warmup 3s --working-set 200
+    @echo "=========================================="
+    @echo "Query through LSI (composite range)"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target rektifier --workload query-lsi --concurrency 16 --duration 10s --warmup 3s
+    @echo "=========================================="
+    @echo "Query through Generated GSI (composite range)"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target rektifier --workload query-gen-gsi --concurrency 16 --duration 10s --warmup 3s
+    @echo "=========================================="
+    @echo "Query through DualWrite GSI (composite range)"
+    @echo "=========================================="
+    ./target/release/rekt-bench run --target rektifier --workload query-dw-gsi --concurrency 16 --duration 10s --warmup 3s
+
 # SDK client tests: validate real DynamoDB SDK clients can connect to
 # rektifier. See clienttests/README.md for prerequisites. Requires
 # Maven and JDK 17 installed.
