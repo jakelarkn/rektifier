@@ -186,12 +186,22 @@ async fn gsi_emission_creates_columns_and_indexes() {
         composite_def.contains("(tier, score)"),
         "composite GSI index must be (tier, score); got: {composite_def}"
     );
+    // PLAN-12 D1: covering index — INCLUDE (data) baked in so GSI
+    // Query can use index-only scans.
+    assert!(
+        composite_def.contains("INCLUDE (data)"),
+        "composite GSI index must INCLUDE (data); got: {composite_def}"
+    );
     let hash_def = by_idx
         .get(&hash_idx)
         .unwrap_or_else(|| panic!("missing {hash_idx} in {by_idx:?}"));
     assert!(
         hash_def.contains("(owner)"),
         "hash-only GSI index must be (owner); got: {hash_def}"
+    );
+    assert!(
+        hash_def.contains("INCLUDE (data)"),
+        "hash-only GSI index must INCLUDE (data); got: {hash_def}"
     );
 
     // Idempotency.

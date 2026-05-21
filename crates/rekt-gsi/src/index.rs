@@ -90,6 +90,12 @@ pub async fn run_index_creation(
     // 2) Build the column list for the index. The state row carries
     //    `column_specs` as a JSON array; the order is partition then
     //    sort, matching the catalog's GsiSpec emission.
+    //
+    // PLAN-12 D1: emit `INCLUDE ("data")` so the index leaf carries
+    // the full JSONB payload — matches the CT-time emission shape,
+    // makes GSI Query an index-only scan. The jsonb column name is
+    // "data" everywhere in rektifier (D2); if that ever varies per
+    // table, widen the state row's `column_specs` to carry it.
     let cols = parse_index_cols(&st)?;
     let pg_table = quote(&st.pg_table);
     let idx_name = quote(&st.index_name);
@@ -99,7 +105,8 @@ pub async fn run_index_creation(
         .collect::<Vec<_>>()
         .join(", ");
     let create_sql = format!(
-        "CREATE INDEX CONCURRENTLY IF NOT EXISTS {idx_name} ON {pg_table} ({cols_sql})"
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS {idx_name} \
+         ON {pg_table} ({cols_sql}) INCLUDE (\"data\")"
     );
     // `CREATE INDEX CONCURRENTLY` cannot run inside a transaction
     // block. `batch_execute` runs each statement as its own

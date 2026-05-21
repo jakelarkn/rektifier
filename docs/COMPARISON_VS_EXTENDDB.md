@@ -283,11 +283,16 @@ plus a `CREATE INDEX` on those columns. Two modes, selected by origin:
   chunked backfill on existing rows + `CREATE INDEX CONCURRENTLY` →
   ACTIVE; pre-ACTIVE Query returns RNF (matches DDB).
 
-Reading via either mode is identical: a btree index scan followed by
-a heap fetch into the base row for any non-key attribute. KEYS_ONLY
-and INCLUDE projections don't materially help — the read still goes
-through the base heap unless PG's index-only-scan kicks in via the
-visibility map.
+Reading via either mode is identical: both indexes are *covering*
+via PG's `INCLUDE (data)` clause on `CREATE INDEX`. The index leaf
+carries the full JSONB payload alongside the key columns, so PG's
+planner picks an index-only scan and skips heap fetches entirely
+(`Heap Fetches: 0` in `EXPLAIN ANALYZE`). The trade-off — larger
+GSI btree, modest +0.05 ms p50 per-Put cost from the WAL'd payload —
+is documented in PLAN-12. The cost-of-using-the-GSI promise the
+operator sees on the wire (DDB's `Projection = ALL` semantic, which
+rektifier honors universally today) is now materialized in the
+on-disk shape.
 
 **ExtendDB**: a GSI is a **separate PG table**, `_ddb_<index_uuid>`,
 with the GSI keys as its primary identifier, the base table's keys
@@ -328,21 +333,25 @@ steady-state queue.
 
 | | extenddb | rektifier |
 |---|---|---|
-| Storage per GSI (ALL projection) | full base item, duplicated | btree leaves only, heap shared |
+| Storage per GSI (ALL projection) | full base item, duplicated | btree leaves carry the JSONB payload (covering index); ~2× heap size |
 | Add a GSI on N-row table | `CREATE TABLE` + backfill (online) | `ALTER TABLE ADD COLUMN x text NULL` (catalog-only) + async chunked backfill + `CREATE INDEX CONCURRENTLY` (online) |
-| Write amplification (3 GSIs sync) | 1 base + 3 (delete+insert) = up to 7 statements | 1 statement, 3 btree updates inline |
+| Write amplification (3 GSIs sync) | 1 base + 3 (delete+insert) = up to 7 statements | 1 statement, 3 btree updates inline (each leaf carries the JSONB) |
 | Write amplification (3 GSIs async) | 1 base + 1 queue insert | n/a — rektifier has no steady-state async path (only the one-shot backfill at GSI creation) |
-| Read on GSI w/ ALL projection | index scan → JSONB at index | index scan → btree → base heap fetch |
+| Read on GSI w/ ALL projection | index scan → JSONB at index | index-only scan over covering btree, no base heap fetch |
 | Strong-consistency GSI read | depends on sync mode | always (same MVCC snapshot) |
 | Sparse index support | yes (engine no-ops when keys missing) | yes — sparse semantics fall out of nullable columns + the `data#>>` extraction returning NULL when the attribute is absent |
 
 The architectural cost is real on extenddb's side: writes that touch
-many GSIs do meaningfully more work. The benefit is also real:
-reading wide pages from a GSI is one sequential read at the GSI
-table, not N random heap fetches at the base. DDB itself is built on
-the same trade — async, projected GSI tables — which is why
-DDB-style workloads (`PutItem occasionally, Query-by-GSI
-constantly`) line up well with extenddb's choices.
+many GSIs do meaningfully more work (delete-then-insert into the
+projected table). On rektifier, the equivalent cost is the WAL'd
+INCLUDE-payload growing each base-table btree leaf — measurable on
+PutItem (+0.05 ms p50 per GSI) but smaller than the multi-statement
+work extenddb does. On reads, the two stacks now converge: extenddb
+returns rows from a single sequential read at the GSI table;
+rektifier returns rows from an index-only scan over a covering btree.
+DDB itself is built on the same trade — async, projected GSI tables —
+which lets DDB-style workloads (`PutItem occasionally, Query-by-GSI
+constantly`) work well on either stack.
 
 ### Authentication and authorization
 
@@ -475,18 +484,24 @@ reading absolute latencies.
 | ScanLimit (20) | 3,585 | 4.27 ms | 11,125 | 1.34 ms | 3.2× |
 | QueryPkOnly | 3,108 | 4.75 ms | 11,231 | 1.33 ms | 3.6× |
 | QuerySkRange | 4,038 | 3.78 ms | 13,536 | 1.11 ms | 3.4× |
-| PutLsi | 1,857 | 8.29 ms | 10,437 | 1.48 ms | 5.6× |
-| PutGenGsi | 1,973 | 7.81 ms | 10,556 | 1.47 ms | 5.4× |
-| PutDwGsi | 1,905 | 8.02 ms | 10,413 | 1.47 ms | 5.5× |
-| PutMultiDwGsi (3 GSIs) | 1,891 | 7.96 ms | 10,131 | 1.51 ms | 5.3× |
-| QueryLsi | 2,253 | 6.87 ms | 11,908 | 1.27 ms | 5.4× |
-| QueryGenGsi | 1,748 | 8.89 ms | 895 | 17.26 ms | **0.51×** ✓ |
-| QueryDwGsi | 1,669 | 9.22 ms | 881 | 17.47 ms | **0.53×** ✓ |
-
-✓ extenddb wins on GSI Query throughput — see [Index workloads](#index-workloads).
+| PutLsi | 1,857 | 8.29 ms | 10,786 | 1.44 ms | 5.8× |
+| PutGenGsi | 1,973 | 7.81 ms | 10,294 | 1.49 ms | 5.2× |
+| PutDwGsi | 1,905 | 8.02 ms | 10,007 | 1.53 ms | 5.2× |
+| PutMultiDwGsi (3 GSIs) | 1,891 | 7.96 ms | 9,803 | 1.57 ms | 5.1× |
+| QueryLsi | 2,253 | 6.87 ms | 12,141 | 1.25 ms | 5.5× |
+| QueryGenGsi | 1,748 | 8.89 ms | 8,250 | 1.85 ms | 4.8× |
+| QueryDwGsi | 1,669 | 9.22 ms | 7,945 | 1.91 ms | 4.8× |
 
 (`extenddb p50` ratios are extenddb / rektifier — higher means
 extenddb is slower.)
+
+The rektifier indexed-Put + indexed-Query numbers above are
+post-PLAN-12 (`INCLUDE (data)` covering payload on every LSI + GSI
+index leaf, GSI Query running as an index-only scan). Pre-PLAN-12
+the GSI Query rows above measured ~895 ops/s / ~17 ms p50 each —
+extenddb won that workload class by ~2×. The covering-index change
+closed and reversed the gap: rektifier now leads on GSI Query for
+the bench shape captured here.
 
 ### Index workloads
 
@@ -510,24 +525,50 @@ not an architectural difference: GSI work is queued via
 `gsi_queue` on extenddb (so per-GSI cost is ~zero, as expected)
 but the request still pays a transactional envelope.
 
-**Indexed Query on a GSI is ~2× faster on extenddb.** This is the
-only workload class in the comparison where extenddb wins on
-absolute throughput, and it's exactly the architectural
+**Indexed Query on a GSI is ~4.8× faster on rektifier (after
+PLAN-12).** This was originally going to be the one workload class
+where extenddb won on absolute throughput. The architectural
 prediction: rektifier's GSI is a btree on the base table, so a
-50-row GSI Query does 50 base-table heap fetches; extenddb's GSI
-is a separate `_ddb_<idx_uuid>` table with the projected items
-already there, so the same Query is one sequential scan of 50
-rows. extenddb Query-on-GSI ran at ~1,700 ops/sec / ~9 ms p50;
-rektifier at ~890 ops/sec / ~17 ms p50. CT-time vs UpdateTable
-GSI is indistinguishable on read for both stacks. Wider results
-(100s–1000s of rows per Query) should make the gap larger — the
-rektifier cost scales with N (heap fetches) while extenddb stays
-flat (sequential scan). A partition-size sweep is future work.
+50-row GSI Query should do 50 base-table heap fetches; extenddb's
+GSI is a separate `_ddb_<idx_uuid>` table with the projected items
+already there, so the same Query should be one sequential scan of
+50 rows. The first capture (pre-PLAN-12) matched that prediction:
+extenddb 1,748 ops/sec, rektifier 895 ops/sec.
 
-LSI Query stays in the same 5.4× band as every other extenddb
-bounded read; the LSI advantage doesn't apply because rektifier's
-LSI hits a composite-PK-like btree on the base table without the
-random-fetch penalty.
+PLAN-12 closed the gap by emitting `INCLUDE (data)` on every LSI +
+GSI `CREATE INDEX`. PG's planner now picks index-only scans for
+GSI Query (Heap Fetches = 0); the index leaf carries the JSONB
+payload alongside the key columns, so the 50-row Query is served
+by a btree walk without touching the base heap. Post-PLAN-12
+numbers: rektifier 8,250 ops/sec / 1.85 ms p50 (`query-gen-gsi`)
+and 7,945 ops/sec / 1.91 ms p50 (`query-dw-gsi`).
+
+The architectural shapes converge: extenddb materializes the
+projection in a side table; rektifier materializes the projection
+inside the base table's GSI btree leaves. Both store the JSONB
+twice (once in base, once in the GSI). Both serve the read from
+contiguous pages. CT-time vs UpdateTable GSI is indistinguishable
+on read for both stacks.
+
+The win comes with two operational dependencies that don't bite
+extenddb's design:
+1. PG's visibility map must be current for the index-only scan to
+   avoid the heap-fetch fallback. autovacuum keeps it current
+   under typical load; intense write bursts can transiently push
+   the planner back to the slow path. Documented in PLAN-12.
+2. Index size roughly doubles vs the non-covering shape (the
+   JSONB payload lands in every leaf). For multi-KB items the
+   PG-level TOAST machinery kicks in and the covering benefit
+   evaporates; PLAN-12's deferred follow-up (projection-aware
+   INCLUDE — emit `INCLUDE` only over `NonKeyAttributes` for
+   INCLUDE-projection GSIs) is the lever for large-item workloads.
+
+LSI Query stays in the same ~5.5× band as every other extenddb
+bounded read — both pre- and post-PLAN-12, since the LSI was
+already fast on rektifier (matching rows clustered on adjacent
+heap pages by base-PK construction). The covering payload on LSI
+indexes is a small win at this row count + a hedge for non-
+clustered LSI workloads.
 
 
 ### Where the gap comes from
@@ -593,20 +634,29 @@ extraction, account-scoped catalog lookup, IAM bypass overhead).
   Production-mode latency is meaningfully higher than the bypass
   numbers in this doc.
 
-### One workload where extenddb wins, in theory
+### Workloads where the GSI-table shape could still win
 
-The wide-Query-on-GSI scenario where extenddb's projected GSI
-table earns its keep:
+PLAN-12's covering-index approach closes the small-item gap, but
+two scenarios still favor extenddb's projected-table design:
 
-> 100 M base rows, `Query(IndexName=byEmail)` returns 100 rows under
-> one email. Rektifier: 100 random heap fetches into the base table.
-> ExtendDB: 100 sequential reads on `_ddb_<gsi_uuid>`, projected
-> item already there.
+1. **Large items (>2 KB JSONB).** PG TOASTs the JSONB inline in
+   the index leaf at that size — the leaf carries a TOAST pointer,
+   and a covering scan still chases the TOAST relation. ExtendDB's
+   GSI table stores the projected item directly (no TOAST chain in
+   the read path for typical projections). The lever on rektifier's
+   side is projection-aware INCLUDE — materialize only
+   `NonKeyAttributes` columns into the index — which is a deferred
+   PLAN-12 follow-up.
+2. **Heavy write contention against the visibility map.** Sustained
+   high-write workloads can lag the autovacuum visibility-map
+   refresh, pushing the PG planner back to bitmap + heap-fetch.
+   ExtendDB's projected table doesn't depend on the visibility map
+   at all. The lever on rektifier's side is operator-side
+   autovacuum tuning (lower thresholds for the GSI tables).
 
-We haven't benchmarked this directly because the rektifier perf
-captures don't include a GSI workload at that scale. The
-architectural argument is sound (and matches DDB's own design)
-but the empirical demonstration is future work.
+We haven't directly benchmarked either scenario; the bench items
+are 256 B, well under TOAST, and the bench runs include an explicit
+VACUUM step. Future work.
 
 ## Tradeoffs and when to pick which
 

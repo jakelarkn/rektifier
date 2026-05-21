@@ -1,10 +1,23 @@
 # Index bench: LSI + GSI (Generated + DualWrite)
 
-Captured 2026-05-21 with `rekt-bench` after PLAN-9 (G1–G9) and
-PLAN-11 (L1–L6) landed. Companion to `baseline.md` (Put/Get),
-`update-baseline.md`, and `crud-conditional-baseline.md`. Subject:
-how much per-write overhead does each kind of secondary index add,
-and how do reads through the three index shapes compare.
+Captured 2026-05-21 with `rekt-bench` after PLAN-9 (G1–G9),
+PLAN-11 (L1–L6), and PLAN-12 (covering-index INCLUDE clause)
+landed. Companion to `baseline.md` (Put/Get), `update-baseline.md`,
+and `crud-conditional-baseline.md`. Subject: how much per-write
+overhead does each kind of secondary index add, and how do reads
+through the three index shapes compare.
+
+> **History note (2026-05-21):** the first capture below ran with
+> the original `CREATE INDEX … (key_cols)` shape. GSI Query then
+> measured 17 ms p50 / 895 ops/s — PG performed a regular index
+> scan followed by 50 random heap fetches per call, which dominated
+> latency. PLAN-12 added `INCLUDE (<jsonb_col>)` to every LSI + GSI
+> emission, turning the index leaf into a covering index. The
+> second capture (current numbers) shows GSI Query at ~1.9 ms p50,
+> ~8k ops/s — index-only scans eliminate the heap fetches. The
+> bench-table rows are truncated + VACUUM'd between sweeps so PG's
+> visibility map is current (without a fresh VACUUM the planner
+> falls back to heap fetches and the win disappears).
 
 ## Setup
 
@@ -45,19 +58,19 @@ and how do reads through the three index shapes compare.
 
 | Workload | ops/sec | p50 | p90 | p99 | p999 |
 |---|---:|---:|---:|---:|---:|
-| `put` (baseline, no index) | 10,914 | 1.43 | 1.88 | 2.50 | 3.70 |
-| `put-lsi` (1 LSI, GENERATED) | 10,437 | 1.48 | 1.96 | 2.69 | 3.98 |
-| `put-gen-gsi` (1 CT-time GSI, GENERATED) | 10,556 | 1.47 | 1.94 | 2.64 | 4.75 |
-| `put-dw-gsi` (1 UpdateTable GSI, DualWrite) | 10,413 | 1.47 | 1.98 | 2.96 | 5.74 |
-| `put-multi-dw-gsi` (3 UpdateTable GSIs) | 10,131 | 1.51 | 2.01 | 2.78 | 4.85 |
+| `put` (baseline, no index) | 10,967 | 1.42 | 1.85 | 2.59 | 4.20 |
+| `put-lsi` (1 LSI, GENERATED, covering) | 10,786 | 1.44 | 1.89 | 2.67 | 3.88 |
+| `put-gen-gsi` (1 CT-time GSI, GENERATED, covering) | 10,294 | 1.49 | 2.00 | 2.81 | 4.49 |
+| `put-dw-gsi` (1 UpdateTable GSI, DualWrite, covering) | 10,007 | 1.53 | 2.07 | 2.96 | 5.39 |
+| `put-multi-dw-gsi` (3 UpdateTable GSIs, covering) | 9,803 | 1.57 | 2.13 | 3.04 | 4.26 |
 
-### Query (read-path through each index shape)
+### Query (read-path through each index shape, post-VACUUM)
 
 | Workload | ops/sec | p50 | p90 | p99 | p999 | rows returned |
 |---|---:|---:|---:|---:|---:|---:|
-| `query-lsi` | 11,908 | 1.27 | 1.79 | 2.79 | 6.22 | 20 |
-| `query-gen-gsi` | 895 | 17.26 | 23.66 | 30.54 | 39.01 | 50 |
-| `query-dw-gsi` | 881 | 17.47 | 24.29 | 32.45 | 43.52 | 50 |
+| `query-lsi` | 12,141 | 1.25 | 1.73 | 2.71 | 6.17 | 20 |
+| `query-gen-gsi` | 8,250 | 1.85 | 2.58 | 3.73 | 7.15 | ~50 |
+| `query-dw-gsi` | 7,945 | 1.91 | 2.69 | 4.04 | 7.84 | ~50 |
 
 ## Observations
 
@@ -96,24 +109,61 @@ btree maintenance).
 Operators sizing capacity for many-GSI tables should plan PG-side
 WAL volume + index page maintenance, not extra rektifier overhead.
 
-### LSI Query is fast; GSI Query at this seed shape returns more rows
+### LSI + GSI Query are now all fast (covering indexes)
 
-`query-lsi` runs at the same shape as `query-sk-range` from the
-prior baseline (~12k ops/sec, p50 ~1.3 ms) — the LSI's composite
-btree (`device_id, score`) is hit identically to the base table's
-composite PK btree.
+After PLAN-12, every Query path is dominated by the rektifier
+HTTP/dispatch envelope rather than PG heap fetches:
 
-`query-gen-gsi` and `query-dw-gsi` look slow (~900 ops/sec, p50
-17 ms) because of the seeded partition shape: 200 rows × 4 tiers
-means each tier=:gold query returns ~50 rows (vs 20 for the LSI
-range). The per-row JSONB read + heap fetch + HTTP serialization
-dominates; the index hit itself is cheap (visible in the consistent
-sub-25 ms p90).
+- `query-lsi` (20 rows): ~1.25 ms p50, ~12k ops/sec — unchanged
+  shape. The LSI was already fast because matching rows clustered
+  on adjacent heap pages by construction.
+- `query-gen-gsi` / `query-dw-gsi` (~50 rows each): ~1.9 ms p50,
+  ~8k ops/sec. The 0.6 ms gap vs `query-lsi` tracks the row-count
+  delta (50 vs 20) — per-row dispatch + JSON serialization is the
+  remaining cost, not the index.
 
-The two GSI modes are **statistically indistinguishable** on read,
-as designed: both materialize as a column + btree, and the Query
-SQL is identical. The 0.21 ms gap between `query-gen-gsi` and
-`query-dw-gsi` p50 is well inside run-to-run noise.
+The two GSI modes (Generated vs DualWrite) are statistically
+indistinguishable, as designed: both materialize as a column +
+btree + INCLUDE-(data) covering payload. The 0.06 ms gap between
+`query-gen-gsi` and `query-dw-gsi` p50 is inside run-to-run noise.
+
+### PLAN-12 INCLUDE: read-side 9×, write-side ≈ free
+
+Adding `INCLUDE (data)` to every LSI + GSI `CREATE INDEX`
+statement bakes the JSONB payload into the index leaf. PG's planner
+picks index-only scans (Heap Fetches: 0) when the visibility map is
+current — observable via `EXPLAIN ANALYZE` and confirmed end-to-end
+in the benchmark.
+
+The cost on the write side is small and roughly proportional to
+the leaf payload growth:
+
+- One LSI: -0.04 ms p50 (within noise; the LSI was already cheap
+  to maintain). +3% throughput vs the pre-PLAN-12 measurement.
+- One CT-time / UpdateTable GSI: +0.02 to +0.06 ms p50. -2 to -4%
+  throughput.
+- Three DualWrite GSIs: +0.06 ms p50. -3% throughput.
+
+The PG-side cost is the index leaf growing from ~30 bytes
+(key + ctid) to ~30 + 256 bytes (key + ctid + JSONB payload). WAL
+volume scales with payload size; for the 256-byte items in this
+bench the effect is small. Operators with much larger items
+(multi-KB) should expect the write-side cost to grow proportionally
+and may eventually want PLAN-12's follow-up option (projection-
+aware INCLUDE — emit `INCLUDE` only over the operator-declared
+`NonKeyAttributes` for INCLUDE-projection GSIs).
+
+### Visibility-map dependence
+
+Index-only scans require PG's visibility map to mark pages as
+all-visible. Newly-inserted rows are not in all-visible pages
+until autovacuum runs. The bench's pre-Query VACUUM step is
+explicit; in production, autovacuum tuning matters for sustained
+GSI Query performance. The win does not disappear on heavily-
+written tables — autovacuum keeps the visibility map current
+under typical load — but workloads with intense write bursts may
+see the heap-fetch fallback transiently. Documented in
+PLAN-12-covering-indexes.md.
 
 ### No mode-discrimination at runtime
 
@@ -121,18 +171,12 @@ The dispatcher routes `Query` requests with `IndexName` through the
 same `resolve_index_for_query` resolver regardless of mode. PG's
 planner sees the same shape (`WHERE col = $1 AND col2 BETWEEN $2
 AND $3`) regardless of whether the column was declared `GENERATED
-ALWAYS AS` or populated by dual-write SQL. The benchmark numbers
-above are the predicted consequence.
+ALWAYS AS` or populated by dual-write SQL, and regardless of
+INCLUDE-clause presence (the SELECT shape is identical). The
+benchmark numbers above are the predicted consequence.
 
 ## Caveats
 
-- 200-row partition is small enough that PG's planner may favor a
-  bitmap or sequential scan over the index for queries returning a
-  large fraction of the partition. The +17 ms p50 for the GSI
-  queries doesn't isolate index-walk cost — it's dominated by
-  rendering 50 items per response. A larger partition (10k+ rows)
-  with a more selective predicate would isolate the index-walk cost
-  more cleanly; deferred for a future capture.
 - Bench tables are intentionally schemaless beyond their declared
   key columns. Real workloads with sparse attribute coverage may
   see slightly different per-row write cost from the GENERATED /
@@ -149,6 +193,18 @@ above are the predicted consequence.
   table; rektifier inherits the same ceiling. Per D15, 20 active
   indexes is approximately a 100% PutItem-latency increase — PG's
   index-maintenance cost, not rektifier's.
+- Re-running Put workloads against the same tables across
+  iterations accumulates rows, growing the partition the Query
+  workloads later scan. The numbers above use truncate + VACUUM
+  between Put and Query sweeps; without that, GSI Query slows
+  proportionally to the accumulated row count (each call returns
+  more matching rows; per-row JSON serialization dominates).
+- The covering-index win is measured at 256 B item size. JSONB > ~2
+  KB is TOASTed in both heap and index leaf, at which point the
+  index leaf holds a TOAST pointer and the "savings" from
+  INCLUDE evaporate (PG still chases the TOAST relation). PLAN-12
+  documents the trade and notes the projection-aware INCLUDE
+  follow-up as the lever for operators with large items.
 
 ## Reproducing
 
@@ -157,10 +213,26 @@ just up                                                            # docker
 REKTIFIER_CONFIG=rektifier.toml.example cargo run --release --bin rektifier &
 just bootstrap-tables                                              # users + device_events (baseline Put needs this)
 ./target/release/rekt-bench setup-index-tables                     # bench_lsi + bench_gen_gsi + bench_dw_gsi + bench_multi_dw_gsi
-# Each workload, 10 s + 3 s warmup, concurrency 16:
-for w in put put-lsi put-gen-gsi put-dw-gsi put-multi-dw-gsi \
-         query-lsi query-gen-gsi query-dw-gsi; do
+
+# Put workloads: 10 s + 3 s warmup, concurrency 16. Truncate before
+# each pass so the Query measurements that follow operate on a
+# clean partition seeded only by `seed_indexed_partition`.
+for t in rekt_t_bench_lsi rekt_t_bench_gen_gsi rekt_t_bench_dw_gsi rekt_t_bench_multi_dw_gsi; do
+    docker exec rektifier-postgres psql -U rektifier -d rektifier -c "TRUNCATE $t;"
+done
+for w in put put-lsi put-gen-gsi put-dw-gsi put-multi-dw-gsi; do
     ./target/release/rekt-bench run --target rektifier --workload $w \
         --duration 10s --warmup 3s --concurrency 16 --working-set 200
+done
+
+# Query workloads need the visibility map current for index-only
+# scans, so TRUNCATE + VACUUM between Put and Query sweeps.
+for t in rekt_t_bench_lsi rekt_t_bench_gen_gsi rekt_t_bench_dw_gsi; do
+    docker exec rektifier-postgres psql -U rektifier -d rektifier -c "TRUNCATE $t;"
+    docker exec rektifier-postgres psql -U rektifier -d rektifier -At -c "VACUUM ANALYZE $t;"
+done
+for w in query-lsi query-gen-gsi query-dw-gsi; do
+    ./target/release/rekt-bench run --target rektifier --workload $w \
+        --duration 10s --warmup 3s --concurrency 16
 done
 ```

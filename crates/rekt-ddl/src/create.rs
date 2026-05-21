@@ -128,13 +128,22 @@ pub fn create_table_sql(plan: &CreateTablePlan, pg_table: &str) -> String {
         cols = cols.join(",\n")
     );
 
+    // PLAN-12 D1. Covering-index payload: every LSI + GSI index leaf
+    // carries the full JSONB payload via `INCLUDE (<jsonb_col>)`.
+    // PG's planner picks index-only scans for Query-style SELECTs
+    // (subject to the visibility map being current), eliminating
+    // heap fetches on indexed reads. Matches the "Projection always
+    // behaves as ALL" wire-level semantics — the index now physically
+    // delivers what the wire contract promises.
+    let include_clause = format!("INCLUDE ({})", plan.jsonb_col);
+
     // PLAN-11 L2: per-LSI btree index on (base_pk, lsi_sort_col). Same
     // batch as CREATE TABLE so both rows + indexes commit atomically.
     // IF NOT EXISTS keeps the block idempotent for crash recovery.
     for lsi in &plan.lsis {
         let idx_name = derive_lsi_index_name(pg_table, &lsi.name);
         sql.push_str(&format!(
-            "CREATE INDEX IF NOT EXISTS {idx} ON {pg_table} ({pk}, {sk});\n",
+            "CREATE INDEX IF NOT EXISTS {idx} ON {pg_table} ({pk}, {sk}) {include_clause};\n",
             idx = idx_name,
             pk = plan.pk_attr,
             sk = lsi.sort_attr,
@@ -152,7 +161,7 @@ pub fn create_table_sql(plan: &CreateTablePlan, pg_table: &str) -> String {
             Some(s) => format!("{}, {}", gsi.partition_attr, s),
         };
         sql.push_str(&format!(
-            "CREATE INDEX IF NOT EXISTS {idx_name} ON {pg_table} ({cols});\n"
+            "CREATE INDEX IF NOT EXISTS {idx_name} ON {pg_table} ({cols}) {include_clause};\n"
         ));
     }
 
@@ -310,13 +319,15 @@ mod tests {
     fn lsi_indexes_emitted_after_create_table() {
         let p = plan_with_two_lsis();
         let sql = create_table_sql(&p, "rekt_t_events");
+        // PLAN-12 D1: covering-index INCLUDE clause carries the
+        // JSONB payload in the index leaf for index-only scans.
         assert!(sql.contains(
             "CREATE INDEX IF NOT EXISTS rekt_t_events_lsi_by_status_idx \
-             ON rekt_t_events (device, status);"
+             ON rekt_t_events (device, status) INCLUDE (data);"
         ));
         assert!(sql.contains(
             "CREATE INDEX IF NOT EXISTS rekt_t_events_lsi_by_priority_idx \
-             ON rekt_t_events (device, priority);"
+             ON rekt_t_events (device, priority) INCLUDE (data);"
         ));
         // CREATE TABLE precedes the CREATE INDEX statements in the block.
         let table_pos = sql.find("CREATE TABLE").unwrap();

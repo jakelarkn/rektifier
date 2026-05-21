@@ -198,10 +198,19 @@ async fn lsi_emission_creates_columns_and_indexes() {
         priority_def.contains("(device, priority)"),
         "priority index must be on (device, priority); got: {priority_def}"
     );
+    // PLAN-12 D1: LSIs are covering indexes too.
+    assert!(
+        priority_def.contains("INCLUDE (data)"),
+        "priority LSI index must INCLUDE (data); got: {priority_def}"
+    );
     let tier_def = index_defs
         .get(&expected_tier_idx)
         .unwrap_or_else(|| panic!("missing index {expected_tier_idx} in {index_defs:?}"));
     assert!(tier_def.contains("(device, tier)"));
+    assert!(
+        tier_def.contains("INCLUDE (data)"),
+        "tier LSI index must INCLUDE (data); got: {tier_def}"
+    );
 
     // Idempotency: re-issuing the same block is a no-op (matches the
     // crash-recovery contract per D9).

@@ -140,6 +140,21 @@ async fn full_lifecycle_drives_to_active() {
         .expect("pg_index lookup");
     let indisvalid: bool = row.get(0);
     assert!(indisvalid, "index must be VALID after G6");
+    // PLAN-12 D1: DualWrite-mode CREATE INDEX CONCURRENTLY also
+    // emits INCLUDE (data) so the GSI Query can use index-only scans.
+    let row = client
+        .query_one(
+            "SELECT indexdef FROM pg_indexes \
+              WHERE schemaname = current_schema() AND indexname = $1",
+            &[&format!("{pg_table}_gsi_by_tier_idx")],
+        )
+        .await
+        .expect("pg_indexes lookup");
+    let indexdef: String = row.get(0);
+    assert!(
+        indexdef.contains("INCLUDE (data)"),
+        "DualWrite GSI index must INCLUDE (data); got: {indexdef}"
+    );
 
     // Catalog row: gsi_specs[0].serveable now true.
     let row = client

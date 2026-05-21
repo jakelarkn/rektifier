@@ -150,9 +150,11 @@ separate PG tables with optional async maintenance. Rektifier extracts
 keys via `GENERATED ALWAYS AS` (for CreateTable-time GSIs/LSIs) or via
 a dual-write SQL path + async chunked backfill + `CREATE INDEX
 CONCURRENTLY` (for GSIs added later via `UpdateTable`) — both online.
-Per-request latency runs roughly 3–5× lower than ExtendDB on the same
-PG 17 host, with the largest gaps on ALL_OLD returns and single-
-statement UpdateItem paths. Full breakdown:
+GSI indexes carry an `INCLUDE (data)` covering payload so GSI Query
+runs as an index-only scan with no heap fetches. Per-request latency
+runs roughly 3–5× lower than ExtendDB on the same PG 17 host, with
+the largest gaps on ALL_OLD returns and single-statement UpdateItem
+paths. Full breakdown:
 [`docs/COMPARISON_VS_EXTENDDB.md`](./docs/COMPARISON_VS_EXTENDDB.md).
 
 ## Testing
