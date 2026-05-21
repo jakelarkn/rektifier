@@ -180,6 +180,43 @@ pub struct LsiSpec {
     pub unserveable_reason: Option<String>,
 }
 
+/// PLAN-9 D17. Per-GSI column-population mode, selected at GSI birth
+/// from the request origin and immutable thereafter.
+///
+/// - `Generated`: CreateTable-time GSI. PG owns the JSONB→column
+///   invariant via `GENERATED ALWAYS AS (data#>>{path,T}) STORED`.
+///   No app-side dual-write code is needed. The GSI is ACTIVE
+///   immediately on CreateTable return.
+/// - `DualWrite`: UpdateTable.Create-time GSI. Regular column;
+///   rektifier populates it on every INSERT/UPDATE. The async
+///   lifecycle in `_rektifier_gsi_state` (declared → adding_column
+///   → backfilling → indexing → active) governs queryability.
+///
+/// Persisted as the lowercase variant name in
+/// `_rektifier_tables.gsi_specs[*].mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GsiMode {
+    Generated,
+    DualWrite,
+}
+
+impl GsiMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Generated => "generated",
+            Self::DualWrite => "dual_write",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "generated" => Some(Self::Generated),
+            "dual_write" => Some(Self::DualWrite),
+            _ => None,
+        }
+    }
+}
+
 /// PLAN-9 G1. Per-GSI cache state — the GSI analog of `LsiSpec`.
 /// `partition_attr` is required (every GSI has a HASH); `sort_attr`
 /// is optional (DDB permits hash-only GSIs). Each attribute name
@@ -197,6 +234,9 @@ pub struct GsiSpec {
     pub index_name: String,
     pub projection_type: Option<String>,
     pub projection_non_key_attrs: Option<Vec<String>>,
+    /// PLAN-9 D17. Mode at GSI birth — Generated for CT-time,
+    /// DualWrite for UpdateTable.Create. Immutable.
+    pub mode: GsiMode,
     /// Reconciler-driven gate (PLAN-9 D7 / G8). When `false`,
     /// Query/Scan with this IndexName returns RNF at dispatch.
     pub serveable: bool,
@@ -416,5 +456,16 @@ mod tests {
         let b = c.get("alpha").unwrap();
         // Same underlying Arc payload — get is pointer-cheap.
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    /// PLAN-9 D17. Mode round-trips through the wire string used to
+    /// persist it inside `_rektifier_tables.gsi_specs[*].mode`.
+    #[test]
+    fn gsi_mode_string_round_trip() {
+        assert_eq!(GsiMode::Generated.as_str(), "generated");
+        assert_eq!(GsiMode::DualWrite.as_str(), "dual_write");
+        assert_eq!(GsiMode::parse("generated"), Some(GsiMode::Generated));
+        assert_eq!(GsiMode::parse("dual_write"), Some(GsiMode::DualWrite));
+        assert_eq!(GsiMode::parse("nonsense"), None);
     }
 }

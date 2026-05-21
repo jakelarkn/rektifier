@@ -24,7 +24,7 @@
 //! ops on table Y.
 
 use crate::{
-    metadata, CatalogError, CatalogSnapshot, GsiSpec, LsiSpec, TableCatalog, TableEntry,
+    metadata, CatalogError, CatalogSnapshot, GsiMode, GsiSpec, LsiSpec, TableCatalog, TableEntry,
     TableStatus,
 };
 use std::collections::HashMap as HMap;
@@ -464,7 +464,9 @@ fn check_gsi(
     columns: &[ColumnInfo],
     index_defs: &HMap<String, String>,
 ) -> GsiSpec {
-    if let Some(reason) = check_key_column(columns, &gsi.partition_pg_col, gsi.partition_type) {
+    if let Some(reason) =
+        check_gsi_column(columns, &gsi.partition_pg_col, gsi.partition_type, gsi.mode)
+    {
         return GsiSpec {
             serveable: false,
             unserveable_reason: Some(format!("GSI `{}` partition column: {reason}", gsi.name)),
@@ -472,7 +474,7 @@ fn check_gsi(
         };
     }
     if let (Some(sa), Some(st)) = (&gsi.sort_pg_col, gsi.sort_type) {
-        if let Some(reason) = check_key_column(columns, sa, st) {
+        if let Some(reason) = check_gsi_column(columns, sa, st, gsi.mode) {
             return GsiSpec {
                 serveable: false,
                 unserveable_reason: Some(format!("GSI `{}` sort column: {reason}", gsi.name)),
@@ -529,8 +531,32 @@ fn check_jsonb_column(columns: &[ColumnInfo], jsonb_col: &str) -> Option<String>
 
 /// Same shape check the legacy `rekt_meta::verify` did, but returns the
 /// reason string instead of constructing a typed error: the reconciler
-/// stores it in `_rektifier_tables.unserveable_reason`.
+/// stores it in `_rektifier_tables.unserveable_reason`. Asserts the
+/// column is GENERATED — used for base PK/SK + LSI sort columns +
+/// Generated-mode GSI columns.
 fn check_key_column(columns: &[ColumnInfo], col_name: &str, key_type: KeyType) -> Option<String> {
+    check_column_with_mode(columns, col_name, key_type, /*must_be_generated=*/ true)
+}
+
+/// PLAN-9 G1 extension. Mode-aware GSI column check: DualWrite-mode GSI
+/// columns are regular (`is_generated = "NEVER"`); Generated-mode are
+/// GENERATED ALWAYS.
+fn check_gsi_column(
+    columns: &[ColumnInfo],
+    col_name: &str,
+    key_type: KeyType,
+    mode: GsiMode,
+) -> Option<String> {
+    let must_be_generated = matches!(mode, GsiMode::Generated);
+    check_column_with_mode(columns, col_name, key_type, must_be_generated)
+}
+
+fn check_column_with_mode(
+    columns: &[ColumnInfo],
+    col_name: &str,
+    key_type: KeyType,
+    must_be_generated: bool,
+) -> Option<String> {
     let Some(col) = columns.iter().find(|c| c.name == col_name) else {
         return Some(format!("column `{col_name}`: missing"));
     };
@@ -545,10 +571,16 @@ fn check_key_column(columns: &[ColumnInfo], col_name: &str, key_type: KeyType) -
             col.data_type
         ));
     }
-    if col.is_generated != "ALWAYS" {
+    if must_be_generated && col.is_generated != "ALWAYS" {
         return Some(format!(
             "column `{col_name}`: must be GENERATED ALWAYS AS (...) STORED (is_generated = {})",
             col.is_generated
+        ));
+    }
+    if !must_be_generated && col.is_generated == "ALWAYS" {
+        return Some(format!(
+            "column `{col_name}`: must be a regular (non-GENERATED) column for \
+             DualWrite-mode GSI (is_generated = ALWAYS)"
         ));
     }
     None

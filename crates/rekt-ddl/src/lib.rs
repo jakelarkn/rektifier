@@ -19,7 +19,7 @@ use deadpool_postgres::Pool;
 use crate::naming::{derive_gsi_index_name, derive_lsi_index_name};
 use rekt_catalog::{
     metadata::{key_type_str, now_ms},
-    CatalogError, GsiSpec, LsiSpec, Reconciler, TableCatalog, TableEntry, TableStatus,
+    CatalogError, GsiMode, GsiSpec, LsiSpec, Reconciler, TableCatalog, TableEntry, TableStatus,
 };
 use rekt_protocol::{
     CreateTableRequest, DeleteTableRequest, TableDescription, UpdateTableRequest,
@@ -598,6 +598,7 @@ pub fn build_gsi_specs(plan: &CreateTablePlan, pg_table: &str) -> Vec<GsiSpec> {
             index_name: derive_gsi_index_name(pg_table, &g.name),
             projection_type: g.projection_type.clone(),
             projection_non_key_attrs: g.projection_non_key_attrs.clone(),
+            mode: GsiMode::Generated,
             serveable: true,
             unserveable_reason: None,
         })

@@ -3,7 +3,7 @@
 //! All SQL lives here, isolated from the cache mechanics. Callers
 //! (seeder, reconciler, DDL workers) compose these primitives.
 
-use crate::{CatalogError, GsiSpec, LsiSpec, TableEntry, TableStatus};
+use crate::{CatalogError, GsiMode, GsiSpec, LsiSpec, TableEntry, TableStatus};
 use deadpool_postgres::Pool;
 use rekt_storage::KeyType;
 use rekt_translator::TableSchema;
@@ -317,6 +317,7 @@ pub fn gsi_specs_to_json(specs: &[GsiSpec]) -> serde_json::Value {
                     "index_name":           s.index_name,
                     "projection_type":      s.projection_type,
                     "projection_non_key_attrs": s.projection_non_key_attrs,
+                    "mode":                 s.mode.as_str(),
                     "serveable":            s.serveable,
                     "unserveable_reason":   s.unserveable_reason,
                 })
@@ -385,6 +386,27 @@ pub fn gsi_specs_from_json(
             .get("unserveable_reason")
             .and_then(|v| if v.is_null() { None } else { v.as_str() })
             .map(str::to_string);
+        // PLAN-9 D17. `mode` defaults to Generated when absent so
+        // pre-revision rows round-trip cleanly (every shipped GSI was
+        // Generated-mode by construction). DualWrite is only written
+        // when the orchestrator inserts a new GSI from UpdateTable.
+        let mode = match obj.get("mode") {
+            None | Some(serde_json::Value::Null) => GsiMode::Generated,
+            Some(serde_json::Value::String(s)) => {
+                GsiMode::parse(s).ok_or_else(|| CatalogError::MalformedRow {
+                    table_name: table_name.into(),
+                    reason: format!(
+                        "gsi_specs[{idx}]: `mode` must be `generated` or `dual_write`, got `{s}`"
+                    ),
+                })?
+            }
+            _ => {
+                return Err(CatalogError::MalformedRow {
+                    table_name: table_name.into(),
+                    reason: format!("gsi_specs[{idx}]: `mode` must be string"),
+                });
+            }
+        };
         out.push(GsiSpec {
             name,
             partition_attr,
@@ -396,6 +418,7 @@ pub fn gsi_specs_from_json(
             index_name,
             projection_type,
             projection_non_key_attrs,
+            mode,
             serveable,
             unserveable_reason,
         });
