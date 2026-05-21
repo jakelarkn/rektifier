@@ -34,6 +34,7 @@ pub fn gcp(audience: impl Into<String>) -> JwtIssuerConfig {
         clock_skew: DEFAULT_CLOCK_SKEW,
         jwks_cache_ttl: DEFAULT_JWKS_TTL,
         principal_format: PrincipalFormat::Email("gcp:user:".into()),
+        safe_to_log_claims: vec!["iss".into(), "sub".into(), "aud".into(), "azp".into()],
     }
 }
 
@@ -52,6 +53,7 @@ pub fn azure(tenant_id: &str, audience: impl Into<String>) -> JwtIssuerConfig {
         clock_skew: DEFAULT_CLOCK_SKEW,
         jwks_cache_ttl: DEFAULT_JWKS_TTL,
         principal_format: PrincipalFormat::AzureObjectId("azure:sp:".into()),
+        safe_to_log_claims: vec!["iss".into(), "sub".into(), "aud".into(), "oid".into(), "tid".into(), "appid".into()],
     }
 }
 
@@ -71,6 +73,7 @@ pub fn snowflake(account: &str, audience: impl Into<String>) -> JwtIssuerConfig 
         clock_skew: DEFAULT_CLOCK_SKEW,
         jwks_cache_ttl: DEFAULT_JWKS_TTL,
         principal_format: PrincipalFormat::Subject("snowflake:user:".into()),
+        safe_to_log_claims: vec!["iss".into(), "sub".into(), "aud".into()],
     }
 }
 
@@ -91,6 +94,7 @@ pub fn databricks(
         clock_skew: DEFAULT_CLOCK_SKEW,
         jwks_cache_ttl: DEFAULT_JWKS_TTL,
         principal_format: PrincipalFormat::Subject("databricks:user:".into()),
+        safe_to_log_claims: vec!["iss".into(), "sub".into(), "aud".into()],
     }
 }
 
@@ -111,6 +115,7 @@ pub fn neon(
         clock_skew: DEFAULT_CLOCK_SKEW,
         jwks_cache_ttl: DEFAULT_JWKS_TTL,
         principal_format: PrincipalFormat::Subject("neon:user:".into()),
+        safe_to_log_claims: vec!["iss".into(), "sub".into(), "aud".into()],
     }
 }
 
@@ -132,6 +137,7 @@ pub fn aws_cognito(
         clock_skew: DEFAULT_CLOCK_SKEW,
         jwks_cache_ttl: DEFAULT_JWKS_TTL,
         principal_format: PrincipalFormat::Subject("cognito:user:".into()),
+        safe_to_log_claims: vec!["iss".into(), "sub".into(), "aud".into(), "client_id".into()],
     }
 }
 

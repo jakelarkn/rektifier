@@ -1109,6 +1109,7 @@ fn app_users_unserveable() -> axum::Router {
     )));
     let state = AppState {
         auth: Arc::new(AuthChain::permissive_only()),
+        audit_enabled: false,
         backend: Arc::new(MockBackend::default()) as Arc<dyn Backend>,
         catalog: catalog.clone(),
         ddl: Arc::new(MockDdlBackend { catalog }) as Arc<dyn DdlBackend>,
@@ -1125,6 +1126,7 @@ fn app_with(backend: MockBackend, request_timeout: std::time::Duration) -> axum:
     let cat = catalog();
     let state = AppState {
         auth: Arc::new(AuthChain::permissive_only()),
+        audit_enabled: false,
         backend: Arc::new(backend) as Arc<dyn Backend>,
         catalog: cat.clone(),
         ddl: Arc::new(MockDdlBackend { catalog: cat }) as Arc<dyn DdlBackend>,
@@ -8795,6 +8797,7 @@ fn app_with_lsi() -> axum::Router {
     )));
     let state = AppState {
         auth: Arc::new(AuthChain::permissive_only()),
+        audit_enabled: false,
         backend: Arc::new(MockBackend::default()) as Arc<dyn Backend>,
         catalog: catalog.clone(),
         ddl: Arc::new(MockDdlBackend { catalog }) as Arc<dyn DdlBackend>,
@@ -8863,6 +8866,7 @@ fn app_with_unserveable_lsi() -> axum::Router {
     )));
     let state = AppState {
         auth: Arc::new(AuthChain::permissive_only()),
+        audit_enabled: false,
         backend: Arc::new(MockBackend::default()) as Arc<dyn Backend>,
         catalog: catalog.clone(),
         ddl: Arc::new(MockDdlBackend { catalog }) as Arc<dyn DdlBackend>,

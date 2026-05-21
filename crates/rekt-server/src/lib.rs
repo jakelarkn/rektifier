@@ -38,7 +38,7 @@ use rekt_protocol::{
 };
 use rekt_catalog::{CatalogSnapshot, TableCatalog, TableEntry};
 use rekt_ddl::DdlBackend;
-use rekt_auth::{AuthChain, AuthError, Verifier};
+use rekt_auth::{safe_claims_for_log, AuthChain, AuthError, Identity, Verifier};
 use rekt_storage::{Backend, BackendError, TransactGetOp, TransactWriteOp, UpdateDecision, UpdateOutcome};
 use rekt_translator::{
     apply_update_expression, encode_lek, evaluate_condition, materialize_insert_only_update,
@@ -70,6 +70,10 @@ const CONTENT_TYPE: &str = "application/x-amz-json-1.0";
 #[derive(Clone)]
 pub struct AppState {
     pub auth: Arc<AuthChain>,
+    /// When true, emit a structured per-request audit log line after
+    /// successful auth (PLAN-13 A6). Off by default; production
+    /// deployments toggle on via `[server] audit_log_enabled = true`.
+    pub audit_enabled: bool,
     pub backend: Arc<dyn Backend>,
     /// Runtime table catalog: the single source of truth for which
     /// tables exist and what shape they have. Refreshed by the
@@ -556,6 +560,31 @@ pub(crate) fn parse_request<T: serde::de::DeserializeOwned>(
 
 // ===== Dispatch ================================================================
 
+/// What flows out of the AuthChain into the handlers. For now just
+/// wraps the validated `Identity`; future authz (PLAN-13 follow-up)
+/// will attach policy decisions here.
+#[derive(Debug, Clone)]
+pub struct RequestContext {
+    pub identity: Identity,
+}
+
+/// Per-request audit log line (PLAN-13 A6). Drops PII by routing
+/// claims through the per-issuer allowlist (empty allowlist for
+/// non-JWT schemes — `Identity.claims` for SigV4 / API-token paths
+/// only carry deployment-shape data anyway).
+fn emit_audit_log(identity: &Identity) {
+    let safe = safe_claims_for_log(identity, &[]);
+    let claims_json = serde_json::Value::Object(safe);
+    tracing::info!(
+        target: "rektifier.audit",
+        principal = %identity.principal,
+        scheme = identity.scheme.as_str(),
+        issuer = identity.issuer.as_deref().unwrap_or(""),
+        claims = %claims_json,
+        "auth.audit"
+    );
+}
+
 #[tracing::instrument(
     level = "debug",
     skip_all,
@@ -564,6 +593,7 @@ pub(crate) fn parse_request<T: serde::de::DeserializeOwned>(
         op = tracing::field::Empty,
         auth_principal = tracing::field::Empty,
         auth_scheme = tracing::field::Empty,
+        auth_issuer = tracing::field::Empty,
     )
 )]
 async fn dispatch(State(state): State<AppState>, req: Request) -> Result<Response, ApiError> {
@@ -592,9 +622,16 @@ async fn dispatch(State(state): State<AppState>, req: Request) -> Result<Respons
     //    We do this before peeking at any body content so the auth
     //    boundary stays at the top.
     let identity = state.auth.verify(&parts, &body).await?;
-    tracing::Span::current().record("auth_principal", identity.principal.as_str());
-    tracing::Span::current().record("auth_scheme", identity.scheme.as_str());
-    let _ = identity; // A6 will thread Identity through RequestContext.
+    let span = tracing::Span::current();
+    span.record("auth_principal", identity.principal.as_str());
+    span.record("auth_scheme", identity.scheme.as_str());
+    if let Some(iss) = identity.issuer.as_deref() {
+        span.record("auth_issuer", iss);
+    }
+    if state.audit_enabled {
+        emit_audit_log(&identity);
+    }
+    let _request_ctx = RequestContext { identity };
 
     // 2. Identify the operation from the X-Amz-Target header.
     let target = parts

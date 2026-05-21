@@ -14,11 +14,14 @@
 use std::sync::OnceLock;
 
 pub mod api_token;
+pub mod audit;
 pub mod crypto;
 pub mod jwt;
 pub mod master_key;
 pub mod permissive;
 pub mod sigv4;
+
+pub use audit::safe_claims_for_log;
 
 pub use api_token::{
     ensure_api_tokens_table, insert_token_hash, mint as mint_api_token, ApiTokenVerifier,

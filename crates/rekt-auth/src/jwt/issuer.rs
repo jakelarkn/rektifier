@@ -40,6 +40,12 @@ pub struct JwtIssuerConfig {
     pub jwks_cache_ttl: Duration,
     /// How to map validated claims to `Identity.principal`.
     pub principal_format: PrincipalFormat,
+    /// Claim names that may be safely emitted to audit logs for
+    /// this issuer (PLAN-13 D2 / A6 PII allowlist). Anything not in
+    /// this list is dropped before the audit line is constructed.
+    /// Empty list = log nothing beyond `principal` + `scheme` +
+    /// `issuer`.
+    pub safe_to_log_claims: Vec<String>,
 }
 
 /// How to derive the namespaced `Identity.principal` string from the
@@ -147,6 +153,7 @@ mod tests {
             clock_skew: Duration::from_secs(60),
             jwks_cache_ttl: Duration::from_secs(600),
             principal_format: PrincipalFormat::Subject("issuer:user:".into()),
+            safe_to_log_claims: vec!["iss".into(), "sub".into(), "aud".into()],
         }
     }
 

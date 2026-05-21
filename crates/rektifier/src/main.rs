@@ -109,6 +109,7 @@ async fn main() -> Result<()> {
 
     let state = AppState {
         auth: Arc::new(AuthChain::permissive_only()),
+        audit_enabled: false,
         backend: Arc::new(backend),
         catalog,
         ddl,

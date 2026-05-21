@@ -251,6 +251,7 @@ mod tests {
             clock_skew: Duration::from_secs(60),
             jwks_cache_ttl: Duration::from_secs(600),
             principal_format: PrincipalFormat::Subject("ex:user:".into()),
+            safe_to_log_claims: vec!["iss".into(), "sub".into(), "aud".into()],
         }
     }
 
