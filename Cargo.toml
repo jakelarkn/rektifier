@@ -19,10 +19,10 @@ members = [
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
-license = "Apache-2.0"
+license = "AGPL-3.0-or-later"
 rust-version = "1.86"
-repository = "https://github.com/jake/rektifier"
-homepage = "https://github.com/jake/rektifier"
+repository = "https://github.com/jakelarkn/rektifier"
+homepage = "https://github.com/jakelarkn/rektifier"
 description = "DynamoDB-compatible API in front of PostgreSQL"
 
 [workspace.metadata.rektifier]

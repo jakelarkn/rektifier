@@ -153,6 +153,37 @@ from DDB on already-implemented APIs.
   The trait surface widens cleanly per phase; that's the supported
   migration path.
 
+## Pre-production phase (no live deployments)
+
+Backward compatibility is not a constraint. Schema, config, and
+wire-shape changes can be made cleanly without aliases, epoch
+defaults, deprecation cycles, or migration tooling. Tests are
+the regression net for renames and removals. Prefer the clean
+break over preserving the prior shape. (Delete this section at
+first production deployment.)
+
+## Strict DDB wire parity
+
+The HTTP request/response surface is DDB exactly. No
+rektifier-specific extension fields on either side. Features
+that would require extending the DDB schema land out-of-band
+(logs, direct metadata reads in psql, or a separate
+non-DDB-claiming admin endpoint), or get dropped. Operator
+escape hatches via internal tables are not documented stable
+interfaces; the operator owns the consequences.
+
+## Plan revision sweep
+
+Plans (`docs/plan/PLAN-N-*.md`) are revised conversationally and
+single decisions cascade across phases, schemas, module layouts,
+open questions, caveats, and cross-references. When pivoting a
+plan's architecture, grep the whole doc for the *old* shape's
+terms (dropped subsystem names, renamed types, superseded
+fields), then check cross-referenced plans for the same. Sweep
+test-surface, module-layout, and recommendation sections — those
+are the most-often-missed. Surface stale content as part of the
+pivot, not as a follow-up round.
+
 ## Useful one-liners
 
 ```
