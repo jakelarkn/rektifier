@@ -19,9 +19,11 @@
 pub mod backfill;
 pub mod index;
 pub mod state;
+pub mod verify;
 
 pub use backfill::{run_backfill, BackfillConfig};
 pub use index::{run_index_creation, IndexConfig};
+pub use verify::{run_drift_check, DriftMismatch, DriftReport};
 pub use state::{
     create_gsi_state_table, fetch_state, fetch_states_by_phase, insert_state_row, update_phase,
     GsiPhase, GsiState, OrchestratorError,
