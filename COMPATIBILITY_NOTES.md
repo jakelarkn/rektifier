@@ -334,6 +334,99 @@ a batch referencing a missing or unhealthy table is
 
 ---
 
+## Local Secondary Indexes (LSIs)
+
+Tracked-implemented as of PLAN-11. LSIs are declared at `CreateTable`
+time only (matching DDB); they share the base partition key and add a
+sort key that PG materializes as a `GENERATED ALWAYS AS ... STORED`
+column plus a composite btree on `(base_pk, lsi_sort_col)`.
+
+### LSI `Projection` always behaves as `ALL` — Lenient
+
+DDB's LSI declarations carry a `Projection` (`ALL` /
+`KEYS_ONLY` / `INCLUDE`) that determines which non-key attributes
+are written to the LSI partition (and consequently returned by LSI
+`Query` results). Rektifier stores every item in full inside the
+base table's `jsonb` column; LSI rows aren't a separate physical
+projection but a column-derived index. Query against any LSI
+trivially returns the full item regardless of the declared
+`Projection`.
+
+**Effect:** code written against DDB's `KEYS_ONLY` / `INCLUDE`
+projections receives *more* attributes from rektifier than DDB
+would. SDK clients tolerate this; clients depending on the
+*absence* of un-projected attributes from LSI Query results won't
+reproduce the omission.
+
+**Closure plan:** none. Rektifier accepts the declared `Projection`
+field, echoes it through `DescribeTable.LocalSecondaryIndexes`,
+and behaves as ALL regardless.
+
+### Per-partition 10 GB item-collection limit is not enforced — Lenient
+
+DDB caps the total size of all items + LSI projections sharing a
+partition key at 10 GB. Beyond that, writes to that partition fail
+with `ItemCollectionSizeLimitExceededException`. The limit exists
+because each DDB partition is a physical storage unit.
+
+PG has no equivalent partitioning model. Rektifier accepts unbounded
+per-partition growth (bounded only by PG-level table / index size
+limits, which are far higher). Operators relying on the 10 GB ceiling
+as an early-warning for runaway item collections must implement
+that check application-side.
+
+**Effect:** `ItemCollectionSizeLimitExceededException` is never
+returned by rektifier; the `ItemCollectionMetrics` field documented
+on `PutItem` / `UpdateItem` / `DeleteItem` / `BatchWriteItem` /
+`TransactWriteItems` responses is also not synthesized.
+
+**Closure plan:** none — enforcing the limit would require a
+per-partition byte counter in a side table on every write; the
+operational value of the limit is low against PG-based storage.
+
+### LSI Query is always strongly consistent regardless of `ConsistentRead` — Positive divergence
+
+DDB advertises that LSI Query supports both consistent and
+eventually-consistent reads; the latter halves RCU cost. Rektifier
+reads the LSI from the same PG row as the base item via the same
+MVCC snapshot — every read is at least as strong as DDB's
+`ConsistentRead=true`. Same shape as the cross-cutting
+`ConsistentRead` entry at the top of this document.
+
+**Effect:** code written against DDB's eventual-consistency
+semantics works against rektifier; code depending on *observing*
+eventual-consistency lag (unusual) won't reproduce it.
+
+### LSI mutation post-create is rejected — Parity
+
+DDB has no `UpdateTable` field for adding or removing LSIs. The
+only way to mutate an LSI is `DeleteTable` + `CreateTable`.
+Rektifier matches: there is no wire surface for LSI mutation, and
+`UpdateTable` carrying any LSI-shaped extension field is unknown to
+the request schema. Worth listing so the closed alternative
+("UpdateTable can mutate LSIs") is on the record.
+
+### LSI drift takes only the LSI unserveable, not the base table — Documented divergence
+
+If the reconciler detects that an LSI's generated column or btree
+disappeared (operator hand-edit, restore from a stale dump), the
+LSI's per-LSI `serveable` flag flips to `false` while the base
+table's flag is unchanged. Subsequent `Query` / `Scan` calls with
+`IndexName` targeting the degraded LSI return
+`ResourceNotFoundException` at dispatch; base-table reads keep
+working.
+
+DDB doesn't expose this failure mode at all (DDB owns the storage
+end-to-end). Rektifier surfaces it because PG is underneath and
+external mutation is theoretically possible.
+
+**Recovery:** `DeleteTable` + `CreateTable` is the only path (LSI
+mutation post-create is rejected per the previous entry). Future
+PLAN-11 work could add a `rektifier lsi rebuild` CLI affordance
+for re-creating the column + index in-place; not in v1 scope.
+
+---
+
 ## BatchGetItem / BatchWriteItem
 
 These entries describe known divergences planned for the in-progress

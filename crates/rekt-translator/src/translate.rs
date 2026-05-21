@@ -264,6 +264,7 @@ pub fn translate_query(
         req.select.as_deref(),
         req.projection_expression.as_deref(),
         names,
+        index_sort.is_some(),
     )?;
 
     Ok(QueryPlan {
@@ -364,6 +365,7 @@ pub fn translate_scan(
         req.select.as_deref(),
         req.projection_expression.as_deref(),
         names,
+        index_sort.is_some(),
     )?;
 
     Ok(ScanPlan {

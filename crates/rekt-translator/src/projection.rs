@@ -69,13 +69,16 @@ pub(crate) fn parse_projection(
 /// Combination rules (matching DDB):
 /// - `Select=COUNT` + `ProjectionExpression` → `ValidationException`.
 /// - `Select=SPECIFIC_ATTRIBUTES` requires `ProjectionExpression`.
-/// - `Select=ALL_PROJECTED_ATTRIBUTES` is GSI-only — rejected until
-///   GSI work lands.
+/// - `Select=ALL_PROJECTED_ATTRIBUTES` requires IndexName. PLAN-11 D4:
+///   rektifier's Projection always behaves as ALL, so the accepted
+///   value is functionally identical to `ALL_ATTRIBUTES` (Lenient
+///   divergence — documented in COMPATIBILITY_NOTES).
 /// - `Select=ALL_ATTRIBUTES` / unset → no special handling.
 pub(crate) fn resolve_select_and_projection(
     select: Option<&str>,
     projection_expr: Option<&str>,
     names: &BTreeMap<String, String>,
+    has_index: bool,
 ) -> Result<(bool, Option<BTreeSet<String>>), TranslateError> {
     let count_only = match select {
         None | Some("ALL_ATTRIBUTES") => false,
@@ -89,11 +92,14 @@ pub(crate) fn resolve_select_and_projection(
             false
         }
         Some("ALL_PROJECTED_ATTRIBUTES") => {
-            return Err(TranslateError::InvalidSelectMode {
-                reason:
-                    "Select=ALL_PROJECTED_ATTRIBUTES requires IndexName (GSI/LSI scan), \
-                     which is not yet supported",
-            });
+            if !has_index {
+                return Err(TranslateError::InvalidSelectMode {
+                    reason: "Select=ALL_PROJECTED_ATTRIBUTES requires IndexName",
+                });
+            }
+            // PLAN-11 D4. Accepted; behavior collapses to ALL because
+            // every item is stored verbatim in JSONB.
+            false
         }
         Some(other) => {
             return Err(TranslateError::UnsupportedSelect {

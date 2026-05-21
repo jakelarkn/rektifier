@@ -16,8 +16,8 @@ use rekt_protocol::{
     AttributeDefinition, CreateTableRequest, CreateTableResponse, DeleteTableRequest,
     DeleteTableResponse, DescribeTableRequest, DescribeTableResponse,
     GlobalSecondaryIndexDescription, KeySchemaElement, ListTablesRequest, ListTablesResponse,
-    Projection, ProvisionedThroughputDescription, TableDescription, UpdateTableRequest,
-    UpdateTableResponse,
+    LocalSecondaryIndexDescription, Projection, ProvisionedThroughputDescription, TableDescription,
+    UpdateTableRequest, UpdateTableResponse,
 };
 use rekt_storage::KeyType;
 
@@ -71,6 +71,60 @@ pub(crate) fn table_description_from_entry(entry: &TableEntry) -> TableDescripti
             attribute_type: key_type_wire(sk_type).into(),
         });
     }
+
+    // PLAN-11 L5. LSI sort attrs must appear in AttributeDefinitions
+    // (DDB requires every key attribute on the wire response to be
+    // declared). Dedupe with a set of attr names already present.
+    let mut declared: std::collections::HashSet<String> =
+        attr_defs.iter().map(|a| a.attribute_name.clone()).collect();
+    for lsi in &entry.lsis {
+        if declared.insert(lsi.sort_attr.clone()) {
+            attr_defs.push(AttributeDefinition {
+                attribute_name: lsi.sort_attr.clone(),
+                attribute_type: key_type_wire(lsi.sort_type).into(),
+            });
+        }
+    }
+
+    // PLAN-11 L5. LSI descriptions: synthesized from entry.lsis with
+    // ProjectionType ALL (D4 — behavior collapses to ALL regardless of
+    // the operator's declared value; round-trip the declared value if
+    // present so DescribeTable still echoes it).
+    let lsi_descs = if entry.lsis.is_empty() {
+        None
+    } else {
+        let mut descs: Vec<LocalSecondaryIndexDescription> = entry
+            .lsis
+            .iter()
+            .map(|l| LocalSecondaryIndexDescription {
+                index_name: Some(l.name.clone()),
+                key_schema: Some(vec![
+                    KeySchemaElement {
+                        attribute_name: schema.pk_attr.clone(),
+                        key_type: "HASH".into(),
+                    },
+                    KeySchemaElement {
+                        attribute_name: l.sort_attr.clone(),
+                        key_type: "RANGE".into(),
+                    },
+                ]),
+                projection: Some(Projection {
+                    projection_type: l
+                        .projection_type
+                        .clone()
+                        .or_else(|| Some("ALL".into())),
+                    non_key_attributes: l.projection_non_key_attrs.clone(),
+                }),
+                // Inert — PLAN-11 D4 + KD11 stance: rektifier doesn't
+                // meter per-index size or item count.
+                index_size_bytes: Some(0),
+                item_count: Some(0),
+                index_arn: None,
+            })
+            .collect();
+        descs.sort_by(|a, b| a.index_name.cmp(&b.index_name));
+        Some(descs)
+    };
 
     // GSI descriptions — joined from the catalog's per-GSI cache (PLAN-9
     // populates these once it lands). Today the map is always empty.
@@ -143,9 +197,7 @@ pub(crate) fn table_description_from_entry(entry: &TableEntry) -> TableDescripti
         item_count: Some(0),
         table_size_bytes: Some(0),
         global_secondary_indexes: gsi_descs,
-        // PLAN-11 L5 wires this from entry.lsis once the catalog grows
-        // the field. For now (L1) — None.
-        local_secondary_indexes: None,
+        local_secondary_indexes: lsi_descs,
         stream_specification: None,
         latest_stream_label: None,
         latest_stream_arn: None,
