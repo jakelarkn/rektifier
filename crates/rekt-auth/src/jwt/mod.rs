@@ -14,6 +14,7 @@
 
 pub mod issuer;
 pub mod jwks;
+pub mod presets;
 
 pub use issuer::{IssuerConfigError, JwtIssuerConfig, PrincipalFormat};
 pub use jwks::{JwksCache, JwksError, PinnedKey};
