@@ -257,12 +257,13 @@ the row's data and key columns disagree and PG cannot detect it.
 | Schemaless attribute that's also a key | OK — engine converts whatever's there | sparse — items missing the attribute leave the column NULL; cast errors only when the attribute is present with the wrong DDB type |
 | Renaming a table | catalog row update, O(1) | requires rewriting the PG table name |
 | Multi-tenancy on shared PG | free — each account's tables live under unique UUIDs | name collisions in shared catalog |
-| Per-row physical size | larger (typed-col triplets, base_pk on indexes) | smaller (one JSONB + generated leaves) |
+| Per-row physical size | larger (typed-col triplets, base_pk on indexes) | base heap is small (one JSONB + generated leaves); each ALL-projection GSI's btree carries the JSONB payload in its leaves (PLAN-12 covering index), so total storage per GSI converges with extenddb's per-GSI-table shape |
 
 Neither is obviously right. ExtendDB optimizes for operational
 flexibility (account isolation, schemaless freedom, fast GSI add);
-rektifier optimizes for correctness-by-construction and storage
-density.
+rektifier optimizes for correctness-by-construction (PG-enforced
+key invariants on the base + LSI + Generated-mode columns) and a
+single-namespace base-heap layout.
 
 ### GSI strategy
 
@@ -681,9 +682,12 @@ A pithy summary:
 - You want a turnkey DynamoDB replacement (init, serve, stop).
 - You need multi-account isolation in one deployment (CI fleets,
   multi-tenant test environments, shared dev clusters).
-- Your workload is read-heavy on GSIs and the projected-table
-  storage cost is worth the throughput win.
-- You want sync-vs-async GSI policy as a knob.
+- Your GSI workload involves large items (>2 KB JSONB) where PG's
+  TOAST chain erodes rektifier's covering-index benefit, or
+  sustained write bursts that lag autovacuum's visibility-map
+  refresh.
+- You want sync-vs-async GSI policy as a knob (eventual-consistency
+  GSI reads with a queue-drained worker).
 - Schemaless attributes are also indexed (PG-derived generated
   columns can't handle the "this attribute is a number sometimes
   and a string other times" case for indexed keys).
@@ -696,8 +700,10 @@ A pithy summary:
 
 - You already run Postgres and want a translation layer that adds
   the minimum operational surface.
-- Your workload is write-heavy with selective GSI usage; storage
-  density and write throughput matter more than wide-Query speed.
+- Your workload runs on typical DDB-sized items (sub-2 KB) where
+  PG's index-only scans over covering GSI btrees deliver wire
+  latency that's hard to beat — write throughput stays near
+  baseline (PLAN-12 measured +0.05 ms p50 per GSI on PutItem).
 - You want a single PG namespace shared with non-DDB workloads
   (rektifier doesn't claim ownership of the database the way
   extenddb does).
