@@ -52,7 +52,7 @@ pub use plan::{
     TransactGetItemsPlan, TransactGetPlanItem, TransactWriteItemsPlan, TransactWriteKind,
     TransactWritePlanItem, UpdateItemPlan,
 };
-pub use schema::TableSchema;
+pub use schema::{LsiSchema, TableSchema};
 pub use translate::{
     translate_batch_get_item, translate_batch_write_item, translate_delete_item,
     translate_get_item, translate_put_item, translate_query, translate_scan,
@@ -79,6 +79,7 @@ mod tests {
             sk_attr: None,
             sk_type: None,
             jsonb_col: "data".into(),
+            lsis: Default::default(),
         }
     }
 
@@ -91,6 +92,7 @@ mod tests {
             sk_attr: Some("ts".into()),
             sk_type: Some(KeyType::N),
             jsonb_col: "doc".into(),
+            lsis: Default::default(),
         }
     }
 
@@ -103,6 +105,7 @@ mod tests {
             sk_attr: None,
             sk_type: None,
             jsonb_col: "meta".into(),
+            lsis: Default::default(),
         }
     }
 
@@ -115,6 +118,7 @@ mod tests {
             sk_attr: Some("ts".into()),
             sk_type: Some(KeyType::S),
             jsonb_col: "data".into(),
+            lsis: Default::default(),
         }
     }
 
@@ -1529,6 +1533,7 @@ mod tests {
                 )
             },
             consistent_read: None,
+            index_name: None,
             limit: None,
             exclusive_start_key: None,
             filter_expression: None,
@@ -2114,15 +2119,17 @@ mod tests {
         translate_scan(&scan_req("events"), &schema_composite_s_n()).unwrap();
     }
 
+    /// PLAN-11 L4: unknown IndexName on a table with no LSIs maps to
+    /// IndexNotFound (→ RNF at the wire layer), not the legacy
+    /// "feature not supported" ValidationException.
     #[test]
-    fn scan_rejects_index_name() {
+    fn scan_unknown_index_returns_index_not_found() {
         let mut req = scan_req("users");
         req.index_name = Some("an_index".into());
         let err = translate_scan(&req, &schema_hash_s()).unwrap_err();
         assert!(matches!(
             err,
-            TranslateError::ScanFeatureNotSupported { what }
-                if what.contains("IndexName")
+            TranslateError::IndexNotFound { index } if index == "an_index"
         ));
     }
 
@@ -2137,6 +2144,133 @@ mod tests {
             TranslateError::ScanFeatureNotSupported { what }
                 if what.contains("parallel scan")
         ));
+    }
+
+    /// PLAN-11 L4: LSI Query routes through the LSI's sort column.
+    /// extract_key_condition resolves the KCE's sort-key term against
+    /// the substituted SK, and the plan carries an index_sort the
+    /// dispatcher uses to swap the storage shape.
+    #[test]
+    fn query_with_index_name_resolves_to_lsi() {
+        let mut schema = schema_composite_s_n();
+        schema.lsis.insert(
+            "by_tier".into(),
+            LsiSchema {
+                name: "by_tier".into(),
+                sort_attr: "tier".into(),
+                sort_type: KeyType::S,
+                sort_pg_col: "tier".into(),
+                serveable: true,
+                unserveable_reason: None,
+            },
+        );
+        let mut req = query_req(
+            "events",
+            "device_id = :pk AND tier = :sk",
+            &[
+                (":pk", AttributeValue::S("dev-1".into())),
+                (":sk", AttributeValue::S("gold".into())),
+            ],
+            &[],
+        );
+        req.index_name = Some("by_tier".into());
+        let plan = translate_query(&req, &schema).unwrap();
+        let idx = plan.index_sort.expect("index_sort populated");
+        assert_eq!(idx.index_name, "by_tier");
+        assert_eq!(idx.sort_pg_col, "tier");
+        assert_eq!(idx.sort_type, KeyType::S);
+        // The plan's SK condition reflects the LSI's column, not the
+        // base table's ts.
+        match plan.sk_condition {
+            Some(SkCondition::Eq(KeyValue::S(s))) => assert_eq!(s, "gold"),
+            other => panic!("unexpected sk_condition: {other:?}"),
+        }
+    }
+
+    /// PLAN-11 L4: KCE that pairs the base PK with the *base* SK while
+    /// IndexName targets an LSI is a misuse — DDB rejects with a
+    /// KeyCondition error because the LSI's SK is `tier`, not `ts`.
+    #[test]
+    fn query_lsi_kce_must_reference_lsi_sort_attr() {
+        let mut schema = schema_composite_s_n();
+        schema.lsis.insert(
+            "by_tier".into(),
+            LsiSchema {
+                name: "by_tier".into(),
+                sort_attr: "tier".into(),
+                sort_type: KeyType::S,
+                sort_pg_col: "tier".into(),
+                serveable: true,
+                unserveable_reason: None,
+            },
+        );
+        let mut req = query_req(
+            "events",
+            "device_id = :pk AND ts = :sk",
+            &[
+                (":pk", AttributeValue::S("dev-1".into())),
+                (":sk", AttributeValue::N("100".into())),
+            ],
+            &[],
+        );
+        req.index_name = Some("by_tier".into());
+        let err = translate_query(&req, &schema).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::KeyConditionNonKeyAttr { attr } if attr == "ts"
+        ));
+    }
+
+    #[test]
+    fn query_with_unknown_index_name_returns_index_not_found() {
+        let schema = schema_composite_s_n();
+        let mut req = query_req(
+            "events",
+            "device_id = :pk",
+            &[(":pk", AttributeValue::S("dev-1".into()))],
+            &[],
+        );
+        req.index_name = Some("by_phantom".into());
+        let err = translate_query(&req, &schema).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::IndexNotFound { index } if index == "by_phantom"
+        ));
+    }
+
+    /// PLAN-11 D12 / open Q4: an LSI with serveable=false (reconciler-
+    /// detected drift) is rejected at translate time as IndexNotServeable.
+    /// Maps to RNF at the wire layer to match DDB's "non-ACTIVE indexes
+    /// aren't queryable" stance.
+    #[test]
+    fn query_unserveable_lsi_returns_index_not_serveable() {
+        let mut schema = schema_composite_s_n();
+        schema.lsis.insert(
+            "by_tier".into(),
+            LsiSchema {
+                name: "by_tier".into(),
+                sort_attr: "tier".into(),
+                sort_type: KeyType::S,
+                sort_pg_col: "tier".into(),
+                serveable: false,
+                unserveable_reason: Some("LSI index missing".into()),
+            },
+        );
+        let mut req = query_req(
+            "events",
+            "device_id = :pk",
+            &[(":pk", AttributeValue::S("dev-1".into()))],
+            &[],
+        );
+        req.index_name = Some("by_tier".into());
+        let err = translate_query(&req, &schema).unwrap_err();
+        match err {
+            TranslateError::IndexNotServeable { index, reason } => {
+                assert_eq!(index, "by_tier");
+                assert!(reason.contains("missing"));
+            }
+            other => panic!("expected IndexNotServeable, got {other:?}"),
+        }
     }
 
     #[test]

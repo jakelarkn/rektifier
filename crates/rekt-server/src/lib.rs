@@ -309,6 +309,17 @@ impl From<TranslateError> for ApiError {
             TranslateError::ResourceNotFoundForTransact { table } => {
                 ApiError::ResourceNotFound(format!("Table not found: {table}"))
             }
+            // PLAN-11 L4. Unknown / non-serveable IndexName surfaces as
+            // ResourceNotFoundException — matches DDB's stance that
+            // non-ACTIVE indexes aren't queryable.
+            TranslateError::IndexNotFound { index } => {
+                ApiError::ResourceNotFound(format!("Index not found: {index}"))
+            }
+            TranslateError::IndexNotServeable { index, reason } => {
+                ApiError::ResourceNotFound(format!(
+                    "Index not currently queryable: {index} ({reason})"
+                ))
+            }
             other => ApiError::Validation(other.to_string()),
         }
     }
@@ -831,10 +842,24 @@ async fn handle_query(state: &AppState, body: &Bytes) -> Result<Response, ApiErr
                 Box::new(move |row| evaluate_condition(Some(row), &cond));
             f
         });
+    // PLAN-11 L4. LSI Query swaps the storage shape's sk_col/sk_type
+    // for the LSI's column. PG's planner then routes through the LSI's
+    // (base_pk, sort_col) btree.
+    let shape = match plan.index_sort.as_ref() {
+        None => schema.shape(),
+        Some(idx) => rekt_storage::TableShape {
+            table: &schema.pg_table,
+            pk_col: &schema.pk_attr,
+            pk_type: schema.pk_type,
+            sk_col: Some(&idx.sort_pg_col),
+            sk_type: Some(idx.sort_type),
+            jsonb_col: &schema.jsonb_col,
+        },
+    };
     let outcome = state
         .backend
         .query_raw(
-            &schema.shape(),
+            &shape,
             &plan.pk,
             plan.sk_condition.as_ref(),
             plan.limit,
@@ -935,9 +960,22 @@ async fn handle_scan(state: &AppState, body: &Bytes) -> Result<Response, ApiErro
             f
         });
 
+    // PLAN-11 L4. LSI scan: substitute sk_col/sk_type for the LSI's.
+    // Same shape rewrite as handle_query.
+    let shape = match plan.index_sort.as_ref() {
+        None => schema.shape(),
+        Some(idx) => rekt_storage::TableShape {
+            table: &schema.pg_table,
+            pk_col: &schema.pk_attr,
+            pk_type: schema.pk_type,
+            sk_col: Some(&idx.sort_pg_col),
+            sk_type: Some(idx.sort_type),
+            jsonb_col: &schema.jsonb_col,
+        },
+    };
     let outcome = state
         .backend
-        .scan_raw(&schema.shape(), filter_fn, plan.limit, esk_pair)
+        .scan_raw(&shape, filter_fn, plan.limit, esk_pair)
         .await?;
 
     let items: Vec<Item> = items_to_response(

@@ -749,6 +749,7 @@ fn schemas() -> HashMap<String, TableSchema> {
         sk_attr: None,
         sk_type: None,
         jsonb_col: "data".into(),
+        lsis: Default::default(),
     };
     let events = TableSchema {
         name: "device_events".into(),
@@ -758,6 +759,7 @@ fn schemas() -> HashMap<String, TableSchema> {
         sk_attr: Some("ts".into()),
         sk_type: Some(KeyType::N),
         jsonb_col: "doc".into(),
+        lsis: Default::default(),
     };
     let messages = TableSchema {
         name: "messages".into(),
@@ -767,6 +769,7 @@ fn schemas() -> HashMap<String, TableSchema> {
         sk_attr: Some("ts".into()),
         sk_type: Some(KeyType::S),
         jsonb_col: "data".into(),
+        lsis: Default::default(),
     };
     // N-PK, B-PK, and S+B composite — matches rektifier.toml.example
     // so dispatch tests can exercise the same key-type matrix the
@@ -780,6 +783,7 @@ fn schemas() -> HashMap<String, TableSchema> {
         sk_attr: None,
         sk_type: None,
         jsonb_col: "data".into(),
+        lsis: Default::default(),
     };
     let blobs = TableSchema {
         name: "blobs".into(),
@@ -789,6 +793,7 @@ fn schemas() -> HashMap<String, TableSchema> {
         sk_attr: None,
         sk_type: None,
         jsonb_col: "data".into(),
+        lsis: Default::default(),
     };
     let binsorted = TableSchema {
         name: "binsorted".into(),
@@ -798,6 +803,7 @@ fn schemas() -> HashMap<String, TableSchema> {
         sk_attr: Some("binmark".into()),
         sk_type: Some(KeyType::B),
         jsonb_col: "data".into(),
+        lsis: Default::default(),
     };
     let mut m = HashMap::new();
     m.insert(users.name.clone(), users);
@@ -4364,13 +4370,19 @@ async fn scan_unknown_table_returns_resource_not_found() {
         .ends_with("#ResourceNotFoundException"));
 }
 
+/// PLAN-11 L4: unknown IndexName resolves to RNF, not Validation —
+/// matches DDB's behavior that non-existent indexes return
+/// `ResourceNotFoundException`. (GSI scan still doesn't *exist* per
+/// PLAN-9, but the dispatch shape is now uniform between LSI and GSI
+/// arms; a phantom IndexName is a "not found" not a "feature
+/// rejection".)
 #[tokio::test]
-async fn scan_index_name_rejected() {
+async fn scan_unknown_index_name_returns_rnf() {
     let app = app();
     let resp = app
         .oneshot(ddb_request(
             "Scan",
-            json!({"TableName":"users","IndexName":"some_gsi"}),
+            json!({"TableName":"users","IndexName":"some_phantom"}),
         ))
         .await
         .unwrap();
@@ -4380,7 +4392,7 @@ async fn scan_index_name_rejected() {
         .get("__type")
         .and_then(Value::as_str)
         .unwrap()
-        .ends_with("#ValidationException"));
+        .ends_with("#ResourceNotFoundException"));
 }
 
 #[tokio::test]

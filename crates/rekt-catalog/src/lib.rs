@@ -280,6 +280,7 @@ mod tests {
                 sk_attr: None,
                 sk_type: None,
                 jsonb_col: "data".into(),
+                lsis: Default::default(),
             },
             status: TableStatus::Active,
             serveable: true,

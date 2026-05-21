@@ -200,10 +200,26 @@ pub enum TranslateError {
 
     // ----- Scan -----
     /// Scan request used a feature rektifier doesn't yet implement
-    /// (`IndexName` → GSI; `Segment`/`TotalSegments` → parallel scan).
-    /// See `PLAN-4` D4/D5.
+    /// (`Segment`/`TotalSegments` → parallel scan). See `PLAN-4` D5.
+    /// LSI scan is supported as of PLAN-11 L4; GSI scan lands with
+    /// PLAN-9 G7.
     #[error("Scan feature not supported: {what}")]
     ScanFeatureNotSupported { what: &'static str },
+
+    // ----- PLAN-11 L4: index resolution -----
+    /// `IndexName` referenced an index that isn't declared on the table.
+    /// Maps to ResourceNotFoundException at the dispatch layer to match
+    /// DDB's wire shape.
+    #[error("Index not found: {index}")]
+    IndexNotFound { index: String },
+
+    /// `IndexName` resolved but the index is currently not serveable
+    /// (reconciler-detected column/index drift, or — for GSIs once
+    /// PLAN-9 lands — a pre-ACTIVE lifecycle state). Maps to
+    /// ResourceNotFoundException to match DDB's stance that non-ACTIVE
+    /// indexes aren't queryable.
+    #[error("Index not currently queryable: {index} ({reason})")]
+    IndexNotServeable { index: String, reason: String },
 
     // ----- Q6 — Select + ProjectionExpression -----
     /// `Select` value isn't one of `ALL_ATTRIBUTES`, `COUNT`,

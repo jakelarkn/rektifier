@@ -122,6 +122,25 @@ pub fn row_to_entry(row: MetadataRow) -> Result<TableEntry, CatalogError> {
         });
     }
     let lsis = lsi_specs_from_json(&row.table_name, &row.lsi_specs)?;
+    // PLAN-11 L4. Mirror the cache's typed LsiSpec list into the
+    // translator's LsiSchema map so the translator/dispatch layer can
+    // resolve IndexName without re-reading the catalog row.
+    let schema_lsis: std::collections::HashMap<String, rekt_translator::LsiSchema> = lsis
+        .iter()
+        .map(|s| {
+            (
+                s.name.clone(),
+                rekt_translator::LsiSchema {
+                    name: s.name.clone(),
+                    sort_attr: s.sort_attr.clone(),
+                    sort_type: s.sort_type,
+                    sort_pg_col: s.sort_pg_col.clone(),
+                    serveable: s.serveable,
+                    unserveable_reason: s.unserveable_reason.clone(),
+                },
+            )
+        })
+        .collect();
     let schema = TableSchema {
         name: row.table_name,
         pg_table: row.pg_table,
@@ -130,6 +149,7 @@ pub fn row_to_entry(row: MetadataRow) -> Result<TableEntry, CatalogError> {
         sk_attr: row.sk_attr,
         sk_type,
         jsonb_col: row.jsonb_col,
+        lsis: schema_lsis,
     };
     Ok(TableEntry {
         schema,

@@ -114,6 +114,11 @@ pub struct QueryRequest {
     #[serde(default)]
     pub expression_attribute_values:
         Option<std::collections::BTreeMap<String, crate::AttributeValue>>,
+    /// PLAN-11 L4. Route the Query through an LSI (or, when PLAN-9
+    /// lands, a GSI) named by IndexName. Unknown / non-serveable
+    /// indexes surface as ResourceNotFoundException.
+    #[serde(default)]
+    pub index_name: Option<String>,
     /// Silently honored — every PG read is already at least as strong as
     /// DDB's strongly-consistent mode. Surfaced via the request tracing
     /// span; see `COMPATIBILITY_NOTES.md`.

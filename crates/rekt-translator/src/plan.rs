@@ -12,7 +12,7 @@
 //!   feeds `ReturnValues=UPDATED_*` projection.
 
 use rekt_expressions::{Condition, UpdateExpression};
-use rekt_storage::{KeyValue, SkCondition, WriteOp};
+use rekt_storage::{KeyType, KeyValue, SkCondition, WriteOp};
 
 #[derive(Debug, Clone)]
 pub struct PutItemPlan {
@@ -137,6 +137,11 @@ pub struct ScanPlan {
     pub filter: Option<ConditionPlan>,
     pub select_count_only: bool,
     pub projection: Option<std::collections::BTreeSet<String>>,
+    /// PLAN-11 L4. When `Some`, the Scan is targeting an LSI; the
+    /// dispatcher must build the storage `TableShape` with the LSI's
+    /// `(sort_pg_col, sort_type)` substituted for the base table's SK
+    /// columns. `None` for base-table Scans.
+    pub index_sort: Option<IndexSort>,
 }
 
 /// Query plan: bounded read of one partition.
@@ -164,6 +169,24 @@ pub struct QueryPlan {
     /// `ProjectionExpression`: dispatcher prunes each item's
     /// attributes to this set (top-level names only in v1).
     pub projection: Option<std::collections::BTreeSet<String>>,
+    /// PLAN-11 L4. Same shape as ScanPlan.index_sort — present when the
+    /// Query is targeting an LSI rather than the base table.
+    pub index_sort: Option<IndexSort>,
+}
+
+/// PLAN-11 L4. Index-sort substitution: the dispatcher uses this to
+/// build a `TableShape` whose `sk_col`/`sk_type` come from the LSI
+/// rather than the base table. PG's planner then picks the LSI's btree
+/// because the WHERE clause matches the index's `(base_pk, sort_col)`
+/// column order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexSort {
+    /// Name of the LSI being queried. Carried through for tracing /
+    /// error messages; the dispatch gate has already resolved it.
+    pub index_name: String,
+    /// PG column name of the LSI sort attribute.
+    pub sort_pg_col: String,
+    pub sort_type: KeyType,
 }
 
 #[derive(Debug, Clone)]

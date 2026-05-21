@@ -332,6 +332,7 @@ mod tests {
                 sk_attr: sk.map(|(a, _)| a.into()),
                 sk_type: sk.map(|(_, t)| t),
                 jsonb_col: "data".into(),
+                lsis: Default::default(),
             },
             status,
             serveable: status == TableStatus::Active,

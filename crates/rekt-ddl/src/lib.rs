@@ -507,6 +507,22 @@ pub fn build_lsi_specs(plan: &CreateTablePlan, pg_table: &str) -> Vec<LsiSpec> {
 pub fn entry_for_new_table(plan: &CreateTablePlan) -> TableEntry {
     let pg_table = derive_pg_table(plan);
     let lsis = build_lsi_specs(plan, &pg_table);
+    let schema_lsis: HashMap<String, rekt_translator::LsiSchema> = lsis
+        .iter()
+        .map(|s| {
+            (
+                s.name.clone(),
+                rekt_translator::LsiSchema {
+                    name: s.name.clone(),
+                    sort_attr: s.sort_attr.clone(),
+                    sort_type: s.sort_type,
+                    sort_pg_col: s.sort_pg_col.clone(),
+                    serveable: s.serveable,
+                    unserveable_reason: s.unserveable_reason.clone(),
+                },
+            )
+        })
+        .collect();
     let now = now_ms();
     TableEntry {
         schema: TableSchema {
@@ -517,6 +533,7 @@ pub fn entry_for_new_table(plan: &CreateTablePlan) -> TableEntry {
             sk_attr: plan.sk_attr.clone(),
             sk_type: plan.sk_type,
             jsonb_col: plan.jsonb_col.clone(),
+            lsis: schema_lsis,
         },
         status: TableStatus::Active,
         serveable: true,

@@ -210,6 +210,14 @@ pub fn translate_query(
         });
     }
 
+    // PLAN-11 L4. Resolve IndexName to an effective schema. For
+    // base-table Query the effective schema is the original. For LSI
+    // Query, we construct a synthetic schema whose sk_attr/sk_type are
+    // substituted with the LSI's so that extract_key_condition types
+    // the KCE's sort-key term against the LSI's sort attribute.
+    let (effective_schema, index_sort) = resolve_index_for_query(schema, req.index_name.as_deref())?;
+    let effective: &TableSchema = effective_schema.as_ref();
+
     let raw = parse_condition_expression(&req.key_condition_expression)?;
     let empty_names: BTreeMap<String, String> = BTreeMap::new();
     let empty_values: BTreeMap<String, AttributeValue> = BTreeMap::new();
@@ -222,19 +230,25 @@ pub fn translate_query(
         .as_ref()
         .unwrap_or(&empty_values);
     let cond = substitute_condition(raw, names, values).map_err(map_substitute_for_condition)?;
-    let bounds = extract_key_condition(&cond, schema)?;
+    let bounds = extract_key_condition(&cond, effective)?;
 
     let limit = req.limit.map(validate_limit).transpose()?;
 
     let esk_sk = match &req.exclusive_start_key {
         None => None,
-        Some(esk) => decode_esk(esk, schema, &bounds.pk)?,
+        Some(esk) => decode_esk(esk, effective, &bounds.pk)?,
     };
 
     // FilterExpression: same parse/substitute/classify pipeline as
     // Put/Delete/Update conditions. The classifier still runs (so
     // future SQL push-down can branch on routing) but Q3 evaluates
     // every filter shape in Rust — see PLAN-4 D2.
+    //
+    // Note: filter uses the *base* schema so attribute_exists / key
+    // references resolve against the full attribute set, not just the
+    // LSI's key columns. PLAN-11 D4 (Projection always ALL) makes this
+    // consistent — every attribute in the JSONB is visible to a filter
+    // regardless of which index drove the partition lookup.
     let filter = translate_condition(
         req.filter_expression.as_deref(),
         names,
@@ -261,7 +275,43 @@ pub fn translate_query(
         forward,
         select_count_only,
         projection,
+        index_sort,
     })
+}
+
+/// PLAN-11 L4. Build the effective schema for a Query / Scan request
+/// based on `IndexName`. Returns a `Cow` so the base-table path doesn't
+/// pay for a clone; the LSI path constructs a synthetic schema with
+/// `sk_attr` / `sk_type` substituted to drive
+/// `extract_key_condition`'s sort-key term resolution.
+fn resolve_index_for_query<'a>(
+    schema: &'a TableSchema,
+    index_name: Option<&str>,
+) -> Result<(std::borrow::Cow<'a, TableSchema>, Option<crate::plan::IndexSort>), TranslateError> {
+    let Some(name) = index_name else {
+        return Ok((std::borrow::Cow::Borrowed(schema), None));
+    };
+    let lsi = schema.lsis.get(name).ok_or_else(|| TranslateError::IndexNotFound {
+        index: name.to_string(),
+    })?;
+    if !lsi.serveable {
+        return Err(TranslateError::IndexNotServeable {
+            index: name.to_string(),
+            reason: lsi
+                .unserveable_reason
+                .clone()
+                .unwrap_or_else(|| "not currently queryable".into()),
+        });
+    }
+    let mut synthetic = schema.clone();
+    synthetic.sk_attr = Some(lsi.sort_attr.clone());
+    synthetic.sk_type = Some(lsi.sort_type);
+    let idx = crate::plan::IndexSort {
+        index_name: name.to_string(),
+        sort_pg_col: lsi.sort_pg_col.clone(),
+        sort_type: lsi.sort_type,
+    };
+    Ok((std::borrow::Cow::Owned(synthetic), Some(idx)))
 }
 
 #[tracing::instrument(level = "debug", skip_all, name = "translate.scan", fields(table = %schema.name))]
@@ -269,24 +319,26 @@ pub fn translate_scan(
     req: &ScanRequest,
     schema: &TableSchema,
 ) -> Result<ScanPlan, TranslateError> {
-    // Reject features deferred per PLAN-4 (D4 / D5 / Q7).
-    if req.index_name.is_some() {
-        return Err(TranslateError::ScanFeatureNotSupported {
-            what: "IndexName (GSI/LSI scan)",
-        });
-    }
+    // Reject features deferred per PLAN-4 (D5 / Q7). PLAN-11 L4 lifts
+    // the IndexName rejection for LSIs; GSI scan lands with PLAN-9 G7.
     if req.segment.is_some() || req.total_segments.is_some() {
         return Err(TranslateError::ScanFeatureNotSupported {
             what: "Segment / TotalSegments (parallel scan)",
         });
     }
 
+    // PLAN-11 L4. LSI scan: substitute the LSI's sort attrs into a
+    // synthetic schema so ESK decoding + filter typing land against
+    // the right effective shape.
+    let (effective_schema, index_sort) = resolve_index_for_query(schema, req.index_name.as_deref())?;
+    let effective: &TableSchema = effective_schema.as_ref();
+
     let limit = req.limit.map(validate_limit).transpose()?;
 
     let (esk_pk, esk_sk) = match &req.exclusive_start_key {
         None => (None, None),
         Some(esk) => {
-            let (pk, sk) = decode_scan_esk(esk, schema)?;
+            let (pk, sk) = decode_scan_esk(esk, effective)?;
             (Some(pk), sk)
         }
     };
@@ -321,6 +373,7 @@ pub fn translate_scan(
         filter,
         select_count_only,
         projection,
+        index_sort,
     })
 }
 
