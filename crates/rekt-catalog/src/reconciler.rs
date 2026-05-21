@@ -24,8 +24,10 @@
 //! ops on table Y.
 
 use crate::{
-    metadata, CatalogError, CatalogSnapshot, LsiSpec, TableCatalog, TableEntry, TableStatus,
+    metadata, CatalogError, CatalogSnapshot, GsiSpec, LsiSpec, TableCatalog, TableEntry,
+    TableStatus,
 };
+use std::collections::HashMap as HMap;
 use deadpool_postgres::Pool;
 use rekt_storage::KeyType;
 use std::collections::HashMap;
@@ -52,17 +54,17 @@ SELECT kcu.column_name
 ";
 
 /// Apply the reconciler's verdict to `_rektifier_tables`. The reconciler
-/// touches three fields together — status, serveable, unserveable_reason
-/// — plus lsi_specs (PLAN-11 L3: per-LSI serveable/reason updated in the
-/// same write). All five columns move together so a partial write can't
-/// leave the row in a half-consistent state.
+/// touches six fields together — status, serveable, unserveable_reason,
+/// lsi_specs, and gsi_specs — so a partial write can't leave the row in
+/// a half-consistent state.
 const UPDATE_VERDICT_SQL: &str = "\
 UPDATE _rektifier_tables
    SET status = $2,
        serveable = $3,
        unserveable_reason = $4,
        lsi_specs = $5::jsonb,
-       last_modified_at_ms = $6,
+       gsi_specs = $6::jsonb,
+       last_modified_at_ms = $7,
        last_modified_by = 'reconciler'
  WHERE table_name = $1
 ";
@@ -98,6 +100,9 @@ pub struct ReconcileVerdict {
     /// causes Query/Scan with `IndexName` targeting it to return RNF
     /// at dispatch, while base-table requests stay served.
     pub lsis: Vec<LsiSpec>,
+    /// PLAN-9 G1. Same shape for GSIs. Per-GSI serveable bit; a GSI
+    /// with a missing column or index demotes only itself.
+    pub gsis: Vec<GsiSpec>,
 }
 
 /// Periodic worker. The single `replace`-er of the catalog cache (KD3).
@@ -169,10 +174,12 @@ impl Reconciler {
                 serveable: entry.serveable,
                 reason: entry.unserveable_reason.clone(),
                 lsis: entry.lsis.clone(),
+                gsis: entry.gsis.values().cloned().collect(),
             };
 
             if verdict != stored_verdict {
                 let lsis_json = metadata::lsi_specs_to_json(&verdict.lsis);
+                let gsis_json = metadata::gsi_specs_to_json(&verdict.gsis);
                 client
                     .execute(
                         UPDATE_VERDICT_SQL,
@@ -182,6 +189,7 @@ impl Reconciler {
                             &verdict.serveable,
                             &verdict.reason,
                             &lsis_json,
+                            &gsis_json,
                             &now,
                         ],
                     )
@@ -227,10 +235,16 @@ impl Reconciler {
             new_entry.serveable = verdict.serveable;
             new_entry.unserveable_reason = verdict.reason;
             new_entry.lsis = verdict.lsis;
+            new_entry.gsis = verdict
+                .gsis
+                .into_iter()
+                .map(|g| (g.name.clone(), g))
+                .collect();
             if new_entry.status != entry.status
                 || new_entry.serveable != entry.serveable
                 || new_entry.unserveable_reason != entry.unserveable_reason
                 || new_entry.lsis != entry.lsis
+                || new_entry.gsis != entry.gsis
             {
                 new_entry.last_modified_at_ms = now;
                 new_entry.last_modified_by = "reconciler".into();
@@ -289,26 +303,29 @@ async fn introspect(
     let columns = fetch_columns(client, pg_table).await?;
 
     if columns.is_empty() {
-        // No table at all: every LSI inherits the same degraded reason
-        // (the column can't exist without its parent table).
         let dead_lsis = degrade_all_lsis(&entry.lsis, "parent PG table does not exist");
+        let dead_gsis = degrade_all_gsis(
+            &entry.gsis.values().cloned().collect::<Vec<_>>(),
+            "parent PG table does not exist",
+        );
         return Ok(ReconcileVerdict {
             status: TableStatus::Degraded,
             serveable: false,
             reason: Some(format!("PG table `{pg_table}` does not exist")),
             lsis: dead_lsis,
+            gsis: dead_gsis,
         });
     }
 
     if let Some(reason) = check_jsonb_column(&columns, &entry.schema.jsonb_col) {
-        return Ok(degraded_with_lsis(reason, &entry.lsis));
+        return Ok(degraded_with_indexes(reason, entry));
     }
     if let Some(reason) = check_key_column(&columns, &entry.schema.pk_attr, entry.schema.pk_type) {
-        return Ok(degraded_with_lsis(reason, &entry.lsis));
+        return Ok(degraded_with_indexes(reason, entry));
     }
     if let (Some(sk_attr), Some(sk_type)) = (&entry.schema.sk_attr, entry.schema.sk_type) {
         if let Some(reason) = check_key_column(&columns, sk_attr, sk_type) {
-            return Ok(degraded_with_lsis(reason, &entry.lsis));
+            return Ok(degraded_with_indexes(reason, entry));
         }
     }
 
@@ -318,25 +335,31 @@ async fn introspect(
         None => vec![entry.schema.pk_attr.clone()],
     };
     if pk_cols != expected_pk {
-        return Ok(degraded_with_lsis(
+        return Ok(degraded_with_indexes(
             format!(
                 "primary key shape mismatch: expected {expected_pk:?}, got {pk_cols:?}"
             ),
-            &entry.lsis,
+            entry,
         ));
     }
 
-    // PLAN-11 L3 / open Q4. Per-LSI introspection. Base-table verdict
-    // stays ACTIVE+serveable; per-LSI serveable flag set independently.
-    let index_defs = if entry.lsis.is_empty() {
-        HashMap::new()
+    // PLAN-11 L3 / PLAN-9 G1. Per-index introspection. Base-table
+    // verdict stays ACTIVE+serveable; per-index serveable flag set
+    // independently. Indexes are fetched once and queried per-LSI/GSI.
+    let index_defs = if entry.lsis.is_empty() && entry.gsis.is_empty() {
+        HMap::new()
     } else {
         fetch_indexes(client, pg_table).await?
     };
-    let lsi_verdicts = entry
+    let lsi_verdicts: Vec<LsiSpec> = entry
         .lsis
         .iter()
         .map(|lsi| check_lsi(lsi, &columns, &index_defs, &entry.schema.pk_attr))
+        .collect();
+    let gsi_verdicts: Vec<GsiSpec> = entry
+        .gsis
+        .values()
+        .map(|gsi| check_gsi(gsi, &columns, &index_defs))
         .collect();
 
     Ok(ReconcileVerdict {
@@ -344,6 +367,7 @@ async fn introspect(
         serveable: true,
         reason: None,
         lsis: lsi_verdicts,
+        gsis: gsi_verdicts,
     })
 }
 
@@ -406,13 +430,84 @@ fn degrade_all_lsis(lsis: &[LsiSpec], reason: &str) -> Vec<LsiSpec> {
         .collect()
 }
 
-fn degraded_with_lsis(reason: String, lsis: &[LsiSpec]) -> ReconcileVerdict {
-    let dead = degrade_all_lsis(lsis, &reason);
+fn degraded_with_indexes(reason: String, entry: &TableEntry) -> ReconcileVerdict {
+    let dead_lsis = degrade_all_lsis(&entry.lsis, &reason);
+    let dead_gsis = degrade_all_gsis(
+        &entry.gsis.values().cloned().collect::<Vec<_>>(),
+        &reason,
+    );
     ReconcileVerdict {
         status: TableStatus::Degraded,
         serveable: false,
         reason: Some(reason),
-        lsis: dead,
+        lsis: dead_lsis,
+        gsis: dead_gsis,
+    }
+}
+
+/// PLAN-9 G1. GSI analog of degrade_all_lsis.
+fn degrade_all_gsis(gsis: &[GsiSpec], reason: &str) -> Vec<GsiSpec> {
+    gsis.iter()
+        .map(|g| GsiSpec {
+            serveable: false,
+            unserveable_reason: Some(reason.into()),
+            ..g.clone()
+        })
+        .collect()
+}
+
+/// PLAN-9 G1. GSI analog of check_lsi. Verifies the GSI's columns
+/// exist with the right type + are GENERATED, then that the index
+/// exists with the right column shape.
+fn check_gsi(
+    gsi: &GsiSpec,
+    columns: &[ColumnInfo],
+    index_defs: &HMap<String, String>,
+) -> GsiSpec {
+    if let Some(reason) = check_key_column(columns, &gsi.partition_pg_col, gsi.partition_type) {
+        return GsiSpec {
+            serveable: false,
+            unserveable_reason: Some(format!("GSI `{}` partition column: {reason}", gsi.name)),
+            ..gsi.clone()
+        };
+    }
+    if let (Some(sa), Some(st)) = (&gsi.sort_pg_col, gsi.sort_type) {
+        if let Some(reason) = check_key_column(columns, sa, st) {
+            return GsiSpec {
+                serveable: false,
+                unserveable_reason: Some(format!("GSI `{}` sort column: {reason}", gsi.name)),
+                ..gsi.clone()
+            };
+        }
+    }
+    let Some(def) = index_defs.get(&gsi.index_name) else {
+        return GsiSpec {
+            serveable: false,
+            unserveable_reason: Some(format!(
+                "GSI `{}` index `{}` missing from pg_indexes",
+                gsi.name, gsi.index_name
+            )),
+            ..gsi.clone()
+        };
+    };
+    let expected = match (&gsi.sort_pg_col, gsi.sort_type) {
+        (Some(sa), Some(_)) => format!("({}, {})", gsi.partition_pg_col, sa),
+        _ => format!("({})", gsi.partition_pg_col),
+    };
+    if !def.contains(&expected) {
+        return GsiSpec {
+            serveable: false,
+            unserveable_reason: Some(format!(
+                "GSI `{}` index columns mismatch: expected `{expected}` in indexdef, got: {def}",
+                gsi.name
+            )),
+            ..gsi.clone()
+        };
+    }
+    GsiSpec {
+        serveable: true,
+        unserveable_reason: None,
+        ..gsi.clone()
     }
 }
 
@@ -488,7 +583,7 @@ async fn fetch_primary_key(
 async fn fetch_indexes(
     client: &deadpool_postgres::Object,
     pg_table: &str,
-) -> Result<HashMap<String, String>, CatalogError> {
+) -> Result<HMap<String, String>, CatalogError> {
     let rows = client.query(SELECT_INDEXES_SQL, &[&pg_table]).await?;
     Ok(rows
         .into_iter()

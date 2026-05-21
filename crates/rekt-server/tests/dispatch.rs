@@ -750,6 +750,7 @@ fn schemas() -> HashMap<String, TableSchema> {
         sk_type: None,
         jsonb_col: "data".into(),
         lsis: Default::default(),
+            gsis: Default::default(),
     };
     let events = TableSchema {
         name: "device_events".into(),
@@ -760,6 +761,7 @@ fn schemas() -> HashMap<String, TableSchema> {
         sk_type: Some(KeyType::N),
         jsonb_col: "doc".into(),
         lsis: Default::default(),
+            gsis: Default::default(),
     };
     let messages = TableSchema {
         name: "messages".into(),
@@ -770,6 +772,7 @@ fn schemas() -> HashMap<String, TableSchema> {
         sk_type: Some(KeyType::S),
         jsonb_col: "data".into(),
         lsis: Default::default(),
+            gsis: Default::default(),
     };
     // N-PK, B-PK, and S+B composite — matches rektifier.toml.example
     // so dispatch tests can exercise the same key-type matrix the
@@ -784,6 +787,7 @@ fn schemas() -> HashMap<String, TableSchema> {
         sk_type: None,
         jsonb_col: "data".into(),
         lsis: Default::default(),
+            gsis: Default::default(),
     };
     let blobs = TableSchema {
         name: "blobs".into(),
@@ -794,6 +798,7 @@ fn schemas() -> HashMap<String, TableSchema> {
         sk_type: None,
         jsonb_col: "data".into(),
         lsis: Default::default(),
+            gsis: Default::default(),
     };
     let binsorted = TableSchema {
         name: "binsorted".into(),
@@ -804,6 +809,7 @@ fn schemas() -> HashMap<String, TableSchema> {
         sk_type: Some(KeyType::B),
         jsonb_col: "data".into(),
         lsis: Default::default(),
+            gsis: Default::default(),
     };
     let mut m = HashMap::new();
     m.insert(users.name.clone(), users);

@@ -24,6 +24,25 @@ pub struct TableSchema {
     /// the catalog's snapshot builder from the per-row `lsi_specs` JSONB
     /// blob. Empty when the table declares no LSIs.
     pub lsis: HashMap<String, LsiSchema>,
+    /// PLAN-9 G1. Declared GSIs, keyed by IndexName. Same population
+    /// pattern as `lsis`.
+    pub gsis: HashMap<String, GsiSchema>,
+}
+
+/// PLAN-9 G1. Translator-side view of a declared GSI. The GSI's HASH
+/// attribute replaces the base table's partition key in the synthetic
+/// schema used by KCE resolution.
+#[derive(Debug, Clone)]
+pub struct GsiSchema {
+    pub name: String,
+    pub partition_attr: String,
+    pub partition_type: KeyType,
+    pub partition_pg_col: String,
+    pub sort_attr: Option<String>,
+    pub sort_type: Option<KeyType>,
+    pub sort_pg_col: Option<String>,
+    pub serveable: bool,
+    pub unserveable_reason: Option<String>,
 }
 
 /// Translator-side view of a declared LSI. The catalog's `LsiSpec`
@@ -72,6 +91,20 @@ impl TableSchema {
             pk_type: self.pk_type,
             sk_col: Some(&lsi.sort_pg_col),
             sk_type: Some(lsi.sort_type),
+            jsonb_col: &self.jsonb_col,
+        }
+    }
+
+    /// PLAN-9 G7. Build a `TableShape` that targets a GSI. Both PK and
+    /// SK columns are substituted with the GSI's attrs. For hash-only
+    /// GSIs the sk_col is None.
+    pub fn shape_for_gsi<'a>(&'a self, gsi: &'a GsiSchema) -> TableShape<'a> {
+        TableShape {
+            table: &self.pg_table,
+            pk_col: &gsi.partition_pg_col,
+            pk_type: gsi.partition_type,
+            sk_col: gsi.sort_pg_col.as_deref(),
+            sk_type: gsi.sort_type,
             jsonb_col: &self.jsonb_col,
         }
     }

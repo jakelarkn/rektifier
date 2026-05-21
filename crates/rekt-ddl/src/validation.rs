@@ -59,6 +59,26 @@ pub struct CreateTablePlan {
     /// Each plan carries the typed sort-attr info; L2 emits per-LSI
     /// `GENERATED ALWAYS AS ... STORED` columns + `CREATE INDEX`.
     pub lsis: Vec<LsiPlan>,
+    /// PLAN-9 G1. GSIs declared at table-creation time. Empty when
+    /// none requested. The pre-production scope ships only the
+    /// CreateTable-time GSI path (G2-simplified); online add via
+    /// UpdateTable is deferred and continues to be rejected.
+    pub gsis: Vec<GsiPlan>,
+}
+
+/// PLAN-9 G1. Post-validation form of a single GSI declaration.
+/// Partition attribute is required; sort attribute is optional (DDB
+/// permits hash-only GSIs). Each attribute name doubles as the PG
+/// column name (same convention as base PK/SK and LSI sort attrs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GsiPlan {
+    pub name: String,
+    pub partition_attr: String,
+    pub partition_type: KeyType,
+    pub sort_attr: Option<String>,
+    pub sort_type: Option<KeyType>,
+    pub projection_type: Option<String>,
+    pub projection_non_key_attrs: Option<Vec<String>>,
 }
 
 /// Post-validation form of a single LSI declaration. PLAN-11 D1 / D8 /
@@ -90,6 +110,7 @@ pub fn validate_create_table(req: &CreateTableRequest) -> Result<CreateTablePlan
     let (pk_attr, pk_type, sk_attr, sk_type) =
         validate_key_schema_and_attrs(&req.table_name, req)?;
     validate_gsi_structures(&req.table_name, req)?;
+    let gsis = validate_gsi_plans(&req.table_name, req, &pk_attr, sk_attr.as_deref())?;
     let lsis = validate_lsi_structures(
         &req.table_name,
         req,
@@ -112,7 +133,130 @@ pub fn validate_create_table(req: &CreateTableRequest) -> Result<CreateTablePlan
         provisioned_wcu: provisioned.map(|p| p.write_capacity_units),
         tags: tags_to_json(req.tags.as_ref()),
         lsis,
+        gsis,
     })
+}
+
+/// PLAN-9 G1. Walks `GlobalSecondaryIndexes`, extracts typed plan info
+/// for each GSI, and enforces GSI-specific column-collision rules
+/// against the base PK/SK and LSI sort attrs. The earlier
+/// `validate_gsi_structures` pass has already enforced shape
+/// (HASH/RANGE cardinality, IndexName grammar, no duplicates); this
+/// pass produces the typed form downstream consumers (catalog, DDL
+/// emitter) use.
+fn validate_gsi_plans(
+    table_name: &str,
+    req: &CreateTableRequest,
+    base_pk_attr: &str,
+    base_sk_attr: Option<&str>,
+) -> Result<Vec<GsiPlan>, DdlError> {
+    let Some(gsis) = req.global_secondary_indexes.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if gsis.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut defs: std::collections::HashMap<&str, KeyType> = Default::default();
+    for ad in &req.attribute_definitions {
+        let kt = parse_attribute_type(table_name, &ad.attribute_name, &ad.attribute_type)?;
+        defs.insert(ad.attribute_name.as_str(), kt);
+    }
+
+    // PLAN-9 D9 (refcount): two GSIs may share a partition or sort
+    // attribute. The DDL emitter dedupes columns; here we only enforce
+    // that no GSI attribute collides with the base table's key columns
+    // or with an LSI's sort column (which would create a column-name
+    // conflict at CREATE TABLE time). LSI sort attrs are checked
+    // against GSI attrs via the validate_lsi_structures pass that runs
+    // afterwards.
+    let mut out: Vec<GsiPlan> = Vec::with_capacity(gsis.len());
+    for gsi in gsis {
+        let mut partition_attr: Option<&str> = None;
+        let mut sort_attr: Option<&str> = None;
+        for kse in &gsi.key_schema {
+            match kse.key_type.as_str() {
+                "HASH" => partition_attr = Some(&kse.attribute_name),
+                "RANGE" => sort_attr = Some(&kse.attribute_name),
+                _ => unreachable!(
+                    "validate_gsi_key_schema already rejected non-HASH/RANGE entries"
+                ),
+            }
+        }
+        let partition_attr = partition_attr.ok_or_else(|| {
+            DdlError::Validation(format!(
+                "table `{table_name}`: GSI `{}`: KeySchema must contain a HASH entry \
+                 (already enforced by validate_gsi_key_schema; this is a bug if reached)",
+                gsi.index_name
+            ))
+        })?;
+        let partition_type = *defs.get(partition_attr).ok_or_else(|| {
+            DdlError::Validation(format!(
+                "table `{table_name}`: GSI `{}` partition attribute `{partition_attr}` \
+                 has no AttributeDefinitions entry",
+                gsi.index_name
+            ))
+        })?;
+        let sort_info = if let Some(s) = sort_attr {
+            let st = *defs.get(s).ok_or_else(|| {
+                DdlError::Validation(format!(
+                    "table `{table_name}`: GSI `{}` sort attribute `{s}` \
+                     has no AttributeDefinitions entry",
+                    gsi.index_name
+                ))
+            })?;
+            Some((s.to_string(), st))
+        } else {
+            None
+        };
+
+        // Projection enum check (PLAN-9 D11 / matches PLAN-11 L1 LSI behavior).
+        if let Some(pt) = gsi.projection.projection_type.as_deref() {
+            if pt != "ALL" && pt != "KEYS_ONLY" && pt != "INCLUDE" {
+                return Err(DdlError::Validation(format!(
+                    "table `{table_name}`: GSI `{}` Projection.ProjectionType `{pt}` \
+                     is not one of ALL | KEYS_ONLY | INCLUDE",
+                    gsi.index_name
+                )));
+            }
+        }
+
+        // PLAN-9 D9 column-name discipline (subset): GSI HASH attr must
+        // not equal the base table's HASH or RANGE — that would be a
+        // GSI that's just the base table's key, which is redundant
+        // (and DDB rejects). Sort attr equal to base SK is also
+        // pointless; reject. Attrs equal to LSI columns are still
+        // allowed because the DDL emitter dedupes via refcount.
+        if partition_attr == base_pk_attr && sort_info.is_none() {
+            return Err(DdlError::Validation(format!(
+                "table `{table_name}`: GSI `{}` has the same hash-only KeySchema as the \
+                 base table — would be a redundant index",
+                gsi.index_name
+            )));
+        }
+        if partition_attr == base_pk_attr && sort_info.as_ref().map(|(s, _)| s.as_str()) == base_sk_attr {
+            return Err(DdlError::Validation(format!(
+                "table `{table_name}`: GSI `{}` KeySchema equals the base table's KeySchema \
+                 — would be a redundant index",
+                gsi.index_name
+            )));
+        }
+
+        let (sort_attr_str, sort_type) = match sort_info {
+            None => (None, None),
+            Some((s, t)) => (Some(s), Some(t)),
+        };
+        out.push(GsiPlan {
+            name: gsi.index_name.clone(),
+            partition_attr: partition_attr.to_string(),
+            partition_type,
+            sort_attr: sort_attr_str,
+            sort_type,
+            projection_type: gsi.projection.projection_type.clone(),
+            projection_non_key_attrs: gsi.projection.non_key_attributes.clone(),
+        });
+    }
+    Ok(out)
 }
 
 /// Cheap re-validation for DeleteTable / UpdateTable. Doesn't enforce

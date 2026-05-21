@@ -174,19 +174,33 @@ pub struct QueryPlan {
     pub index_sort: Option<IndexSort>,
 }
 
-/// PLAN-11 L4. Index-sort substitution: the dispatcher uses this to
-/// build a `TableShape` whose `sk_col`/`sk_type` come from the LSI
-/// rather than the base table. PG's planner then picks the LSI's btree
-/// because the WHERE clause matches the index's `(base_pk, sort_col)`
-/// column order.
+/// PLAN-11 L4 / PLAN-9 G7. Index-shape substitution: the dispatcher
+/// uses this to build a `TableShape` whose pk/sk columns come from the
+/// index rather than the base table. LSIs override only the sk side
+/// (partition is shared with the base table); GSIs override both.
+///
+/// For LSI: `partition_override` is `None` (use base PK), `sort` is
+/// `Some(lsi sort)`.
+///
+/// For GSI: `partition_override` is `Some(gsi HASH)`; `sort` is
+/// `Some(gsi RANGE)` for HASH+RANGE GSIs, `None` for hash-only GSIs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexSort {
-    /// Name of the LSI being queried. Carried through for tracing /
-    /// error messages; the dispatch gate has already resolved it.
     pub index_name: String,
-    /// PG column name of the LSI sort attribute.
-    pub sort_pg_col: String,
-    pub sort_type: KeyType,
+    /// Partition override. None means "use the base table's PK"
+    /// (LSI semantics). Some means "substitute with the GSI's HASH"
+    /// (GSI semantics).
+    pub partition_override: Option<IndexColumn>,
+    /// Sort override. None for hash-only GSIs; Some for LSIs and
+    /// HASH+RANGE GSIs.
+    pub sort: Option<IndexColumn>,
+}
+
+/// PLAN-9 G7. Per-column substitution carried inside IndexSort.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexColumn {
+    pub pg_col: String,
+    pub key_type: KeyType,
 }
 
 #[derive(Debug, Clone)]

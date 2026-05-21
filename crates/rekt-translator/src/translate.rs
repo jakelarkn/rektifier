@@ -280,39 +280,76 @@ pub fn translate_query(
     })
 }
 
-/// PLAN-11 L4. Build the effective schema for a Query / Scan request
-/// based on `IndexName`. Returns a `Cow` so the base-table path doesn't
-/// pay for a clone; the LSI path constructs a synthetic schema with
-/// `sk_attr` / `sk_type` substituted to drive
-/// `extract_key_condition`'s sort-key term resolution.
+/// PLAN-11 L4 / PLAN-9 G7. Build the effective schema for a Query /
+/// Scan request based on `IndexName`. Returns a `Cow` so the
+/// base-table path doesn't pay for a clone. The LSI path replaces
+/// `sk_attr`/`sk_type`; the GSI path replaces both `pk_attr`/`pk_type`
+/// AND `sk_attr`/`sk_type`.
 fn resolve_index_for_query<'a>(
     schema: &'a TableSchema,
     index_name: Option<&str>,
 ) -> Result<(std::borrow::Cow<'a, TableSchema>, Option<crate::plan::IndexSort>), TranslateError> {
+    use crate::plan::{IndexColumn, IndexSort};
     let Some(name) = index_name else {
         return Ok((std::borrow::Cow::Borrowed(schema), None));
     };
-    let lsi = schema.lsis.get(name).ok_or_else(|| TranslateError::IndexNotFound {
-        index: name.to_string(),
-    })?;
-    if !lsi.serveable {
-        return Err(TranslateError::IndexNotServeable {
-            index: name.to_string(),
-            reason: lsi
-                .unserveable_reason
-                .clone()
-                .unwrap_or_else(|| "not currently queryable".into()),
-        });
+    if let Some(lsi) = schema.lsis.get(name) {
+        if !lsi.serveable {
+            return Err(TranslateError::IndexNotServeable {
+                index: name.to_string(),
+                reason: lsi
+                    .unserveable_reason
+                    .clone()
+                    .unwrap_or_else(|| "not currently queryable".into()),
+            });
+        }
+        let mut synthetic = schema.clone();
+        synthetic.sk_attr = Some(lsi.sort_attr.clone());
+        synthetic.sk_type = Some(lsi.sort_type);
+        let idx = IndexSort {
+            index_name: name.to_string(),
+            partition_override: None,
+            sort: Some(IndexColumn {
+                pg_col: lsi.sort_pg_col.clone(),
+                key_type: lsi.sort_type,
+            }),
+        };
+        return Ok((std::borrow::Cow::Owned(synthetic), Some(idx)));
     }
-    let mut synthetic = schema.clone();
-    synthetic.sk_attr = Some(lsi.sort_attr.clone());
-    synthetic.sk_type = Some(lsi.sort_type);
-    let idx = crate::plan::IndexSort {
-        index_name: name.to_string(),
-        sort_pg_col: lsi.sort_pg_col.clone(),
-        sort_type: lsi.sort_type,
-    };
-    Ok((std::borrow::Cow::Owned(synthetic), Some(idx)))
+    if let Some(gsi) = schema.gsis.get(name) {
+        if !gsi.serveable {
+            return Err(TranslateError::IndexNotServeable {
+                index: name.to_string(),
+                reason: gsi
+                    .unserveable_reason
+                    .clone()
+                    .unwrap_or_else(|| "not currently queryable".into()),
+            });
+        }
+        let mut synthetic = schema.clone();
+        synthetic.pk_attr = gsi.partition_attr.clone();
+        synthetic.pk_type = gsi.partition_type;
+        synthetic.sk_attr = gsi.sort_attr.clone();
+        synthetic.sk_type = gsi.sort_type;
+        let idx = IndexSort {
+            index_name: name.to_string(),
+            partition_override: Some(IndexColumn {
+                pg_col: gsi.partition_pg_col.clone(),
+                key_type: gsi.partition_type,
+            }),
+            sort: match (gsi.sort_pg_col.as_ref(), gsi.sort_type) {
+                (Some(c), Some(t)) => Some(IndexColumn {
+                    pg_col: c.clone(),
+                    key_type: t,
+                }),
+                _ => None,
+            },
+        };
+        return Ok((std::borrow::Cow::Owned(synthetic), Some(idx)));
+    }
+    Err(TranslateError::IndexNotFound {
+        index: name.to_string(),
+    })
 }
 
 #[tracing::instrument(level = "debug", skip_all, name = "translate.scan", fields(table = %schema.name))]

@@ -3,7 +3,7 @@
 //! All SQL lives here, isolated from the cache mechanics. Callers
 //! (seeder, reconciler, DDL workers) compose these primitives.
 
-use crate::{CatalogError, GsiCacheEntry, LsiSpec, TableEntry, TableStatus};
+use crate::{CatalogError, GsiSpec, LsiSpec, TableEntry, TableStatus};
 use deadpool_postgres::Pool;
 use rekt_storage::KeyType;
 use rekt_translator::TableSchema;
@@ -49,6 +49,8 @@ pub struct MetadataRow {
     /// PLAN-11 L3: per-LSI specs, stored as a JSONB array. Empty array
     /// when the table declared no LSIs.
     pub lsi_specs: serde_json::Value,
+    /// PLAN-9 G1: per-GSI specs, stored as a JSONB array.
+    pub gsi_specs: serde_json::Value,
 }
 
 const SELECT_ALL_SQL: &str = "\
@@ -56,7 +58,7 @@ SELECT table_name, pg_table, jsonb_col, pk_attr, pk_type, sk_attr, sk_type,
        status, serveable, unserveable_reason,
        last_modified_at_ms, last_modified_by, creation_date_ms,
        tags, billing_mode, provisioned_rcu, provisioned_wcu,
-       lsi_specs
+       lsi_specs, gsi_specs
   FROM _rektifier_tables
 ";
 
@@ -92,6 +94,7 @@ pub async fn load_snapshot(
             provisioned_rcu: row.get("provisioned_rcu"),
             provisioned_wcu: row.get("provisioned_wcu"),
             lsi_specs: row.get("lsi_specs"),
+            gsi_specs: row.get("gsi_specs"),
         };
         let entry = row_to_entry(raw)?;
         out.insert(entry.schema.name.clone(), Arc::new(entry));
@@ -122,6 +125,7 @@ pub fn row_to_entry(row: MetadataRow) -> Result<TableEntry, CatalogError> {
         });
     }
     let lsis = lsi_specs_from_json(&row.table_name, &row.lsi_specs)?;
+    let gsis_vec = gsi_specs_from_json(&row.table_name, &row.gsi_specs)?;
     // PLAN-11 L4. Mirror the cache's typed LsiSpec list into the
     // translator's LsiSchema map so the translator/dispatch layer can
     // resolve IndexName without re-reading the catalog row.
@@ -141,6 +145,26 @@ pub fn row_to_entry(row: MetadataRow) -> Result<TableEntry, CatalogError> {
             )
         })
         .collect();
+    // PLAN-9 G1. Same shape for GSIs.
+    let schema_gsis: std::collections::HashMap<String, rekt_translator::GsiSchema> = gsis_vec
+        .iter()
+        .map(|s| {
+            (
+                s.name.clone(),
+                rekt_translator::GsiSchema {
+                    name: s.name.clone(),
+                    partition_attr: s.partition_attr.clone(),
+                    partition_type: s.partition_type,
+                    partition_pg_col: s.partition_pg_col.clone(),
+                    sort_attr: s.sort_attr.clone(),
+                    sort_type: s.sort_type,
+                    sort_pg_col: s.sort_pg_col.clone(),
+                    serveable: s.serveable,
+                    unserveable_reason: s.unserveable_reason.clone(),
+                },
+            )
+        })
+        .collect();
     let schema = TableSchema {
         name: row.table_name,
         pg_table: row.pg_table,
@@ -150,7 +174,14 @@ pub fn row_to_entry(row: MetadataRow) -> Result<TableEntry, CatalogError> {
         sk_type,
         jsonb_col: row.jsonb_col,
         lsis: schema_lsis,
+        gsis: schema_gsis,
     };
+    // PLAN-9 G1. Materialize the GSI vec into the catalog's
+    // HashMap<IndexName, GsiSpec> shape used at TableEntry storage.
+    let gsis: HashMap<String, GsiSpec> = gsis_vec
+        .into_iter()
+        .map(|g| (g.name.clone(), g))
+        .collect();
     Ok(TableEntry {
         schema,
         status,
@@ -163,7 +194,7 @@ pub fn row_to_entry(row: MetadataRow) -> Result<TableEntry, CatalogError> {
         provisioned_rcu: row.provisioned_rcu,
         provisioned_wcu: row.provisioned_wcu,
         tags: row.tags,
-        gsis: HashMap::<String, GsiCacheEntry>::new(),
+        gsis,
         lsis,
     })
 }
@@ -267,6 +298,126 @@ fn read_str(
         })
 }
 
+/// PLAN-9 G1. GSI analog of `lsi_specs_to_json`. Shape is internal
+/// (same writer and reader own both ends) so a flat hand-rolled object
+/// keeps the catalog free of serde derives on `KeyType`.
+pub fn gsi_specs_to_json(specs: &[GsiSpec]) -> serde_json::Value {
+    serde_json::Value::Array(
+        specs
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "name":                 s.name,
+                    "partition_attr":       s.partition_attr,
+                    "partition_type":       key_type_str(s.partition_type),
+                    "partition_pg_col":     s.partition_pg_col,
+                    "sort_attr":            s.sort_attr,
+                    "sort_type":            s.sort_type.map(key_type_str),
+                    "sort_pg_col":          s.sort_pg_col,
+                    "index_name":           s.index_name,
+                    "projection_type":      s.projection_type,
+                    "projection_non_key_attrs": s.projection_non_key_attrs,
+                    "serveable":            s.serveable,
+                    "unserveable_reason":   s.unserveable_reason,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Inverse of `gsi_specs_to_json`. Hard-fails on malformed shape so
+/// operator hand-edits don't silently drop GSIs.
+pub fn gsi_specs_from_json(
+    table_name: &str,
+    json: &serde_json::Value,
+) -> Result<Vec<GsiSpec>, CatalogError> {
+    let arr = json.as_array().ok_or_else(|| CatalogError::MalformedRow {
+        table_name: table_name.into(),
+        reason: "gsi_specs must be a JSON array".into(),
+    })?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, v) in arr.iter().enumerate() {
+        let obj = v.as_object().ok_or_else(|| CatalogError::MalformedRow {
+            table_name: table_name.into(),
+            reason: format!("gsi_specs[{idx}]: expected object"),
+        })?;
+        let name = read_str_g(obj, "name", table_name, idx)?;
+        let partition_attr = read_str_g(obj, "partition_attr", table_name, idx)?;
+        let partition_type_s = read_str_g(obj, "partition_type", table_name, idx)?;
+        let partition_type = parse_key_type(table_name, &partition_type_s)?;
+        let partition_pg_col = read_str_g(obj, "partition_pg_col", table_name, idx)?;
+        let sort_attr = obj
+            .get("sort_attr")
+            .and_then(|v| if v.is_null() { None } else { v.as_str() })
+            .map(str::to_string);
+        let sort_type = match obj.get("sort_type") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(s)) => Some(parse_key_type(table_name, s)?),
+            _ => {
+                return Err(CatalogError::MalformedRow {
+                    table_name: table_name.into(),
+                    reason: format!("gsi_specs[{idx}]: `sort_type` must be string or null"),
+                });
+            }
+        };
+        let sort_pg_col = obj
+            .get("sort_pg_col")
+            .and_then(|v| if v.is_null() { None } else { v.as_str() })
+            .map(str::to_string);
+        let index_name = read_str_g(obj, "index_name", table_name, idx)?;
+        let projection_type = obj
+            .get("projection_type")
+            .and_then(|v| if v.is_null() { None } else { v.as_str() })
+            .map(str::to_string);
+        let projection_non_key_attrs = obj
+            .get("projection_non_key_attrs")
+            .and_then(|v| if v.is_null() { None } else { v.as_array() })
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            });
+        let serveable = obj
+            .get("serveable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let unserveable_reason = obj
+            .get("unserveable_reason")
+            .and_then(|v| if v.is_null() { None } else { v.as_str() })
+            .map(str::to_string);
+        out.push(GsiSpec {
+            name,
+            partition_attr,
+            partition_type,
+            partition_pg_col,
+            sort_attr,
+            sort_type,
+            sort_pg_col,
+            index_name,
+            projection_type,
+            projection_non_key_attrs,
+            serveable,
+            unserveable_reason,
+        });
+    }
+    Ok(out)
+}
+
+fn read_str_g(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    table_name: &str,
+    idx: usize,
+) -> Result<String, CatalogError> {
+    obj.get(key)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| CatalogError::MalformedRow {
+            table_name: table_name.into(),
+            reason: format!("gsi_specs[{idx}]: missing or non-string `{key}`"),
+        })
+}
+
 fn parse_key_type(table_name: &str, s: &str) -> Result<KeyType, CatalogError> {
     match s {
         "S" => Ok(KeyType::S),
@@ -314,6 +465,7 @@ mod tests {
             provisioned_rcu: None,
             provisioned_wcu: None,
             lsi_specs: serde_json::json!([]),
+            gsi_specs: serde_json::json!([]),
         };
         let entry = row_to_entry(row).unwrap();
         assert_eq!(entry.schema.name, "users");
@@ -344,6 +496,7 @@ mod tests {
             provisioned_rcu: None,
             provisioned_wcu: None,
             lsi_specs: serde_json::json!([]),
+            gsi_specs: serde_json::json!([]),
         };
         let entry = row_to_entry(row).unwrap();
         assert_eq!(entry.schema.sk_attr.as_deref(), Some("ts"));
@@ -371,6 +524,7 @@ mod tests {
             provisioned_rcu: None,
             provisioned_wcu: None,
             lsi_specs: serde_json::json!([]),
+            gsi_specs: serde_json::json!([]),
         };
         let err = row_to_entry(row).unwrap_err();
         match err {
@@ -403,6 +557,7 @@ mod tests {
             provisioned_rcu: None,
             provisioned_wcu: None,
             lsi_specs: serde_json::json!([]),
+            gsi_specs: serde_json::json!([]),
         };
         let err = row_to_entry(row).unwrap_err();
         assert!(matches!(err, CatalogError::MalformedRow { .. }));

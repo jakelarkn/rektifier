@@ -52,7 +52,7 @@ pub use plan::{
     TransactGetItemsPlan, TransactGetPlanItem, TransactWriteItemsPlan, TransactWriteKind,
     TransactWritePlanItem, UpdateItemPlan,
 };
-pub use schema::{LsiSchema, TableSchema};
+pub use schema::{GsiSchema, LsiSchema, TableSchema};
 pub use translate::{
     translate_batch_get_item, translate_batch_write_item, translate_delete_item,
     translate_get_item, translate_put_item, translate_query, translate_scan,
@@ -80,6 +80,7 @@ mod tests {
             sk_type: None,
             jsonb_col: "data".into(),
             lsis: Default::default(),
+            gsis: Default::default(),
         }
     }
 
@@ -93,6 +94,7 @@ mod tests {
             sk_type: Some(KeyType::N),
             jsonb_col: "doc".into(),
             lsis: Default::default(),
+            gsis: Default::default(),
         }
     }
 
@@ -106,6 +108,7 @@ mod tests {
             sk_type: None,
             jsonb_col: "meta".into(),
             lsis: Default::default(),
+            gsis: Default::default(),
         }
     }
 
@@ -119,6 +122,7 @@ mod tests {
             sk_type: Some(KeyType::S),
             jsonb_col: "data".into(),
             lsis: Default::default(),
+            gsis: Default::default(),
         }
     }
 
@@ -2177,8 +2181,10 @@ mod tests {
         let plan = translate_query(&req, &schema).unwrap();
         let idx = plan.index_sort.expect("index_sort populated");
         assert_eq!(idx.index_name, "by_tier");
-        assert_eq!(idx.sort_pg_col, "tier");
-        assert_eq!(idx.sort_type, KeyType::S);
+        let sort = idx.sort.as_ref().expect("LSI must have sort");
+        assert_eq!(sort.pg_col, "tier");
+        assert_eq!(sort.key_type, KeyType::S);
+        assert!(idx.partition_override.is_none(), "LSI shares base PK");
         // The plan's SK condition reflects the LSI's column, not the
         // base table's ts.
         match plan.sk_condition {

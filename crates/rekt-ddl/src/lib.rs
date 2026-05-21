@@ -16,10 +16,10 @@ pub mod validation;
 
 use async_trait::async_trait;
 use deadpool_postgres::Pool;
-use crate::naming::derive_lsi_index_name;
+use crate::naming::{derive_gsi_index_name, derive_lsi_index_name};
 use rekt_catalog::{
     metadata::{key_type_str, now_ms},
-    CatalogError, LsiSpec, Reconciler, TableCatalog, TableEntry, TableStatus,
+    CatalogError, GsiSpec, LsiSpec, Reconciler, TableCatalog, TableEntry, TableStatus,
 };
 use rekt_protocol::{
     CreateTableRequest, DeleteTableRequest, TableDescription, UpdateTableRequest,
@@ -31,7 +31,7 @@ use std::sync::Arc;
 pub use create::{create_table_sql, derive_pg_table};
 pub use errors::DdlError;
 pub use naming::sanitize_pg_table_name;
-pub use validation::{validate_create_table, CreateTablePlan, LsiPlan};
+pub use validation::{validate_create_table, CreateTablePlan, GsiPlan, LsiPlan};
 
 /// DDL surface consumed by the dispatch handlers. Trait-driven so
 /// dispatch tests can supply a no-PG implementation that mutates an
@@ -111,13 +111,13 @@ INSERT INTO _rektifier_tables (
     sk_attr, sk_type, status, serveable,
     creation_date_ms, last_modified_at_ms, last_modified_by,
     tags, billing_mode, provisioned_rcu, provisioned_wcu,
-    lsi_specs
+    lsi_specs, gsi_specs
 ) VALUES (
     $1, $2, $3, $4, $5,
     $6, $7, 'CREATING', false,
     $8, $8, 'ddl',
     $9, $10, $11, $12,
-    $13::jsonb
+    $13::jsonb, $14::jsonb
 )
 ";
 
@@ -229,6 +229,9 @@ impl DdlBackend for PgDdlBackend {
         // confirms the underlying column + index exist post-DDL).
         let lsi_specs = build_lsi_specs(&plan, &pg_table);
         let lsi_specs_json = rekt_catalog::lsi_specs_to_json(&lsi_specs);
+        // PLAN-9 G1. Mirror for GSIs.
+        let gsi_specs = build_gsi_specs(&plan, &pg_table);
+        let gsi_specs_json = rekt_catalog::gsi_specs_to_json(&gsi_specs);
         let insert_rows = tx
             .execute(
                 INSERT_CREATING_SQL,
@@ -246,6 +249,7 @@ impl DdlBackend for PgDdlBackend {
                     &plan.provisioned_rcu,
                     &plan.provisioned_wcu,
                     &lsi_specs_json,
+                    &gsi_specs_json,
                 ],
             )
             .await;
@@ -507,6 +511,7 @@ pub fn build_lsi_specs(plan: &CreateTablePlan, pg_table: &str) -> Vec<LsiSpec> {
 pub fn entry_for_new_table(plan: &CreateTablePlan) -> TableEntry {
     let pg_table = derive_pg_table(plan);
     let lsis = build_lsi_specs(plan, &pg_table);
+    let gsis = build_gsi_specs(plan, &pg_table);
     let schema_lsis: HashMap<String, rekt_translator::LsiSchema> = lsis
         .iter()
         .map(|s| {
@@ -523,6 +528,29 @@ pub fn entry_for_new_table(plan: &CreateTablePlan) -> TableEntry {
             )
         })
         .collect();
+    let schema_gsis: HashMap<String, rekt_translator::GsiSchema> = gsis
+        .iter()
+        .map(|s| {
+            (
+                s.name.clone(),
+                rekt_translator::GsiSchema {
+                    name: s.name.clone(),
+                    partition_attr: s.partition_attr.clone(),
+                    partition_type: s.partition_type,
+                    partition_pg_col: s.partition_pg_col.clone(),
+                    sort_attr: s.sort_attr.clone(),
+                    sort_type: s.sort_type,
+                    sort_pg_col: s.sort_pg_col.clone(),
+                    serveable: s.serveable,
+                    unserveable_reason: s.unserveable_reason.clone(),
+                },
+            )
+        })
+        .collect();
+    let gsis_map: HashMap<String, GsiSpec> = gsis
+        .into_iter()
+        .map(|g| (g.name.clone(), g))
+        .collect();
     let now = now_ms();
     TableEntry {
         schema: TableSchema {
@@ -534,6 +562,7 @@ pub fn entry_for_new_table(plan: &CreateTablePlan) -> TableEntry {
             sk_type: plan.sk_type,
             jsonb_col: plan.jsonb_col.clone(),
             lsis: schema_lsis,
+            gsis: schema_gsis,
         },
         status: TableStatus::Active,
         serveable: true,
@@ -545,9 +574,34 @@ pub fn entry_for_new_table(plan: &CreateTablePlan) -> TableEntry {
         provisioned_rcu: plan.provisioned_rcu,
         provisioned_wcu: plan.provisioned_wcu,
         tags: plan.tags.clone(),
-        gsis: HashMap::new(),
+        gsis: gsis_map,
         lsis,
     }
+}
+
+/// PLAN-9 G1. Mirror of `build_lsi_specs` for GSIs. Materializes the
+/// validator's typed `GsiPlan` list into catalog-shaped `GsiSpec`
+/// entries, deriving the PG index identifier via
+/// `derive_gsi_index_name`. `serveable=true` is the create-path
+/// default; the reconciler demotes if drift appears later.
+pub fn build_gsi_specs(plan: &CreateTablePlan, pg_table: &str) -> Vec<GsiSpec> {
+    plan.gsis
+        .iter()
+        .map(|g| GsiSpec {
+            name: g.name.clone(),
+            partition_attr: g.partition_attr.clone(),
+            partition_type: g.partition_type,
+            partition_pg_col: g.partition_attr.clone(),
+            sort_attr: g.sort_attr.clone(),
+            sort_type: g.sort_type,
+            sort_pg_col: g.sort_attr.clone(),
+            index_name: derive_gsi_index_name(pg_table, &g.name),
+            projection_type: g.projection_type.clone(),
+            projection_non_key_attrs: g.projection_non_key_attrs.clone(),
+            serveable: true,
+            unserveable_reason: None,
+        })
+        .collect()
 }
 
 /// Mirrors `rekt_server::ddl::table_description_from_entry` but lives

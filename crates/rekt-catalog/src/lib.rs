@@ -33,7 +33,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub use bootstrap::ensure_metadata_tables;
-pub use metadata::{load_snapshot, lsi_specs_from_json, lsi_specs_to_json, MetadataRow};
+pub use metadata::{
+    gsi_specs_from_json, gsi_specs_to_json, load_snapshot, lsi_specs_from_json, lsi_specs_to_json,
+    MetadataRow,
+};
 pub use reconciler::{ReconcileVerdict, Reconciler};
 
 #[derive(Debug, thiserror::Error)]
@@ -177,16 +180,33 @@ pub struct LsiSpec {
     pub unserveable_reason: Option<String>,
 }
 
-/// Per-GSI cache state placeholder; PLAN-9 owns the real shape.
-/// Defined here (rather than in PLAN-9's crate) so the catalog can
-/// expose stable cross-references during D5's DescribeTable wiring,
-/// even with PLAN-9 not yet landed.
-#[derive(Debug, Clone)]
-pub struct GsiCacheEntry {
-    /// DDB wire vocabulary: CREATING | ACTIVE | UPDATING | DELETING.
-    pub status: String,
-    pub key_schema: Vec<(String, String)>,
+/// PLAN-9 G1. Per-GSI cache state — the GSI analog of `LsiSpec`.
+/// `partition_attr` is required (every GSI has a HASH); `sort_attr`
+/// is optional (DDB permits hash-only GSIs). Each attribute name
+/// doubles as the PG column name (matches PK/SK and LSI sort-attr
+/// convention).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GsiSpec {
+    pub name: String,
+    pub partition_attr: String,
+    pub partition_type: KeyType,
+    pub partition_pg_col: String,
+    pub sort_attr: Option<String>,
+    pub sort_type: Option<KeyType>,
+    pub sort_pg_col: Option<String>,
+    pub index_name: String,
+    pub projection_type: Option<String>,
+    pub projection_non_key_attrs: Option<Vec<String>>,
+    /// Reconciler-driven gate (PLAN-9 D7 / G8). When `false`,
+    /// Query/Scan with this IndexName returns RNF at dispatch.
+    pub serveable: bool,
+    pub unserveable_reason: Option<String>,
 }
+
+/// PLAN-9 G1 prior placeholder. Retained as a thin alias for the
+/// transitional period while DescribeTable / dispatch sites are
+/// migrated; new code uses `GsiSpec` directly.
+pub type GsiCacheEntry = GsiSpec;
 
 /// Immutable snapshot swapped wholesale by writers. Holds two views of
 /// the same data:
@@ -281,6 +301,7 @@ mod tests {
                 sk_type: None,
                 jsonb_col: "data".into(),
                 lsis: Default::default(),
+            gsis: Default::default(),
             },
             status: TableStatus::Active,
             serveable: true,

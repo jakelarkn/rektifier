@@ -432,6 +432,34 @@ impl From<SigV4Error> for ApiError {
 /// is functionally equivalent to a missing one. DDB SDK retry logic
 /// for RNF often does the right thing — by the time the retry lands,
 /// the reconciler may have flipped serveable back.
+/// PLAN-11 L4 / PLAN-9 G7. Build the storage `TableShape` for a
+/// Query/Scan request. `index_sort = None` produces the base-table
+/// shape; `Some` substitutes pk/sk columns per the resolved index.
+fn build_index_shape<'a>(
+    schema: &'a rekt_translator::TableSchema,
+    index_sort: Option<&'a rekt_translator::plan::IndexSort>,
+) -> rekt_storage::TableShape<'a> {
+    let Some(idx) = index_sort else {
+        return schema.shape();
+    };
+    let (pk_col, pk_type) = match &idx.partition_override {
+        Some(p) => (p.pg_col.as_str(), p.key_type),
+        None => (schema.pk_attr.as_str(), schema.pk_type),
+    };
+    let (sk_col, sk_type) = match &idx.sort {
+        Some(s) => (Some(s.pg_col.as_str()), Some(s.key_type)),
+        None => (None, None),
+    };
+    rekt_storage::TableShape {
+        table: &schema.pg_table,
+        pk_col,
+        pk_type,
+        sk_col,
+        sk_type,
+        jsonb_col: &schema.jsonb_col,
+    }
+}
+
 fn require_serveable(
     catalog: &TableCatalog,
     table_name: &str,
@@ -842,20 +870,11 @@ async fn handle_query(state: &AppState, body: &Bytes) -> Result<Response, ApiErr
                 Box::new(move |row| evaluate_condition(Some(row), &cond));
             f
         });
-    // PLAN-11 L4. LSI Query swaps the storage shape's sk_col/sk_type
-    // for the LSI's column. PG's planner then routes through the LSI's
-    // (base_pk, sort_col) btree.
-    let shape = match plan.index_sort.as_ref() {
-        None => schema.shape(),
-        Some(idx) => rekt_storage::TableShape {
-            table: &schema.pg_table,
-            pk_col: &schema.pk_attr,
-            pk_type: schema.pk_type,
-            sk_col: Some(&idx.sort_pg_col),
-            sk_type: Some(idx.sort_type),
-            jsonb_col: &schema.jsonb_col,
-        },
-    };
+    // PLAN-11 L4 / PLAN-9 G7. Index Query swaps the storage shape's
+    // pk/sk columns. LSIs share the base PK (partition_override is
+    // None); GSIs override both. PG's planner picks the right btree
+    // because the WHERE clause matches the substituted column order.
+    let shape = build_index_shape(schema, plan.index_sort.as_ref());
     let outcome = state
         .backend
         .query_raw(
@@ -960,19 +979,9 @@ async fn handle_scan(state: &AppState, body: &Bytes) -> Result<Response, ApiErro
             f
         });
 
-    // PLAN-11 L4. LSI scan: substitute sk_col/sk_type for the LSI's.
-    // Same shape rewrite as handle_query.
-    let shape = match plan.index_sort.as_ref() {
-        None => schema.shape(),
-        Some(idx) => rekt_storage::TableShape {
-            table: &schema.pg_table,
-            pk_col: &schema.pk_attr,
-            pk_type: schema.pk_type,
-            sk_col: Some(&idx.sort_pg_col),
-            sk_type: Some(idx.sort_type),
-            jsonb_col: &schema.jsonb_col,
-        },
-    };
+    // PLAN-11 L4 / PLAN-9 G7. Index Scan: same shape rewrite as
+    // handle_query (LSI shares base PK, GSI overrides both).
+    let shape = build_index_shape(schema, plan.index_sort.as_ref());
     let outcome = state
         .backend
         .scan_raw(&shape, filter_fn, plan.limit, esk_pair)

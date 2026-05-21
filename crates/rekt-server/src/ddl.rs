@@ -126,39 +126,65 @@ pub(crate) fn table_description_from_entry(entry: &TableEntry) -> TableDescripti
         Some(descs)
     };
 
-    // GSI descriptions — joined from the catalog's per-GSI cache (PLAN-9
-    // populates these once it lands). Today the map is always empty.
+    // PLAN-9 G1. Add GSI HASH + RANGE attrs to AttributeDefinitions if
+    // not already declared (same shape as the LSI loop above).
+    for gsi in entry.gsis.values() {
+        if declared.insert(gsi.partition_attr.clone()) {
+            attr_defs.push(AttributeDefinition {
+                attribute_name: gsi.partition_attr.clone(),
+                attribute_type: key_type_wire(gsi.partition_type).into(),
+            });
+        }
+        if let (Some(sa), Some(st)) = (&gsi.sort_attr, gsi.sort_type) {
+            if declared.insert(sa.clone()) {
+                attr_defs.push(AttributeDefinition {
+                    attribute_name: sa.clone(),
+                    attribute_type: key_type_wire(st).into(),
+                });
+            }
+        }
+    }
+
+    // GSI descriptions — synthesized from entry.gsis. Each GSI carries
+    // a per-LSI-style serveable bit; if false, IndexStatus collapses
+    // to CREATING (matching DDB's stance on non-ACTIVE indexes per
+    // PLAN-9 D16). Otherwise ACTIVE.
     let gsi_descs = if entry.gsis.is_empty() {
         None
     } else {
         let mut descs: Vec<GlobalSecondaryIndexDescription> = entry
             .gsis
-            .iter()
-            .map(|(name, g)| GlobalSecondaryIndexDescription {
-                index_name: Some(name.clone()),
-                index_status: Some(g.status.clone()),
-                key_schema: Some(
-                    g.key_schema
-                        .iter()
-                        .map(|(attr, kt)| KeySchemaElement {
-                            attribute_name: attr.clone(),
-                            key_type: kt.clone(),
-                        })
-                        .collect(),
-                ),
-                projection: Some(Projection {
-                    projection_type: Some("ALL".into()),
-                    non_key_attributes: None,
-                }),
-                index_size_bytes: Some(0),
-                item_count: Some(0),
-                index_arn: None,
-                backfilling: None,
-                provisioned_throughput: None,
+            .values()
+            .map(|g| {
+                let mut ks = vec![KeySchemaElement {
+                    attribute_name: g.partition_attr.clone(),
+                    key_type: "HASH".into(),
+                }];
+                if let Some(sa) = &g.sort_attr {
+                    ks.push(KeySchemaElement {
+                        attribute_name: sa.clone(),
+                        key_type: "RANGE".into(),
+                    });
+                }
+                GlobalSecondaryIndexDescription {
+                    index_name: Some(g.name.clone()),
+                    index_status: Some(if g.serveable { "ACTIVE" } else { "CREATING" }.into()),
+                    key_schema: Some(ks),
+                    projection: Some(Projection {
+                        projection_type: g
+                            .projection_type
+                            .clone()
+                            .or_else(|| Some("ALL".into())),
+                        non_key_attributes: g.projection_non_key_attrs.clone(),
+                    }),
+                    index_size_bytes: Some(0),
+                    item_count: Some(0),
+                    index_arn: None,
+                    backfilling: None,
+                    provisioned_throughput: None,
+                }
             })
             .collect();
-        // Stable ordering — DDB sorts by IndexName; mirror that so
-        // response diffs stay deterministic.
         descs.sort_by(|a, b| a.index_name.cmp(&b.index_name));
         Some(descs)
     };
@@ -385,6 +411,7 @@ mod tests {
                 sk_type: sk.map(|(_, t)| t),
                 jsonb_col: "data".into(),
                 lsis: Default::default(),
+            gsis: Default::default(),
             },
             status,
             serveable: status == TableStatus::Active,

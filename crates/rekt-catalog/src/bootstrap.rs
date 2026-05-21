@@ -28,14 +28,17 @@ CREATE TABLE IF NOT EXISTS _rektifier_tables (
     provisioned_rcu         bigint,
     provisioned_wcu         bigint,
     lsi_specs               jsonb NOT NULL DEFAULT '[]'::jsonb,
+    gsi_specs               jsonb NOT NULL DEFAULT '[]'::jsonb,
     UNIQUE (pg_table)
 );
 
--- PLAN-11 L3. Idempotent for catalogs created before LSI support; rows
--- pre-dating the column default into the empty-list shape so they
--- round-trip cleanly through the reconciler.
+-- PLAN-11 L3 / PLAN-9 G1. Idempotent for catalogs created before LSI /
+-- GSI support; rows pre-dating either column default into an empty
+-- list so they round-trip cleanly through the reconciler.
 ALTER TABLE _rektifier_tables
     ADD COLUMN IF NOT EXISTS lsi_specs jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE _rektifier_tables
+    ADD COLUMN IF NOT EXISTS gsi_specs jsonb NOT NULL DEFAULT '[]'::jsonb;
 
 CREATE INDEX IF NOT EXISTS _rektifier_tables_status_idx
     ON _rektifier_tables (status);

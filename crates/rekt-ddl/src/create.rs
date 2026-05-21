@@ -5,9 +5,10 @@
 //! that extract from the blob at write time. Same shape rekt-storage-libpq
 //! expects.
 
-use crate::naming::{derive_lsi_index_name, sanitize_pg_table_name};
+use crate::naming::{derive_gsi_index_name, derive_lsi_index_name, sanitize_pg_table_name};
 use crate::validation::CreateTablePlan;
 use rekt_storage::KeyType;
+use std::collections::HashSet;
 
 /// SQL projection of a key type. Mirrors `rekt_meta`'s pre-D3 contract
 /// — kept identical so existing seeded tables keep working.
@@ -69,13 +70,47 @@ pub fn create_table_sql(plan: &CreateTablePlan, pg_table: &str) -> String {
     // semantics (items omitting the LSI attr simply don't appear in
     // LSI Query results). The validator (L1) already guaranteed no
     // collisions with base PK/SK or sibling LSI columns.
+    let mut emitted_cols: HashSet<String> = HashSet::new();
+    emitted_cols.insert(plan.pk_attr.clone());
+    if let Some(sk) = &plan.sk_attr {
+        emitted_cols.insert(sk.clone());
+    }
     for lsi in &plan.lsis {
-        cols.push(format!(
-            "    {col} {pty} GENERATED ALWAYS AS ({expr}) STORED",
-            col = lsi.sort_attr,
-            pty = pg_key_type(lsi.sort_type),
-            expr = generated_expr(&lsi.sort_attr, lsi.sort_type),
-        ));
+        if emitted_cols.insert(lsi.sort_attr.clone()) {
+            cols.push(format!(
+                "    {col} {pty} GENERATED ALWAYS AS ({expr}) STORED",
+                col = lsi.sort_attr,
+                pty = pg_key_type(lsi.sort_type),
+                expr = generated_expr(&lsi.sort_attr, lsi.sort_type),
+            ));
+        }
+    }
+
+    // PLAN-9 G1/G2 (CreateTable-time GSI emission). Per-GSI columns
+    // are NULLable (sparse semantics: items omitting the GSI attr
+    // simply don't appear in GSI Query results), GENERATED, and
+    // deduped against base PK/SK + LSI sort attrs (PLAN-9 D9
+    // refcount). Each GSI attr is emitted at most once even if
+    // multiple GSIs share it.
+    for gsi in &plan.gsis {
+        if emitted_cols.insert(gsi.partition_attr.clone()) {
+            cols.push(format!(
+                "    {col} {pty} GENERATED ALWAYS AS ({expr}) STORED",
+                col = gsi.partition_attr,
+                pty = pg_key_type(gsi.partition_type),
+                expr = generated_expr(&gsi.partition_attr, gsi.partition_type),
+            ));
+        }
+        if let (Some(sa), Some(st)) = (&gsi.sort_attr, gsi.sort_type) {
+            if emitted_cols.insert(sa.clone()) {
+                cols.push(format!(
+                    "    {col} {pty} GENERATED ALWAYS AS ({expr}) STORED",
+                    col = sa,
+                    pty = pg_key_type(st),
+                    expr = generated_expr(sa, st),
+                ));
+            }
+        }
     }
 
     if has_sk {
@@ -103,6 +138,21 @@ pub fn create_table_sql(plan: &CreateTablePlan, pg_table: &str) -> String {
             idx = idx_name,
             pk = plan.pk_attr,
             sk = lsi.sort_attr,
+        ));
+    }
+
+    // PLAN-9 G2 (CreateTable-time GSI emission). Per-GSI btree:
+    // either single-column `(partition_col)` for hash-only GSI or
+    // composite `(partition_col, sort_col)` for HASH+RANGE GSI. PG's
+    // planner picks the index based on the WHERE clause shape.
+    for gsi in &plan.gsis {
+        let idx_name = derive_gsi_index_name(pg_table, &gsi.name);
+        let cols = match &gsi.sort_attr {
+            None => gsi.partition_attr.clone(),
+            Some(s) => format!("{}, {}", gsi.partition_attr, s),
+        };
+        sql.push_str(&format!(
+            "CREATE INDEX IF NOT EXISTS {idx_name} ON {pg_table} ({cols});\n"
         ));
     }
 
@@ -135,6 +185,7 @@ mod tests {
             provisioned_wcu: None,
             tags: serde_json::json!({}),
             lsis: vec![],
+            gsis: vec![],
         }
     }
 
@@ -151,6 +202,7 @@ mod tests {
             provisioned_wcu: None,
             tags: serde_json::json!({}),
             lsis: vec![],
+            gsis: vec![],
         }
     }
 
