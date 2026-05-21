@@ -143,6 +143,9 @@ pub(crate) fn table_description_from_entry(entry: &TableEntry) -> TableDescripti
         item_count: Some(0),
         table_size_bytes: Some(0),
         global_secondary_indexes: gsi_descs,
+        // PLAN-11 L5 wires this from entry.lsis once the catalog grows
+        // the field. For now (L1) — None.
+        local_secondary_indexes: None,
         stream_specification: None,
         latest_stream_label: None,
         latest_stream_arn: None,

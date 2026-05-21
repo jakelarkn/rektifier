@@ -3,7 +3,9 @@
 //! request validation" section.
 
 use crate::errors::DdlError;
-use rekt_protocol::{CreateTableRequest, GlobalSecondaryIndex, UpdateTableRequest};
+use rekt_protocol::{
+    CreateTableRequest, GlobalSecondaryIndex, LocalSecondaryIndex, UpdateTableRequest,
+};
 use rekt_storage::KeyType;
 use std::collections::{BTreeSet, HashSet};
 
@@ -33,6 +35,9 @@ const MAX_ATTR_NAME_BYTES: usize = 255;
 /// "more than one HASH" / "more than one RANGE" fired ad-hoc.
 const MAX_KEY_SCHEMA_LEN: usize = 2;
 
+/// DDB caps LSIs per table at 5. Matches the documented limit.
+const MAX_LSIS_PER_TABLE: usize = 5;
+
 /// What survives validation: a derived plan ready for the worker.
 /// Carries the inputs in their post-validation typed form so the SQL
 /// generator and the metadata writer don't have to re-parse.
@@ -50,6 +55,31 @@ pub struct CreateTablePlan {
     pub provisioned_rcu: Option<i64>,
     pub provisioned_wcu: Option<i64>,
     pub tags: serde_json::Value,
+    /// LSIs declared at table-creation time. Empty when none requested.
+    /// Each plan carries the typed sort-attr info; L2 emits per-LSI
+    /// `GENERATED ALWAYS AS ... STORED` columns + `CREATE INDEX`.
+    pub lsis: Vec<LsiPlan>,
+}
+
+/// Post-validation form of a single LSI declaration. PLAN-11 D1 / D8 /
+/// D11. The sort-attr name doubles as the PG column name (same
+/// convention the base PK/SK extraction uses); collision avoidance is
+/// enforced at validation time so this struct only contains
+/// already-cleared data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LsiPlan {
+    /// DDB IndexName as supplied. Used as the LSI key in catalog/cache
+    /// lookups and as the input to PG index-name derivation.
+    pub name: String,
+    /// The LSI's RANGE attribute. Doubles as the PG column name.
+    pub sort_attr: String,
+    /// Typed sort-attr (independent of base table's sort-key type).
+    pub sort_type: KeyType,
+    /// Echoed back in DescribeTable; behavior always collapses to ALL
+    /// (PLAN-11 D4). `None` when the operator omitted the field.
+    pub projection_type: Option<String>,
+    /// Accepted and ignored (PLAN-11 D4); kept for DescribeTable round-trip.
+    pub projection_non_key_attrs: Option<Vec<String>>,
 }
 
 pub fn validate_create_table(req: &CreateTableRequest) -> Result<CreateTablePlan, DdlError> {
@@ -60,7 +90,12 @@ pub fn validate_create_table(req: &CreateTableRequest) -> Result<CreateTablePlan
     let (pk_attr, pk_type, sk_attr, sk_type) =
         validate_key_schema_and_attrs(&req.table_name, req)?;
     validate_gsi_structures(&req.table_name, req)?;
-    validate_lsi_not_supported(req)?;
+    let lsis = validate_lsi_structures(
+        &req.table_name,
+        req,
+        &pk_attr,
+        sk_attr.as_deref(),
+    )?;
     validate_stream_not_enabled(req)?;
     validate_billing_mode(req)?;
 
@@ -76,6 +111,7 @@ pub fn validate_create_table(req: &CreateTableRequest) -> Result<CreateTablePlan
         provisioned_rcu: provisioned.map(|p| p.read_capacity_units),
         provisioned_wcu: provisioned.map(|p| p.write_capacity_units),
         tags: tags_to_json(req.tags.as_ref()),
+        lsis,
     })
 }
 
@@ -195,6 +231,13 @@ fn validate_attribute_names(
     if let Some(gsis) = req.global_secondary_indexes.as_ref() {
         for gsi in gsis {
             for kse in &gsi.key_schema {
+                check_attr_name(table_name, &kse.attribute_name)?;
+            }
+        }
+    }
+    if let Some(lsis) = req.local_secondary_indexes.as_ref() {
+        for lsi in lsis {
+            for kse in &lsi.key_schema {
                 check_attr_name(table_name, &kse.attribute_name)?;
             }
         }
@@ -434,6 +477,13 @@ fn validate_key_schema_and_attrs(
             }
         }
     }
+    if let Some(lsis) = req.local_secondary_indexes.as_ref() {
+        for lsi in lsis {
+            for kse in &lsi.key_schema {
+                keyed.insert(kse.attribute_name.as_str());
+            }
+        }
+    }
     for k in &keyed {
         if !defs.contains_key(*k) {
             return Err(DdlError::Validation(format!(
@@ -485,17 +535,219 @@ fn parse_attribute_type(
     }
 }
 
-fn validate_lsi_not_supported(req: &CreateTableRequest) -> Result<(), DdlError> {
-    if let Some(lsi) = req.local_secondary_indexes.as_ref() {
-        if !lsi.is_empty() {
-            return Err(DdlError::Validation(
-                "LocalSecondaryIndexes are not supported by rektifier; \
-                 use GlobalSecondaryIndexes instead"
-                    .into(),
-            ));
+/// PLAN-11 L1. Walks `LocalSecondaryIndexes`, enforces D7 / D9 / D10 /
+/// D11, and produces a `Vec<LsiPlan>` for downstream consumers (L2's
+/// DDL emitter, L3's catalog wiring). Cross-references the LSI sort
+/// attributes against the AttributeDefinitions-derived type map by
+/// re-walking AttributeDefinitions here — the
+/// `validate_key_schema_and_attrs` pass has already ensured every LSI
+/// key attribute has a definition entry (and that no entry is unused),
+/// so this loop only re-derives the typed form.
+fn validate_lsi_structures(
+    table_name: &str,
+    req: &CreateTableRequest,
+    pk_attr: &str,
+    sk_attr: Option<&str>,
+) -> Result<Vec<LsiPlan>, DdlError> {
+    let Some(lsis) = req.local_secondary_indexes.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if lsis.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // D7: hard cap.
+    if lsis.len() > MAX_LSIS_PER_TABLE {
+        return Err(DdlError::Validation(format!(
+            "table `{table_name}`: LocalSecondaryIndexes has {} entries; the \
+             maximum is {MAX_LSIS_PER_TABLE}",
+            lsis.len()
+        )));
+    }
+
+    // D9 prerequisite: LSIs require the base table to declare a sort key.
+    let base_sk = sk_attr.ok_or_else(|| {
+        DdlError::Validation(format!(
+            "table `{table_name}`: LocalSecondaryIndexes require the base table \
+             to declare a composite key (HASH + RANGE); this table has no RANGE"
+        ))
+    })?;
+
+    // Pre-derive a type map from AttributeDefinitions so each LSI's sort
+    // attr can be typed without re-parsing. validate_key_schema_and_attrs
+    // already vetted these so unwrap-by-lookup is safe.
+    let mut defs: std::collections::HashMap<&str, KeyType> = Default::default();
+    for ad in &req.attribute_definitions {
+        let kt = parse_attribute_type(table_name, &ad.attribute_name, &ad.attribute_type)?;
+        defs.insert(ad.attribute_name.as_str(), kt);
+    }
+
+    let mut out: Vec<LsiPlan> = Vec::with_capacity(lsis.len());
+    let mut seen_names: HashSet<&str> = HashSet::new();
+    // D11: track PG column names already taken — base PK, base SK, and
+    // any sibling LSI sort attr. The sort-attr name doubles as the PG
+    // column name (same convention as PK/SK in create.rs).
+    let mut taken_cols: HashSet<String> = HashSet::new();
+    taken_cols.insert(pk_attr.to_string());
+    taken_cols.insert(base_sk.to_string());
+
+    for lsi in lsis {
+        validate_lsi_index_name(table_name, &lsi.index_name)?;
+        if !seen_names.insert(lsi.index_name.as_str()) {
+            return Err(DdlError::Validation(format!(
+                "table `{table_name}`: LocalSecondaryIndexes has duplicate \
+                 IndexName `{}`",
+                lsi.index_name
+            )));
         }
+
+        let (lsi_hash_attr, lsi_range_attr) = validate_lsi_key_schema_shape(table_name, lsi)?;
+
+        // D9: LSI HASH must match the base table's HASH attribute.
+        if lsi_hash_attr != pk_attr {
+            return Err(DdlError::Validation(format!(
+                "table `{table_name}`: LSI `{}` HASH attribute `{lsi_hash_attr}` \
+                 must match the base table's HASH attribute `{pk_attr}` \
+                 (LSIs share the base partition key)",
+                lsi.index_name
+            )));
+        }
+
+        // D10: LSI RANGE must differ from the base table's RANGE.
+        if lsi_range_attr == base_sk {
+            return Err(DdlError::Validation(format!(
+                "table `{table_name}`: LSI `{}` RANGE attribute `{lsi_range_attr}` \
+                 must differ from the base table's RANGE attribute `{base_sk}` \
+                 (would be a redundant index)",
+                lsi.index_name
+            )));
+        }
+
+        // D11: LSI sort-attr column must not collide with base PK/SK or
+        // a sibling LSI's sort attr.
+        if !taken_cols.insert(lsi_range_attr.to_string()) {
+            return Err(DdlError::Validation(format!(
+                "table `{table_name}`: LSI `{}` sort attribute `{lsi_range_attr}` \
+                 collides with an existing column (base PK/SK or another LSI's \
+                 sort attribute)",
+                lsi.index_name
+            )));
+        }
+
+        // Cross-reference against AttributeDefinitions. By this point
+        // validate_key_schema_and_attrs has already enforced presence;
+        // this is the type lookup.
+        let sort_type = *defs.get(lsi_range_attr).ok_or_else(|| {
+            DdlError::Validation(format!(
+                "table `{table_name}`: LSI `{}` sort attribute `{lsi_range_attr}` \
+                 has no AttributeDefinitions entry",
+                lsi.index_name
+            ))
+        })?;
+
+        // Projection structural check: if ProjectionType is set, it must
+        // be one of the documented values. Behavior collapses to ALL
+        // regardless (PLAN-11 D4).
+        if let Some(pt) = lsi.projection.projection_type.as_deref() {
+            if pt != "ALL" && pt != "KEYS_ONLY" && pt != "INCLUDE" {
+                return Err(DdlError::Validation(format!(
+                    "table `{table_name}`: LSI `{}` Projection.ProjectionType `{pt}` \
+                     is not one of ALL | KEYS_ONLY | INCLUDE",
+                    lsi.index_name
+                )));
+            }
+        }
+
+        out.push(LsiPlan {
+            name: lsi.index_name.clone(),
+            sort_attr: lsi_range_attr.to_string(),
+            sort_type,
+            projection_type: lsi.projection.projection_type.clone(),
+            projection_non_key_attrs: lsi.projection.non_key_attributes.clone(),
+        });
+    }
+    Ok(out)
+}
+
+fn validate_lsi_index_name(table_name: &str, name: &str) -> Result<(), DdlError> {
+    if name.len() < 3 || name.len() > 255 {
+        return Err(DdlError::Validation(format!(
+            "table `{table_name}`: LSI IndexName `{name}` must be between \
+             3 and 255 characters"
+        )));
+    }
+    if !name.chars().all(is_valid_table_name_char) {
+        return Err(DdlError::Validation(format!(
+            "table `{table_name}`: LSI IndexName `{name}` contains \
+             characters outside [a-zA-Z0-9_.-]"
+        )));
     }
     Ok(())
+}
+
+/// Returns `(hash_attr, range_attr)` after enforcing LSI KeySchema
+/// invariants. Unlike GSI, LSI's RANGE is mandatory — DDB has no
+/// concept of a partition-key-only LSI.
+fn validate_lsi_key_schema_shape<'a>(
+    table_name: &str,
+    lsi: &'a LocalSecondaryIndex,
+) -> Result<(&'a str, &'a str), DdlError> {
+    if lsi.key_schema.len() != 2 {
+        return Err(DdlError::Validation(format!(
+            "table `{table_name}`: LSI `{}`: KeySchema must have exactly 2 entries \
+             (HASH + RANGE); got {}",
+            lsi.index_name,
+            lsi.key_schema.len()
+        )));
+    }
+    let mut hash_attr: Option<&str> = None;
+    let mut range_attr: Option<&str> = None;
+    for kse in &lsi.key_schema {
+        match kse.key_type.as_str() {
+            "HASH" => {
+                if hash_attr.is_some() {
+                    return Err(DdlError::Validation(format!(
+                        "table `{table_name}`: LSI `{}`: KeySchema has more than \
+                         one HASH entry",
+                        lsi.index_name
+                    )));
+                }
+                hash_attr = Some(&kse.attribute_name);
+            }
+            "RANGE" => {
+                if range_attr.is_some() {
+                    return Err(DdlError::Validation(format!(
+                        "table `{table_name}`: LSI `{}`: KeySchema has more than \
+                         one RANGE entry",
+                        lsi.index_name
+                    )));
+                }
+                range_attr = Some(&kse.attribute_name);
+            }
+            other => {
+                return Err(DdlError::Validation(format!(
+                    "table `{table_name}`: LSI `{}`: KeySchema KeyType must be \
+                     HASH or RANGE (got `{other}`)",
+                    lsi.index_name
+                )));
+            }
+        }
+    }
+    let h = hash_attr.ok_or_else(|| {
+        DdlError::Validation(format!(
+            "table `{table_name}`: LSI `{}`: KeySchema must contain exactly one \
+             HASH entry",
+            lsi.index_name
+        ))
+    })?;
+    let r = range_attr.ok_or_else(|| {
+        DdlError::Validation(format!(
+            "table `{table_name}`: LSI `{}`: KeySchema must contain exactly one \
+             RANGE entry (LSIs require a sort key)",
+            lsi.index_name
+        ))
+    })?;
+    Ok((h, r))
 }
 
 fn validate_stream_not_enabled(req: &CreateTableRequest) -> Result<(), DdlError> {
@@ -548,7 +800,61 @@ fn tags_to_json(tags: Option<&Vec<rekt_protocol::Tag>>) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rekt_protocol::{AttributeDefinition, GlobalSecondaryIndex, KeySchemaElement, Projection};
+    use rekt_protocol::{
+        AttributeDefinition, GlobalSecondaryIndex, KeySchemaElement, LocalSecondaryIndex,
+        Projection,
+    };
+
+    /// Helper: a base CreateTableRequest with composite key (device HASH
+    /// S, ts RANGE N) — needed for LSI tests because LSIs require a
+    /// composite base table.
+    fn req_composite(table_name: &str) -> CreateTableRequest {
+        CreateTableRequest {
+            table_name: table_name.into(),
+            key_schema: vec![
+                KeySchemaElement {
+                    attribute_name: "device".into(),
+                    key_type: "HASH".into(),
+                },
+                KeySchemaElement {
+                    attribute_name: "ts".into(),
+                    key_type: "RANGE".into(),
+                },
+            ],
+            attribute_definitions: vec![
+                AttributeDefinition {
+                    attribute_name: "device".into(),
+                    attribute_type: "S".into(),
+                },
+                AttributeDefinition {
+                    attribute_name: "ts".into(),
+                    attribute_type: "N".into(),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// Helper: a single well-formed LSI on `priority` (numeric).
+    fn lsi(name: &str, sort_attr: &str) -> LocalSecondaryIndex {
+        LocalSecondaryIndex {
+            index_name: name.into(),
+            key_schema: vec![
+                KeySchemaElement {
+                    attribute_name: "device".into(),
+                    key_type: "HASH".into(),
+                },
+                KeySchemaElement {
+                    attribute_name: sort_attr.into(),
+                    key_type: "RANGE".into(),
+                },
+            ],
+            projection: Projection {
+                projection_type: Some("ALL".into()),
+                non_key_attributes: None,
+            },
+        }
+    }
 
     fn req(table_name: &str) -> CreateTableRequest {
         CreateTableRequest {
@@ -673,23 +979,307 @@ mod tests {
         assert!(matches!(err, DdlError::Validation(m) if m.contains("S | N | B")));
     }
 
-    /// LSI rejection — rektifier doesn't support LSIs (PLAN-9 covers
-    /// GSIs only).
-    #[test]
-    fn rejects_local_secondary_indexes() {
-        let mut r = req("Orders");
-        r.local_secondary_indexes = Some(vec![serde_json::json!({"IndexName": "lsi"})]);
-        let err = validate_create_table(&r).unwrap_err();
-        assert!(matches!(err, DdlError::Validation(m) if m.contains("LocalSecondaryIndexes")));
-    }
-
     /// Empty LSI list is fine — operators may send `LocalSecondaryIndexes: []`
-    /// from SDKs that always include the field.
+    /// from SDKs that always include the field. Applies even on a
+    /// hash-only base table (no LSIs means the LSI-needs-composite-key
+    /// rule never fires).
     #[test]
     fn accepts_empty_local_secondary_indexes_list() {
         let mut r = req("Orders");
         r.local_secondary_indexes = Some(vec![]);
         validate_create_table(&r).unwrap();
+    }
+
+    // ===== PLAN-11 L1: LSI validation suite =================================
+
+    /// Happy path: well-formed LSI lands in CreateTablePlan.lsis with
+    /// the expected typed shape.
+    #[test]
+    fn accepts_well_formed_lsi() {
+        let mut r = req_composite("Events");
+        r.attribute_definitions.push(AttributeDefinition {
+            attribute_name: "priority".into(),
+            attribute_type: "N".into(),
+        });
+        r.local_secondary_indexes = Some(vec![lsi("by_priority", "priority")]);
+        let plan = validate_create_table(&r).unwrap();
+        assert_eq!(plan.lsis.len(), 1);
+        assert_eq!(plan.lsis[0].name, "by_priority");
+        assert_eq!(plan.lsis[0].sort_attr, "priority");
+        assert_eq!(plan.lsis[0].sort_type, KeyType::N);
+        assert_eq!(plan.lsis[0].projection_type.as_deref(), Some("ALL"));
+    }
+
+    /// Two LSIs with different sort attrs both round-trip cleanly.
+    #[test]
+    fn accepts_multiple_well_formed_lsis() {
+        let mut r = req_composite("Events");
+        r.attribute_definitions.push(AttributeDefinition {
+            attribute_name: "priority".into(),
+            attribute_type: "N".into(),
+        });
+        r.attribute_definitions.push(AttributeDefinition {
+            attribute_name: "status".into(),
+            attribute_type: "S".into(),
+        });
+        r.local_secondary_indexes = Some(vec![
+            lsi("by_priority", "priority"),
+            lsi("by_status", "status"),
+        ]);
+        let plan = validate_create_table(&r).unwrap();
+        assert_eq!(plan.lsis.len(), 2);
+        assert_eq!(plan.lsis[1].sort_type, KeyType::S);
+    }
+
+    /// PLAN-11 D9: LSI on a hash-only base table is rejected — LSIs
+    /// require a composite key.
+    #[test]
+    fn rejects_lsi_when_base_table_has_no_sort_key() {
+        let mut r = req("Orders");
+        r.attribute_definitions.push(AttributeDefinition {
+            attribute_name: "stamp".into(),
+            attribute_type: "S".into(),
+        });
+        r.local_secondary_indexes = Some(vec![LocalSecondaryIndex {
+            index_name: "by_stamp".into(),
+            key_schema: vec![
+                KeySchemaElement {
+                    attribute_name: "id".into(),
+                    key_type: "HASH".into(),
+                },
+                KeySchemaElement {
+                    attribute_name: "stamp".into(),
+                    key_type: "RANGE".into(),
+                },
+            ],
+            projection: Projection {
+                projection_type: Some("ALL".into()),
+                non_key_attributes: None,
+            },
+        }]);
+        let err = validate_create_table(&r).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(m.contains("LocalSecondaryIndexes require"), "got: {m}");
+                assert!(m.contains("RANGE"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// PLAN-11 D9: LSI HASH attribute must equal base table's HASH.
+    #[test]
+    fn rejects_lsi_with_mismatched_partition_key() {
+        let mut r = req_composite("Events");
+        r.attribute_definitions.push(AttributeDefinition {
+            attribute_name: "priority".into(),
+            attribute_type: "N".into(),
+        });
+        r.attribute_definitions.push(AttributeDefinition {
+            attribute_name: "other_pk".into(),
+            attribute_type: "S".into(),
+        });
+        r.local_secondary_indexes = Some(vec![LocalSecondaryIndex {
+            index_name: "wrong_partition".into(),
+            key_schema: vec![
+                KeySchemaElement {
+                    attribute_name: "other_pk".into(),
+                    key_type: "HASH".into(),
+                },
+                KeySchemaElement {
+                    attribute_name: "priority".into(),
+                    key_type: "RANGE".into(),
+                },
+            ],
+            projection: Projection {
+                projection_type: Some("ALL".into()),
+                non_key_attributes: None,
+            },
+        }]);
+        let err = validate_create_table(&r).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(m.contains("must match the base"), "got: {m}");
+                assert!(m.contains("device"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// PLAN-11 D10: LSI RANGE must differ from base RANGE.
+    #[test]
+    fn rejects_lsi_with_same_range_as_base() {
+        let mut r = req_composite("Events");
+        r.local_secondary_indexes = Some(vec![lsi("redundant", "ts")]);
+        let err = validate_create_table(&r).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(m.contains("must differ from"), "got: {m}");
+                assert!(m.contains("redundant index"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// LSI sort attribute referenced in KeySchema must be declared in
+    /// AttributeDefinitions (this fires from the existing
+    /// validate_key_schema_and_attrs pass, but verify under LSI shape).
+    #[test]
+    fn rejects_lsi_missing_attribute_definition() {
+        let mut r = req_composite("Events");
+        r.local_secondary_indexes = Some(vec![lsi("by_missing", "missing_attr")]);
+        let err = validate_create_table(&r).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(m.contains("no AttributeDefinitions"), "got: {m}");
+                assert!(m.contains("missing_attr"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// PLAN-11 D7: more than 5 LSIs rejected.
+    #[test]
+    fn rejects_more_than_five_lsis() {
+        let mut r = req_composite("Events");
+        let names = ["s1", "s2", "s3", "s4", "s5", "s6"];
+        for n in &names {
+            r.attribute_definitions.push(AttributeDefinition {
+                attribute_name: (*n).into(),
+                attribute_type: "S".into(),
+            });
+        }
+        r.local_secondary_indexes = Some(
+            names
+                .iter()
+                .map(|n| lsi(&format!("by_{n}"), n))
+                .collect(),
+        );
+        let err = validate_create_table(&r).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(m.contains("LocalSecondaryIndexes has 6 entries"), "got: {m}");
+                assert!(m.contains("maximum is 5"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// Duplicate IndexName within a single CreateTable LSI block is
+    /// rejected.
+    #[test]
+    fn rejects_duplicate_lsi_index_name() {
+        let mut r = req_composite("Events");
+        r.attribute_definitions.push(AttributeDefinition {
+            attribute_name: "priority".into(),
+            attribute_type: "N".into(),
+        });
+        r.attribute_definitions.push(AttributeDefinition {
+            attribute_name: "status".into(),
+            attribute_type: "S".into(),
+        });
+        r.local_secondary_indexes = Some(vec![
+            lsi("by_x", "priority"),
+            lsi("by_x", "status"),
+        ]);
+        let err = validate_create_table(&r).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(m.contains("duplicate IndexName"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// LSI IndexName must satisfy the same grammar as table/GSI names.
+    #[test]
+    fn rejects_invalid_lsi_index_name() {
+        let mut r = req_composite("Events");
+        r.attribute_definitions.push(AttributeDefinition {
+            attribute_name: "priority".into(),
+            attribute_type: "N".into(),
+        });
+        let mut bad = lsi("ab", "priority"); // too short
+        bad.index_name = "ab".into();
+        r.local_secondary_indexes = Some(vec![bad]);
+        let err = validate_create_table(&r).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(m.contains("LSI IndexName"), "got: {m}");
+                assert!(m.contains("3 and 255"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// LSI without RANGE entry is rejected — LSIs require a sort key.
+    /// Test uses the base table's `device` HASH attribute alone so the
+    /// unused-AttributeDefinitions check doesn't preempt the LSI-shape
+    /// check.
+    #[test]
+    fn rejects_lsi_missing_range_entry() {
+        let mut r = req_composite("Events");
+        r.local_secondary_indexes = Some(vec![LocalSecondaryIndex {
+            index_name: "by_device_only".into(),
+            key_schema: vec![KeySchemaElement {
+                attribute_name: "device".into(),
+                key_type: "HASH".into(),
+            }],
+            projection: Projection::default(),
+        }]);
+        let err = validate_create_table(&r).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(m.contains("exactly 2 entries"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// PLAN-11 D11: LSI sort-attr name colliding with another LSI's
+    /// sort attr is rejected (would produce a PG column collision).
+    #[test]
+    fn rejects_lsi_column_collision_between_siblings() {
+        let mut r = req_composite("Events");
+        r.attribute_definitions.push(AttributeDefinition {
+            attribute_name: "priority".into(),
+            attribute_type: "N".into(),
+        });
+        // Two LSIs both sort on `priority` — different IndexName but
+        // they'd both need a column called `priority`.
+        r.local_secondary_indexes = Some(vec![
+            lsi("by_priority_a", "priority"),
+            lsi("by_priority_b", "priority"),
+        ]);
+        let err = validate_create_table(&r).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(m.contains("collides with"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// Projection.ProjectionType not in {ALL, KEYS_ONLY, INCLUDE} is
+    /// rejected at validation time (D4 still accepts the value but
+    /// only after structural check).
+    #[test]
+    fn rejects_lsi_unknown_projection_type() {
+        let mut r = req_composite("Events");
+        r.attribute_definitions.push(AttributeDefinition {
+            attribute_name: "priority".into(),
+            attribute_type: "N".into(),
+        });
+        let mut bad = lsi("by_priority", "priority");
+        bad.projection.projection_type = Some("WEIRD".into());
+        r.local_secondary_indexes = Some(vec![bad]);
+        let err = validate_create_table(&r).unwrap_err();
+        match err {
+            DdlError::Validation(m) => {
+                assert!(m.contains("ProjectionType"), "got: {m}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
     }
 
     /// Streams deferred to PLAN-10 D10.

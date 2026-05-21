@@ -15,9 +15,10 @@ pub use ddl::{
     DeleteGlobalSecondaryIndexAction, DeleteTableRequest, DeleteTableResponse,
     DescribeTableRequest, DescribeTableResponse, GlobalSecondaryIndex,
     GlobalSecondaryIndexDescription, GlobalSecondaryIndexUpdate, KeySchemaElement,
-    ListTablesRequest, ListTablesResponse, Projection, ProvisionedThroughput,
-    ProvisionedThroughputDescription, StreamSpecification, TableClassSummary, TableDescription,
-    Tag, UpdateGlobalSecondaryIndexAction, UpdateTableRequest, UpdateTableResponse,
+    ListTablesRequest, ListTablesResponse, LocalSecondaryIndex, LocalSecondaryIndexDescription,
+    Projection, ProvisionedThroughput, ProvisionedThroughputDescription, StreamSpecification,
+    TableClassSummary, TableDescription, Tag, UpdateGlobalSecondaryIndexAction,
+    UpdateTableRequest, UpdateTableResponse,
 };
 pub use operations::{
     BatchGetItemRequest, BatchGetItemResponse, BatchWriteItemRequest, BatchWriteItemResponse,

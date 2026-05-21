@@ -154,6 +154,40 @@ pub struct DeleteGlobalSecondaryIndexAction {
     pub index_name: String,
 }
 
+/// LSI declaration inside `CreateTable.LocalSecondaryIndexes`. LSIs are
+/// CreateTable-only — there is no UpdateTable surface for mutating them
+/// (matches DDB). See PLAN-11 D2.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub struct LocalSecondaryIndex {
+    pub index_name: String,
+    pub key_schema: Vec<KeySchemaElement>,
+    pub projection: Projection,
+}
+
+/// LSI sub-description inside `TableDescription`. No `IndexStatus`
+/// (LSIs have no lifecycle in DDB; they exist from CreateTable on or
+/// not at all).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "PascalCase")]
+pub struct LocalSecondaryIndexDescription {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_schema: Option<Vec<KeySchemaElement>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<Projection>,
+    /// Always `0` in rektifier (Inert; same stance as base
+    /// TableSizeBytes per PLAN-10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_size_bytes: Option<i64>,
+    /// Always `0` in rektifier (Inert).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_arn: Option<String>,
+}
+
 /// Stream config on `CreateTable` / `UpdateTable`. Rektifier rejects
 /// `StreamEnabled = true` (Streams deferred to PLAN-10 D10); the rest
 /// round-trips.
@@ -223,6 +257,8 @@ pub struct TableDescription {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_secondary_indexes: Option<Vec<GlobalSecondaryIndexDescription>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_secondary_indexes: Option<Vec<LocalSecondaryIndexDescription>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_specification: Option<StreamSpecification>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_stream_label: Option<String>,
@@ -248,10 +284,8 @@ pub struct CreateTableRequest {
     pub provisioned_throughput: Option<ProvisionedThroughput>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_secondary_indexes: Option<Vec<GlobalSecondaryIndex>>,
-    /// Rektifier does not support LSIs in v1; the translator rejects
-    /// non-empty values with `ValidationException`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub local_secondary_indexes: Option<Vec<serde_json::Value>>,
+    pub local_secondary_indexes: Option<Vec<LocalSecondaryIndex>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_specification: Option<StreamSpecification>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -97,6 +97,7 @@ mod tests {
             provisioned_rcu: None,
             provisioned_wcu: None,
             tags: serde_json::json!({}),
+            lsis: vec![],
         }
     }
 
@@ -112,6 +113,7 @@ mod tests {
             provisioned_rcu: None,
             provisioned_wcu: None,
             tags: serde_json::json!({}),
+            lsis: vec![],
         }
     }
 

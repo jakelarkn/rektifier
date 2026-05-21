@@ -30,7 +30,7 @@ use std::sync::Arc;
 pub use create::{create_table_sql, derive_pg_table};
 pub use errors::DdlError;
 pub use naming::sanitize_pg_table_name;
-pub use validation::{validate_create_table, CreateTablePlan};
+pub use validation::{validate_create_table, CreateTablePlan, LsiPlan};
 
 /// DDL surface consumed by the dispatch handlers. Trait-driven so
 /// dispatch tests can supply a no-PG implementation that mutates an
@@ -543,6 +543,7 @@ fn synthesize_description(entry: &TableEntry) -> TableDescription {
         item_count: Some(0),
         table_size_bytes: Some(0),
         global_secondary_indexes: None,
+        local_secondary_indexes: None,
         stream_specification: None,
         latest_stream_label: None,
         latest_stream_arn: None,
