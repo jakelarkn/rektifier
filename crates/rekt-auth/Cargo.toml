@@ -27,6 +27,11 @@ rand = "0.8"
 sha2 = "0.10"
 subtle = "2"
 tokio-postgres = { workspace = true }
+# A3 — JWT validation + JWKS fetch.
+jsonwebtoken = "9"
+reqwest = { workspace = true }
+tokio = { workspace = true }
+url = "2"
 
 [dev-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

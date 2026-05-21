@@ -14,10 +14,12 @@
 use std::sync::OnceLock;
 
 pub mod crypto;
+pub mod jwt;
 pub mod master_key;
 pub mod permissive;
 pub mod sigv4;
 
+pub use jwt::{JwksCache, JwtIssuerConfig, JwtVerifier, PrincipalFormat};
 pub use master_key::{MasterKeyError, MasterKeySource};
 pub use permissive::PermissiveVerifier;
 pub use sigv4::{
