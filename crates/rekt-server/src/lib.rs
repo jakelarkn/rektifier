@@ -38,7 +38,7 @@ use rekt_protocol::{
 };
 use rekt_catalog::{CatalogSnapshot, TableCatalog, TableEntry};
 use rekt_ddl::DdlBackend;
-use rekt_sigv4::{SigV4Error, Verifier};
+use rekt_auth::{AuthChain, AuthError, Verifier};
 use rekt_storage::{Backend, BackendError, TransactGetOp, TransactWriteOp, UpdateDecision, UpdateOutcome};
 use rekt_translator::{
     apply_update_expression, encode_lek, evaluate_condition, materialize_insert_only_update,
@@ -69,7 +69,7 @@ const CONTENT_TYPE: &str = "application/x-amz-json-1.0";
 
 #[derive(Clone)]
 pub struct AppState {
-    pub verifier: Arc<dyn Verifier>,
+    pub auth: Arc<AuthChain>,
     pub backend: Arc<dyn Backend>,
     /// Runtime table catalog: the single source of truth for which
     /// tables exist and what shape they have. Refreshed by the
@@ -416,9 +416,18 @@ impl From<rekt_ddl::DdlError> for ApiError {
     }
 }
 
-impl From<SigV4Error> for ApiError {
-    fn from(e: SigV4Error) -> Self {
-        ApiError::AccessDenied(e.to_string())
+impl From<AuthError> for ApiError {
+    fn from(e: AuthError) -> Self {
+        match e {
+            AuthError::MissingAuthorization
+            | AuthError::MalformedAuthorization
+            | AuthError::UnsupportedScheme(_)
+            | AuthError::SignatureFailed(_)
+            | AuthError::TokenFailed(_)
+            | AuthError::IdentityNotFound
+            | AuthError::IdentityDisabled => ApiError::AccessDenied(e.to_string()),
+            AuthError::Internal(m) => ApiError::Internal(m),
+        }
     }
 }
 
@@ -547,7 +556,16 @@ pub(crate) fn parse_request<T: serde::de::DeserializeOwned>(
 
 // ===== Dispatch ================================================================
 
-#[tracing::instrument(level = "debug", skip_all, name = "server.dispatch", fields(op = tracing::field::Empty))]
+#[tracing::instrument(
+    level = "debug",
+    skip_all,
+    name = "server.dispatch",
+    fields(
+        op = tracing::field::Empty,
+        auth_principal = tracing::field::Empty,
+        auth_scheme = tracing::field::Empty,
+    )
+)]
 async fn dispatch(State(state): State<AppState>, req: Request) -> Result<Response, ApiError> {
     // Split the request into its real Parts + Body. Passing the real Parts
     // straight to the verifier saves a HeaderMap::clone vs the earlier
@@ -568,10 +586,15 @@ async fn dispatch(State(state): State<AppState>, req: Request) -> Result<Respons
             ApiError::Serialization(format!("body read failed: {e}"))
         })?;
 
-    // 1. Verify the request. PermissiveVerifier is the MVP impl — see
-    //    rekt-sigv4. We do this before peeking at any body content so the
-    //    auth boundary stays at the top.
-    state.verifier.verify(&parts, &body)?;
+    // 1. Verify the request via the AuthChain (PLAN-13 D1). The chain
+    //    routes by Authorization header prefix to one of SigV4 (A2),
+    //    JWT (A3), opaque API token (A5), or PermissiveVerifier (dev).
+    //    We do this before peeking at any body content so the auth
+    //    boundary stays at the top.
+    let identity = state.auth.verify(&parts, &body).await?;
+    tracing::Span::current().record("auth_principal", identity.principal.as_str());
+    tracing::Span::current().record("auth_scheme", identity.scheme.as_str());
+    let _ = identity; // A6 will thread Identity through RequestContext.
 
     // 2. Identify the operation from the X-Amz-Target header.
     let target = parts

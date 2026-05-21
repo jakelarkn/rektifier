@@ -1366,6 +1366,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "rekt-auth"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "http",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rekt-bench"
 version = "0.0.1"
 dependencies = [
@@ -1475,11 +1488,11 @@ dependencies = [
  "axum",
  "bytes",
  "http",
+ "rekt-auth",
  "rekt-catalog",
  "rekt-ddl",
  "rekt-expressions",
  "rekt-protocol",
- "rekt-sigv4",
  "rekt-storage",
  "rekt-translator",
  "serde",
@@ -1488,15 +1501,6 @@ dependencies = [
  "tokio",
  "tower",
  "tower-http",
- "tracing",
-]
-
-[[package]]
-name = "rekt-sigv4"
-version = "0.0.1"
-dependencies = [
- "http",
- "thiserror 1.0.69",
  "tracing",
 ]
 
@@ -1550,12 +1554,12 @@ dependencies = [
  "anyhow",
  "axum",
  "deadpool-postgres",
+ "rekt-auth",
  "rekt-catalog",
  "rekt-config",
  "rekt-ddl",
  "rekt-gsi",
  "rekt-server",
- "rekt-sigv4",
  "rekt-storage",
  "rekt-storage-libpq",
  "rekt-translator",

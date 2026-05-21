@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/rekt-protocol",
-    "crates/rekt-sigv4",
+    "crates/rekt-auth",
     "crates/rekt-storage",
     "crates/rekt-storage-libpq",
     "crates/rekt-translator",

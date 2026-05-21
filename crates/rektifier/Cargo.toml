@@ -16,7 +16,7 @@ rekt-config = { path = "../rekt-config" }
 rekt-ddl = { path = "../rekt-ddl" }
 rekt-gsi = { path = "../rekt-gsi" }
 rekt-server = { path = "../rekt-server" }
-rekt-sigv4 = { path = "../rekt-sigv4" }
+rekt-auth = { path = "../rekt-auth" }
 rekt-storage = { path = "../rekt-storage" }
 rekt-storage-libpq = { path = "../rekt-storage-libpq" }
 rekt-translator = { path = "../rekt-translator" }

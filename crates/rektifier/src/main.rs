@@ -18,9 +18,9 @@
 //! against a fresh PG starts with an empty catalog; the operator
 //! issues `CreateTable` to populate it.
 //!
-//! The verifier wired in for MVP is `PermissiveVerifier` — SigV4 signatures
-//! are NOT validated. Don't expose this to untrusted networks until
-//! `StrictVerifier` lands.
+//! The auth chain wired in for MVP is `AuthChain::permissive_only()` —
+//! SigV4 signatures are NOT validated. Don't expose this to untrusted
+//! networks until A2 (strict SigV4) or A3 (JWT) is configured.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,7 +31,7 @@ use rekt_catalog::{Reconciler, TableCatalog};
 use rekt_ddl::PgDdlBackend;
 use rekt_config::Config;
 use rekt_server::{router, AppState};
-use rekt_sigv4::PermissiveVerifier;
+use rekt_auth::AuthChain;
 use rekt_storage_libpq::PgBackend;
 use tokio_postgres::NoTls;
 use tracing_subscriber::EnvFilter;
@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
     );
 
     let state = AppState {
-        verifier: Arc::new(PermissiveVerifier),
+        auth: Arc::new(AuthChain::permissive_only()),
         backend: Arc::new(backend),
         catalog,
         ddl,

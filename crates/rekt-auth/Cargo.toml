@@ -1,0 +1,18 @@
+[package]
+name = "rekt-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Authentication layer for rektifier (SigV4 + JWT + opaque API tokens)"
+
+[dependencies]
+async-trait = { workspace = true }
+http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -9,7 +9,7 @@ use rekt_catalog::{CatalogSnapshot, TableCatalog, TableEntry, TableStatus};
 use rekt_ddl::{DdlBackend, DdlError};
 use rekt_protocol::{CreateTableRequest, DeleteTableRequest, TableDescription, UpdateTableRequest};
 use rekt_server::{router, AppState};
-use rekt_sigv4::{PermissiveVerifier, Verifier};
+use rekt_auth::AuthChain;
 use rekt_storage::{
     Backend, BackendError, BatchGetOutcome, BatchWriteOutcome, ConditionEvalFn, FilterEvalFn,
     GeneralUpdateFn, KeyType, KeyValue, QueryOutcome, ScanOutcome, SkCondition, TableShape,
@@ -1108,7 +1108,7 @@ fn app_users_unserveable() -> axum::Router {
         entries,
     )));
     let state = AppState {
-        verifier: Arc::new(PermissiveVerifier) as Arc<dyn Verifier>,
+        auth: Arc::new(AuthChain::permissive_only()),
         backend: Arc::new(MockBackend::default()) as Arc<dyn Backend>,
         catalog: catalog.clone(),
         ddl: Arc::new(MockDdlBackend { catalog }) as Arc<dyn DdlBackend>,
@@ -1124,7 +1124,7 @@ fn app_users_unserveable() -> axum::Router {
 fn app_with(backend: MockBackend, request_timeout: std::time::Duration) -> axum::Router {
     let cat = catalog();
     let state = AppState {
-        verifier: Arc::new(PermissiveVerifier) as Arc<dyn Verifier>,
+        auth: Arc::new(AuthChain::permissive_only()),
         backend: Arc::new(backend) as Arc<dyn Backend>,
         catalog: cat.clone(),
         ddl: Arc::new(MockDdlBackend { catalog: cat }) as Arc<dyn DdlBackend>,
@@ -8794,7 +8794,7 @@ fn app_with_lsi() -> axum::Router {
         entries,
     )));
     let state = AppState {
-        verifier: Arc::new(PermissiveVerifier) as Arc<dyn Verifier>,
+        auth: Arc::new(AuthChain::permissive_only()),
         backend: Arc::new(MockBackend::default()) as Arc<dyn Backend>,
         catalog: catalog.clone(),
         ddl: Arc::new(MockDdlBackend { catalog }) as Arc<dyn DdlBackend>,
@@ -8862,7 +8862,7 @@ fn app_with_unserveable_lsi() -> axum::Router {
         entries,
     )));
     let state = AppState {
-        verifier: Arc::new(PermissiveVerifier) as Arc<dyn Verifier>,
+        auth: Arc::new(AuthChain::permissive_only()),
         backend: Arc::new(MockBackend::default()) as Arc<dyn Backend>,
         catalog: catalog.clone(),
         ddl: Arc::new(MockDdlBackend { catalog }) as Arc<dyn DdlBackend>,
