@@ -427,6 +427,73 @@ for re-creating the column + index in-place; not in v1 scope.
 
 ---
 
+## Global Secondary Indexes (GSIs)
+
+Tracked-implemented for the CreateTable-time case (PLAN-9 G1+G2+G7).
+GSIs declared inside `CreateTable.GlobalSecondaryIndexes` land as
+`GENERATED ALWAYS AS ... STORED` columns plus a composite btree, all
+in the same DDL transaction. Online add via `UpdateTable` is deferred.
+
+### GSI lifecycle: only `CreateTable`-time declaration is supported — Strict
+
+DDB's full GSI surface includes `UpdateTable.GlobalSecondaryIndexUpdates`
+for online add / mutate / delete on populated tables. Rektifier
+currently rejects all three of those subactions with a
+`ValidationException` whose message names PLAN-9 G2/G5/G6/G9 as the
+deferred work. Operators who need an additional GSI after table birth
+must `DeleteTable` + `CreateTable` (same recovery procedure as LSI
+mutation).
+
+**Effect:** SDK code that calls `UpdateTable` with
+`GlobalSecondaryIndexUpdates.Create` / `.Update` / `.Delete` fails
+against rektifier where it would succeed against DDB. Migration risk
+for clients that automate runtime GSI mutation.
+
+**Design departure from PLAN-9 D1:** PLAN-9's headline choice was
+regular columns + async backfill specifically so online add could
+happen without rewriting the table. Because rektifier is
+pre-production with no populated tables, the CreateTable-only path
+uses `GENERATED STORED` columns instead (same mechanism as LSIs, same
+mechanism as the base PK/SK). When online add becomes a real need,
+the new code path either co-exists with the CreateTable-time path or
+migrates this code to regular columns; PLAN-9 G3+G5+G6 carry that
+work.
+
+### GSI `Projection` always behaves as `ALL` — Lenient
+
+Same shape as the LSI Projection entry above. Rektifier stores every
+item in full inside `data jsonb`; GSI Query returns the full item
+regardless of declared `Projection`. Round-tripped through
+`DescribeTable.GlobalSecondaryIndexes[].Projection` as declared.
+
+### GSI reads are always strongly consistent regardless of `ConsistentRead` — Positive divergence
+
+DDB's GSIs are *eventually consistent* even when ACTIVE — a PutItem
+returns before the GSI reflects the write. Rektifier writes the
+JSONB and the GSI's GENERATED columns in the same row, in the same
+PG statement; reads see one MVCC snapshot. Code that depends on
+observing eventual-consistency lag (unusual) won't reproduce it
+against rektifier.
+
+### GSI drift demotes only the GSI, not the base table — Documented divergence
+
+Per-GSI serveable bit (same mechanism as PLAN-11 D12 / open Q4 for
+LSIs). If the reconciler detects that a GSI's column or btree is
+missing, `Query`/`Scan` targeting that `IndexName` returns
+`ResourceNotFoundException`, but base-table reads continue. DDB
+doesn't expose this failure mode at all (DDB owns the storage end-
+to-end). DescribeTable's `IndexStatus` collapses to `CREATING` for
+non-serveable GSIs, matching DDB's "pre-ACTIVE indexes return RNF"
+stance.
+
+### Redundant GSI declarations rejected — Strict
+
+A GSI whose `KeySchema` exactly matches the base table's `KeySchema`
+is rejected at validation time as "redundant index." DDB rejects the
+same shape; matches.
+
+---
+
 ## BatchGetItem / BatchWriteItem
 
 These entries describe known divergences planned for the in-progress
