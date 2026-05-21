@@ -83,12 +83,37 @@ The default config is `rektifier.toml.example`; copy it to
 | rektifier        | 9000  | DynamoDB-compatible server                       |
 | Adminer          | 8080  | Web UI for Postgres                              |
 
+## Authentication
+
+PLAN-13 ships three auth primitives via the `rekt-auth` crate:
+
+- **Strict SigV4** for AWS SDK clients — secrets live in
+  `_rektifier_aws_credentials` AES-GCM-encrypted at rest, decrypted +
+  cached in-process so signature verification runs against memory on
+  the hot path (no STS round-trip, no per-request KMS call).
+- **JWT (Bearer)** with JWKS validation — multi-issuer, per-key
+  algorithm pinning (kills the HS256-with-RSA-pubkey alg-confusion
+  class), HTTPS-only JWKS URLs, boot-time warm-up. Presets ship for
+  GCP / Azure / Snowflake / Databricks / Neon / AWS Cognito.
+- **Opaque API tokens** with type-prefixed format
+  (`rekt_pat_…` / `rekt_svc_…`), HMAC-peppered hashes in
+  `_rektifier_api_tokens`, in-memory `TokenCache` mirroring the
+  SigV4 secret cache.
+
+The master key feeding AES-GCM credential encryption and the
+API-token HMAC pepper comes from one of `master_key_env` /
+`master_key_file` / `master_key_kms`; see
+[`docs/auth/runbook.md`](./docs/auth/runbook.md) for the operator
+workflow and [`docs/auth/role_separation.sql`](./docs/auth/role_separation.sql)
+for the PG role-separation script that locks down the credential
+and token tables.
+
 ## Workspace layout
 
 | Crate                  | Purpose                                                |
 |------------------------|--------------------------------------------------------|
 | `rekt-protocol`        | DDB JSON wire types — AttributeValue, request/response |
-| `rekt-sigv4`           | SigV4 request verification                             |
+| `rekt-auth`            | SigV4 + JWT + opaque-token verifiers (PLAN-13)         |
 | `rekt-expressions`     | KeyCondition / Filter / Update / Condition parsers     |
 | `rekt-translator`      | DDB op + AST → SQL plan                                |
 | `rekt-storage`         | Backend-neutral storage trait                          |

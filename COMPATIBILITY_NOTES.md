@@ -55,19 +55,41 @@ Rektifier → DDB code that *relies on* eventual-consistency
 characteristics (e.g. cache-friendly read latency) may behave
 differently under load.
 
-### SigV4 signatures: permissive verifier accepts everything
+### Authentication accepts SigV4, JWT, and opaque API tokens — Lenient
 
-The `PermissiveVerifier` impl in `crates/rekt-sigv4/src/lib.rs` logs a
-warning on first use and otherwise accepts every request. The
-`StrictVerifier` (real SigV4 verification + credentials store) is not
-yet implemented.
+PLAN-13 shipped strict SigV4 alongside JWT-with-JWKS and opaque API
+tokens. DDB rejects every `Authorization` value other than
+`AWS4-HMAC-SHA256 ...` with `MissingAuthenticationTokenException`;
+rektifier accepts:
+
+- `Authorization: AWS4-HMAC-SHA256 ...` — strict SigV4 (PLAN-13 A2)
+  via the `_rektifier_aws_credentials` table (operator-managed, no
+  AWS IAM lookup). Signatures are verified locally against the
+  cached + decrypted secret_access_key.
+- `Authorization: Bearer <JWT>` — JWT validation (PLAN-13 A3) with
+  per-JWKS-key algorithm pinning, HTTPS-only JWKS URLs, boot-time
+  warm-up. Trusted issuers configured per-deployment; presets ship
+  for GCP / Azure / Snowflake / Databricks / Neon / AWS Cognito.
+- `Authorization: Bearer <rekt_pat_…>` / `Bearer <rekt_svc_…>` —
+  opaque API token (PLAN-13 A5), HMAC-pepper hashed in
+  `_rektifier_api_tokens`.
+- `Authorization` missing — `PermissiveVerifier` (dev-only,
+  loopback-bind required, env-var double opt-in).
 
 **Affected ops:** all.
 
-**Migration risk:** code that doesn't actually sign requests
-correctly will pass against rektifier and fail against DDB. Conversely
-rektifier should not be exposed beyond a trusted network until the
-strict verifier lands.
+**Migration risk:** code paths that authenticate via JWT or opaque
+bearer tokens against rektifier won't authenticate against DDB. The
+SigV4 path is wire-compatible — code that signs correctly against AWS
+DDB signs correctly against rektifier (the secret store is the only
+difference, invisible to the client).
+
+**Storage:** secrets live in PG, encrypted at rest with AES-GCM-256.
+The DEK is HKDF-derived from an operator-supplied master key
+(`master_key_env` / `master_key_file` / `master_key_kms`, exactly
+one configured). Operators MUST restrict access to
+`_rektifier_aws_credentials` and `_rektifier_api_tokens` via PG role
+grants — see `docs/auth/role_separation.sql`.
 
 ### Per-table size limits parsed but not enforced — Inert
 
