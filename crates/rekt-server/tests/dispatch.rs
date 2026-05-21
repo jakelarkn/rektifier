@@ -8588,3 +8588,441 @@ async fn update_table_rejects_stream_enabled_true() {
         .unwrap()
         .contains("Streams"));
 }
+
+// ===== PLAN-11 L6: LSI dispatch tests =======================================
+
+/// Builds an app whose `device_events` table declares an LSI `by_tier`
+/// (sort attribute `tier`, type `S`). The catalog is constructed
+/// directly with the LSI populated so dispatch tests can exercise the
+/// IndexName resolution without going through the DDL backend.
+fn app_with_lsi() -> axum::Router {
+    use rekt_translator::LsiSchema;
+    let mut entries = HashMap::new();
+    for (name, mut schema) in schemas() {
+        if name == "device_events" {
+            schema.lsis.insert(
+                "by_tier".into(),
+                LsiSchema {
+                    name: "by_tier".into(),
+                    sort_attr: "tier".into(),
+                    sort_type: KeyType::S,
+                    sort_pg_col: "tier".into(),
+                    serveable: true,
+                    unserveable_reason: None,
+                },
+            );
+        }
+        let lsis_for_entry = if name == "device_events" {
+            vec![rekt_catalog::LsiSpec {
+                name: "by_tier".into(),
+                sort_attr: "tier".into(),
+                sort_type: KeyType::S,
+                sort_pg_col: "tier".into(),
+                index_name: "device_events_lsi_by_tier_idx".into(),
+                projection_type: Some("ALL".into()),
+                projection_non_key_attrs: None,
+                serveable: true,
+                unserveable_reason: None,
+            }]
+        } else {
+            Vec::new()
+        };
+        entries.insert(
+            name.clone(),
+            Arc::new(TableEntry {
+                schema,
+                status: TableStatus::Active,
+                serveable: true,
+                unserveable_reason: None,
+                creation_date_ms: 1_700_000_000_000,
+                last_modified_at_ms: 1_700_000_000_000,
+                last_modified_by: "lsi-fixture".into(),
+                billing_mode: None,
+                provisioned_rcu: None,
+                provisioned_wcu: None,
+                tags: serde_json::json!({}),
+                gsis: HashMap::new(),
+                lsis: lsis_for_entry,
+            }),
+        );
+    }
+    let catalog = Arc::new(TableCatalog::from_snapshot(CatalogSnapshot::from_entries(
+        entries,
+    )));
+    let state = AppState {
+        verifier: Arc::new(PermissiveVerifier) as Arc<dyn Verifier>,
+        backend: Arc::new(MockBackend::default()) as Arc<dyn Backend>,
+        catalog: catalog.clone(),
+        ddl: Arc::new(MockDdlBackend { catalog }) as Arc<dyn DdlBackend>,
+        batch_limits: rekt_server::BatchLimits::default(),
+        request_timeout: std::time::Duration::from_secs(30),
+    };
+    router(state)
+}
+
+/// Variant of `app_with_lsi` where the LSI's `serveable` bit is false
+/// (reconciler-detected drift). LSI Query must return RNF (PLAN-11 D12
+/// + open Q4) while base-table Query continues to work.
+fn app_with_unserveable_lsi() -> axum::Router {
+    use rekt_translator::LsiSchema;
+    let mut entries = HashMap::new();
+    for (name, mut schema) in schemas() {
+        if name == "device_events" {
+            schema.lsis.insert(
+                "by_tier".into(),
+                LsiSchema {
+                    name: "by_tier".into(),
+                    sort_attr: "tier".into(),
+                    sort_type: KeyType::S,
+                    sort_pg_col: "tier".into(),
+                    serveable: false,
+                    unserveable_reason: Some("LSI index missing".into()),
+                },
+            );
+        }
+        let lsis_for_entry = if name == "device_events" {
+            vec![rekt_catalog::LsiSpec {
+                name: "by_tier".into(),
+                sort_attr: "tier".into(),
+                sort_type: KeyType::S,
+                sort_pg_col: "tier".into(),
+                index_name: "device_events_lsi_by_tier_idx".into(),
+                projection_type: Some("ALL".into()),
+                projection_non_key_attrs: None,
+                serveable: false,
+                unserveable_reason: Some("LSI index missing".into()),
+            }]
+        } else {
+            Vec::new()
+        };
+        entries.insert(
+            name.clone(),
+            Arc::new(TableEntry {
+                schema,
+                status: TableStatus::Active,
+                serveable: true,
+                unserveable_reason: None,
+                creation_date_ms: 1_700_000_000_000,
+                last_modified_at_ms: 1_700_000_000_000,
+                last_modified_by: "lsi-fixture".into(),
+                billing_mode: None,
+                provisioned_rcu: None,
+                provisioned_wcu: None,
+                tags: serde_json::json!({}),
+                gsis: HashMap::new(),
+                lsis: lsis_for_entry,
+            }),
+        );
+    }
+    let catalog = Arc::new(TableCatalog::from_snapshot(CatalogSnapshot::from_entries(
+        entries,
+    )));
+    let state = AppState {
+        verifier: Arc::new(PermissiveVerifier) as Arc<dyn Verifier>,
+        backend: Arc::new(MockBackend::default()) as Arc<dyn Backend>,
+        catalog: catalog.clone(),
+        ddl: Arc::new(MockDdlBackend { catalog }) as Arc<dyn DdlBackend>,
+        batch_limits: rekt_server::BatchLimits::default(),
+        request_timeout: std::time::Duration::from_secs(30),
+    };
+    router(state)
+}
+
+#[tokio::test]
+async fn lsi_query_unknown_index_name_returns_rnf() {
+    let app = app_with_lsi();
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName": "device_events",
+                "IndexName": "by_phantom",
+                "KeyConditionExpression": "device_id = :pk",
+                "ExpressionAttributeValues": {":pk":{"S":"d-1"}}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ResourceNotFoundException"));
+    assert!(body["message"].as_str().unwrap().contains("by_phantom"));
+}
+
+#[tokio::test]
+async fn lsi_query_unserveable_returns_rnf_with_reason() {
+    let app = app_with_unserveable_lsi();
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName": "device_events",
+                "IndexName": "by_tier",
+                "KeyConditionExpression": "device_id = :pk",
+                "ExpressionAttributeValues": {":pk":{"S":"d-1"}}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ResourceNotFoundException"));
+    let msg = body["message"].as_str().unwrap();
+    assert!(msg.contains("by_tier"), "got: {msg}");
+    assert!(msg.contains("LSI index missing"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn base_table_query_unaffected_by_unserveable_lsi() {
+    let app = app_with_unserveable_lsi();
+    put_item(
+        &app,
+        "device_events",
+        json!({"device_id":{"S":"d-base"},"ts":{"N":"1"},"tier":{"S":"gold"}}),
+    )
+    .await;
+    let resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName": "device_events",
+                "KeyConditionExpression": "device_id = :pk",
+                "ExpressionAttributeValues": {":pk":{"S":"d-base"}}
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["Count"], 1);
+}
+
+#[tokio::test]
+async fn lsi_query_resolves_and_routes_through_dispatch() {
+    let app = app_with_lsi();
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName": "device_events",
+                "IndexName": "by_tier",
+                "KeyConditionExpression": "device_id = :pk AND tier = :t",
+                "ExpressionAttributeValues": {
+                    ":pk":{"S":"d-1"},
+                    ":t":{"S":"gold"}
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["Count"], 0);
+    assert_eq!(body["ScannedCount"], 0);
+}
+
+#[tokio::test]
+async fn lsi_query_accepts_all_projected_attributes() {
+    let app = app_with_lsi();
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName": "device_events",
+                "IndexName": "by_tier",
+                "KeyConditionExpression": "device_id = :pk",
+                "ExpressionAttributeValues": {":pk":{"S":"d-1"}},
+                "Select": "ALL_PROJECTED_ATTRIBUTES"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn select_all_projected_attributes_without_index_rejected() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "Query",
+            json!({
+                "TableName": "device_events",
+                "KeyConditionExpression": "device_id = :pk",
+                "ExpressionAttributeValues": {":pk":{"S":"d-1"}},
+                "Select": "ALL_PROJECTED_ATTRIBUTES"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ValidationException"));
+}
+
+#[tokio::test]
+async fn lsi_query_consistent_read_is_no_op() {
+    let app = app_with_lsi();
+    for flag in [true, false] {
+        let resp = app
+            .clone()
+            .oneshot(ddb_request(
+                "Query",
+                json!({
+                    "TableName": "device_events",
+                    "IndexName": "by_tier",
+                    "KeyConditionExpression": "device_id = :pk",
+                    "ExpressionAttributeValues": {":pk":{"S":"d-1"}},
+                    "ConsistentRead": flag
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "flag={flag}");
+    }
+}
+
+#[tokio::test]
+async fn create_table_with_lsi_round_trips_through_describe() {
+    let app = app();
+    let create_resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "CreateTable",
+            json!({
+                "TableName": "RektLsiDispatchTest",
+                "KeySchema": [
+                    {"AttributeName":"device","KeyType":"HASH"},
+                    {"AttributeName":"ts","KeyType":"RANGE"}
+                ],
+                "AttributeDefinitions": [
+                    {"AttributeName":"device","AttributeType":"S"},
+                    {"AttributeName":"ts","AttributeType":"N"},
+                    {"AttributeName":"tier","AttributeType":"S"}
+                ],
+                "LocalSecondaryIndexes": [{
+                    "IndexName": "by_tier",
+                    "KeySchema": [
+                        {"AttributeName":"device","KeyType":"HASH"},
+                        {"AttributeName":"tier","KeyType":"RANGE"}
+                    ],
+                    "Projection": {"ProjectionType":"ALL"}
+                }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::OK);
+
+    let desc_resp = app
+        .clone()
+        .oneshot(ddb_request(
+            "DescribeTable",
+            json!({"TableName": "RektLsiDispatchTest"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(desc_resp.status(), StatusCode::OK);
+    let body = body_json(desc_resp).await;
+    let lsis = body["Table"]["LocalSecondaryIndexes"]
+        .as_array()
+        .expect("LocalSecondaryIndexes populated");
+    assert_eq!(lsis.len(), 1);
+    assert_eq!(lsis[0]["IndexName"], "by_tier");
+    let kse = lsis[0]["KeySchema"].as_array().unwrap();
+    assert_eq!(kse.len(), 2);
+    assert_eq!(kse[0]["AttributeName"], "device");
+    assert_eq!(kse[0]["KeyType"], "HASH");
+    assert_eq!(kse[1]["AttributeName"], "tier");
+    assert_eq!(kse[1]["KeyType"], "RANGE");
+    assert_eq!(lsis[0]["Projection"]["ProjectionType"], "ALL");
+    let attr_defs = body["Table"]["AttributeDefinitions"].as_array().unwrap();
+    let tier_def = attr_defs
+        .iter()
+        .find(|a| a["AttributeName"] == "tier")
+        .expect("tier in AttributeDefinitions");
+    assert_eq!(tier_def["AttributeType"], "S");
+}
+
+#[tokio::test]
+async fn create_table_rejects_lsi_on_hash_only_base() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "CreateTable",
+            json!({
+                "TableName": "RektBadLsiHashOnly",
+                "KeySchema": [{"AttributeName":"id","KeyType":"HASH"}],
+                "AttributeDefinitions": [
+                    {"AttributeName":"id","AttributeType":"S"},
+                    {"AttributeName":"stamp","AttributeType":"S"}
+                ],
+                "LocalSecondaryIndexes": [{
+                    "IndexName": "by_stamp",
+                    "KeySchema": [
+                        {"AttributeName":"id","KeyType":"HASH"},
+                        {"AttributeName":"stamp","KeyType":"RANGE"}
+                    ],
+                    "Projection": {"ProjectionType":"ALL"}
+                }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ValidationException"));
+}
+
+#[tokio::test]
+async fn create_table_rejects_lsi_with_same_range_as_base() {
+    let app = app();
+    let resp = app
+        .oneshot(ddb_request(
+            "CreateTable",
+            json!({
+                "TableName": "RektBadLsiSameRange",
+                "KeySchema": [
+                    {"AttributeName":"device","KeyType":"HASH"},
+                    {"AttributeName":"ts","KeyType":"RANGE"}
+                ],
+                "AttributeDefinitions": [
+                    {"AttributeName":"device","AttributeType":"S"},
+                    {"AttributeName":"ts","AttributeType":"N"}
+                ],
+                "LocalSecondaryIndexes": [{
+                    "IndexName": "redundant",
+                    "KeySchema": [
+                        {"AttributeName":"device","KeyType":"HASH"},
+                        {"AttributeName":"ts","KeyType":"RANGE"}
+                    ],
+                    "Projection": {"ProjectionType":"ALL"}
+                }]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(body["__type"]
+        .as_str()
+        .unwrap()
+        .ends_with("#ValidationException"));
+    assert!(body["message"]
+        .as_str()
+        .unwrap()
+        .contains("must differ from"));
+}
