@@ -457,6 +457,11 @@ fn build_index_shape<'a>(
         sk_col,
         sk_type,
         jsonb_col: &schema.jsonb_col,
+        // Index shapes target a GSI/LSI for *reads* (Query/Scan). The
+        // dual_write_cols slice is irrelevant on the read path — the
+        // SQL doesn't reference them; the index lives on the column
+        // PG owns.
+        dual_write_cols: &[],
     }
 }
 
@@ -611,7 +616,8 @@ async fn handle_put_item(state: &AppState, body: &Bytes) -> Result<Response, Api
     let schema = &entry.schema;
 
     let plan = translate_put_item(&req, schema)?;
-    let shape = schema.shape();
+    let dwc = schema.dual_write_cols();
+    let shape = schema.shape_with_dual_write(&dwc);
 
     // Conditional + unconditional both come back through the same
     // "(pre-image, item)" surface; the only branch is which backend
@@ -706,7 +712,8 @@ async fn handle_delete_item(state: &AppState, body: &Bytes) -> Result<Response, 
     let schema = &entry.schema;
 
     let plan = translate_delete_item(&req, schema)?;
-    let shape = schema.shape();
+    let dwc = schema.dual_write_cols();
+    let shape = schema.shape_with_dual_write(&dwc);
 
     let old_item = match plan.condition.as_ref() {
         None => {
@@ -739,6 +746,8 @@ async fn handle_update_item(state: &AppState, body: &Bytes) -> Result<Response, 
     let schema = &entry.schema;
 
     let plan = translate_update_item(&req, schema)?;
+    let dwc = schema.dual_write_cols();
+    let shape = schema.shape_with_dual_write(&dwc);
 
     // Slow-path predicate: the fast paths require *both* a simple
     // UpdateExpression (top-level SET=literal + REMOVE only) *and* a
@@ -770,7 +779,7 @@ async fn handle_update_item(state: &AppState, body: &Bytes) -> Result<Response, 
             state
                 .backend
                 .update_simple_raw(
-                    &schema.shape(),
+                    &shape,
                     &plan.pk,
                     plan.sk.as_ref(),
                     &prims.insert_item,
@@ -783,7 +792,7 @@ async fn handle_update_item(state: &AppState, body: &Bytes) -> Result<Response, 
             let insert_item = materialize_insert_only_update(&plan, &req.key)?;
             state
                 .backend
-                .update_insert_only_raw(&schema.shape(), &insert_item)
+                .update_insert_only_raw(&shape, &insert_item)
                 .await?
         }
         Some(ConditionRouting::SimpleSql) => {
@@ -804,7 +813,7 @@ async fn handle_update_item(state: &AppState, body: &Bytes) -> Result<Response, 
             state
                 .backend
                 .update_with_simple_condition_raw(
-                    &schema.shape(),
+                    &shape,
                     &plan.pk,
                     plan.sk.as_ref(),
                     &sets_borrowed,
@@ -1119,9 +1128,11 @@ async fn handle_batch_write_item(state: &AppState, body: &Bytes) -> Result<Respo
                     table_plan.table_name
                 ))
             })?;
+        let dwc = schema.dual_write_cols();
+        let shape = schema.shape_with_dual_write(&dwc);
         state
             .backend
-            .batch_write_raw(&schema.shape(), &table_plan.ops)
+            .batch_write_raw(&shape, &table_plan.ops)
             .await?;
     }
 
@@ -1260,12 +1271,28 @@ async fn handle_transact_write_items(
     // per-item. Each shape is borrowed from the snapshot's schemas
     // map; the Arc<CatalogSnapshot> keeps the borrow valid for the
     // call's lifetime, which is also the ConditionEvalFn lifetime ('a).
+    //
+    // PLAN-9 G3/G4: per-item DualWrite GSI column slices are hoisted
+    // into a parallel vec so each shape can borrow a stable slice for
+    // the lifetime of ops. The Vec<Vec<DualWriteCol>> lives in this
+    // function's scope.
+    let dwc_per_item: Vec<Vec<rekt_storage::DualWriteCol<'_>>> = plan
+        .items
+        .iter()
+        .map(|item| {
+            snapshot
+                .schemas
+                .get(&item.table_name)
+                .map(|s| s.dual_write_cols())
+                .unwrap_or_default()
+        })
+        .collect();
     let mut ops: Vec<TransactWriteOp<'_>> = Vec::with_capacity(plan.items.len());
-    for plan_item in plan.items.into_iter() {
+    for (idx, plan_item) in plan.items.into_iter().enumerate() {
         let schema = snapshot.schemas.get(&plan_item.table_name).ok_or_else(|| {
             ApiError::ResourceNotFound(format!("Table not found: {}", plan_item.table_name))
         })?;
-        let shape = schema.shape();
+        let shape = schema.shape_with_dual_write(&dwc_per_item[idx]);
         let condition_fn: Option<rekt_storage::ConditionEvalFn<'_>> =
             plan_item.condition.as_ref().map(|cp| {
                 let cond = cp.condition.clone();
@@ -1450,9 +1477,11 @@ async fn dispatch_slow_path(
         }
     };
 
+    let dwc = schema.dual_write_cols();
+    let shape = schema.shape_with_dual_write(&dwc);
     let outcome = state
         .backend
-        .update_general_rmw_raw(&schema.shape(), &plan.pk, plan.sk.as_ref(), Box::new(apply))
+        .update_general_rmw_raw(&shape, &plan.pk, plan.sk.as_ref(), Box::new(apply))
         .await?;
 
     let paths = touched_paths(&plan.expression);

@@ -531,6 +531,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         let s = backend.shape_sql(&shape);
         // Sanity: the cached entry was produced and is reusable.
@@ -574,6 +575,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         let item = serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}});
         let _ = pg_put(&backend, &shape, &item).await;
@@ -643,6 +645,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "doc",
+            dual_write_cols: &[],
         };
 
         // 38-digit precision number.
@@ -714,6 +717,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "meta",
+            dual_write_cols: &[],
         };
         // base64 of "\x00\x01\x02\xff" is "AAEC/w==".
         let item = serde_json::json!({"hash":{"B":"AAEC/w=="},"extent":{"N":"4"}});
@@ -763,6 +767,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         // JSONB has no `id` attr — generated column yields NULL — PRIMARY KEY
         // rejects. The pk_value we bind to the CTE is a separate concern (it
@@ -806,6 +811,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         let item = serde_json::json!({"id":{"S":"alice"},"label":{"S":"A"}});
         let _ = pg_put(&backend, &shape, &item).await;
@@ -869,6 +875,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "doc",
+            dual_write_cols: &[],
         };
         let item_a = serde_json::json!({"device_id":{"S":"d1"},"ts":{"N":"100"},"v":{"N":"1"}});
         let item_b = serde_json::json!({"device_id":{"S":"d1"},"ts":{"N":"200"},"v":{"N":"2"}});
@@ -952,6 +959,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         let insert_item =
@@ -995,6 +1003,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         // Seed an item that has `name` and `untouched`.
@@ -1056,6 +1065,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         let original = serde_json::json!({
@@ -1110,6 +1120,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         let original = serde_json::json!({
@@ -1173,6 +1184,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "doc",
+            dual_write_cols: &[],
         };
 
         // Upsert via update on a missing composite-key row.
@@ -1256,6 +1268,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         // Cover S, N, B, BOOL, NULL, L, M, SS, NS, BS — every variant.
@@ -1329,6 +1342,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         let item = serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}});
@@ -1359,6 +1373,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         let original = serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}});
@@ -1411,6 +1426,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "doc",
+            dual_write_cols: &[],
         };
 
         let first = serde_json::json!({
@@ -1495,6 +1511,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         let _ = pg_put(&backend, &shape, &serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}})).await;
@@ -1539,6 +1556,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         let new_name = serde_json::json!({"S":"x"});
@@ -1573,6 +1591,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         let _ = pg_put(&backend, &shape, &serde_json::json!({"id":{"S":"u1"},"version":{"N":"3"}})).await;
@@ -1634,6 +1653,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         let _ = pg_put(&backend, &shape, &serde_json::json!({"id":{"S":"u1"},"score":{"N":"42"}})).await;
@@ -1693,6 +1713,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         let _ = pg_put(&backend, &shape, &serde_json::json!({ "id":{"S":"u1"}, "flag":{"S":"active"}, "version":{"N":"1"}, })).await;
@@ -1760,6 +1781,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         let _ = pg_put(&backend, &shape, &serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}})).await;
@@ -1818,6 +1840,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         let new_item = serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}});
@@ -1859,6 +1882,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         let original = serde_json::json!({"id":{"S":"u1"},"tally":{"N":"5"}});
@@ -1910,6 +1934,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         let original = serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}});
@@ -1957,6 +1982,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: &shape_owned.2,
+                    dual_write_cols: &[],
         };
         let init_item = serde_json::json!({"id":{"S":"u1"},"tally":{"N":"0"}});
         backend
@@ -1980,6 +2006,7 @@ mod tests {
                     sk_col: None,
                     sk_type: None,
                     jsonb_col: &shape_owned.2,
+                    dual_write_cols: &[],
                 };
                 let apply: GeneralUpdateFn<'_> = Box::new(move |existing| {
                     let existing = existing.expect("row should be present");
@@ -2018,6 +2045,7 @@ mod tests {
                     sk_col: None,
                     sk_type: None,
                     jsonb_col: &shape_owned.2,
+                    dual_write_cols: &[],
                 },
                 &KeyValue::S("u1".into()),
                 None,
@@ -2095,6 +2123,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         let _ = pg_put(&backend, &shape, &serde_json::json!({"id":{"S":"u1"},"tally":{"N":"10"}})).await;
@@ -2143,6 +2172,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         let _ = pg_put(&backend, &shape, &serde_json::json!({"id":{"S":"u1"},"tags":{"SS":["a","b"]}})).await;
@@ -2198,6 +2228,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         let _ = pg_put(&backend, &shape, &serde_json::json!({"id":{"S":"u1"},"tags":{"SS":["a","b"]},"keep":{"S":"x"}})).await;
@@ -2251,6 +2282,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         let _ = pg_put(&backend, &shape, &serde_json::json!({"id":{"S":"u1"},"label":{"S":"alice"}})).await;
@@ -2324,6 +2356,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         let err = backend
             .get_item_raw(&shape, &KeyValue::S("u1".into()), None)
@@ -2360,6 +2393,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "doc",
+            dual_write_cols: &[],
         };
         for ts in ["3000", "1000", "2000"] {
             let item =
@@ -2410,6 +2444,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "doc",
+            dual_write_cols: &[],
         };
         for ts in ["100", "200", "300", "400", "500"] {
             pg_put(
@@ -2531,6 +2566,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::S),
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         for ts in ["2026-01-01", "2026-01-02", "2026-02-01", "2027-01-01"] {
             pg_put(
@@ -2605,6 +2641,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "doc",
+            dual_write_cols: &[],
         };
         for ts in 1..=10 {
             pg_put(
@@ -2664,6 +2701,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "doc",
+            dual_write_cols: &[],
         };
         for ts in 1..=5 {
             pg_put(
@@ -2730,6 +2768,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "doc",
+            dual_write_cols: &[],
         };
         for ts in 1..=10 {
             pg_put(
@@ -2803,6 +2842,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::S),
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         for ts in [
             "2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04", "2026-02-01",
@@ -2909,6 +2949,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "doc",
+            dual_write_cols: &[],
         };
         for ts in 1..=5 {
             let flag = if ts % 2 == 1 { "on" } else { "off" };
@@ -2975,6 +3016,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "doc",
+            dual_write_cols: &[],
         };
         for ts in 1..=5 {
             pg_put(
@@ -3037,6 +3079,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "doc",
+            dual_write_cols: &[],
         };
         for ts in 1..=10 {
             let flag = if ts % 2 == 0 { "on" } else { "off" };
@@ -3105,6 +3148,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         for n in 1..=4 {
             pg_put(
@@ -3156,6 +3200,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "doc",
+            dual_write_cols: &[],
         };
         for (dev, ts) in [("d2", "10"), ("d1", "20"), ("d1", "10"), ("d2", "5")] {
             pg_put(
@@ -3220,6 +3265,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         let out = backend.scan_raw(&shape, None, None, None).await.unwrap();
         assert_eq!(out.count, 0);
@@ -3260,6 +3306,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "doc",
+            dual_write_cols: &[],
         };
         // 6 rows across 2 partitions; expected scan order is
         // (d1, 1), (d1, 2), (d1, 3), (d2, 1), (d2, 2), (d2, 3).
@@ -3341,6 +3388,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         for n in 1..=4 {
             let flag = if n % 2 == 0 { "on" } else { "off" };
@@ -3394,6 +3442,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "doc",
+            dual_write_cols: &[],
         };
         for ts in 1..=6 {
             pg_put(
@@ -3469,6 +3518,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         for k in ["AAEC", "AAED", "AAEE"] {
             pg_put(
@@ -3516,6 +3566,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         pg_put(
             &backend,
@@ -3564,6 +3615,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         for n in ["10", "1", "20", "2"] {
             pg_put(
@@ -3621,6 +3673,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         for n in ["10", "1", "20", "2"] {
             pg_put(
@@ -3674,6 +3727,7 @@ mod tests {
             sk_col: Some("binmark"),
             sk_type: Some(KeyType::B),
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         for b in ["AAA=", "AAE=", "AAI="] {
             pg_put(
@@ -3737,6 +3791,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         for n in ["a", "b", "c"] {
             let item = serde_json::json!({"id":{"S":n},"label":{"S":format!("L-{n}")}});
@@ -3793,6 +3848,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         for n in ["1", "2", "3"] {
             pg_put(&backend, &shape, &serde_json::json!({"id":{"N":n}})).await;
@@ -3833,6 +3889,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         // Insert items with B keys via DDB-base64-wire form.
         use base64::Engine;
@@ -3883,6 +3940,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         // Two partitions, three SK each.
         for dev in ["d1", "d2"] {
@@ -3936,6 +3994,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         let ops = vec![
             WriteOp::Put {
@@ -4006,6 +4065,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         let ops = vec![
             WriteOp::Put {
@@ -4065,6 +4125,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
 
         // Pre-seed two rows that will get deleted.
@@ -4135,6 +4196,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         let err = backend
             .batch_write_raw(
@@ -4164,6 +4226,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         let keys = vec![(KeyValue::S("x".into()), None)];
         let err = backend.batch_get_raw(&shape, &keys).await.unwrap_err();
@@ -4205,6 +4268,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         // Seed 100 rows across two partitions.
         for i in 0..100 {
@@ -4262,6 +4326,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         let ops: Vec<WriteOp> = (0..25)
             .map(|i| WriteOp::Put {
@@ -4317,6 +4382,7 @@ mod tests {
             sk_col: Some("binmark"),
             sk_type: Some(KeyType::B),
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         use base64::Engine;
         for raw in [b"\x00\x01" as &[u8], b"\x00\x02", b"\x00\x03"] {
@@ -4380,6 +4446,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         for n in ["a", "b", "c"] {
             let item = serde_json::json!({"id":{"S":n},"label":{"S":format!("L-{n}")}});
@@ -4452,6 +4519,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         for n in 1..=3 {
             let item = serde_json::json!({
@@ -4526,6 +4594,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         // Seed one row, leave a second pending for the concurrent insert.
         pg_put(
@@ -4612,6 +4681,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         let shape_b = TableShape {
             table: "rekt_t_tg_xb",
@@ -4620,6 +4690,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "doc",
+            dual_write_cols: &[],
         };
         pg_put(
             &backend,
@@ -4694,6 +4765,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         let ops = vec![
             TransactWriteOp::Put {
@@ -4753,6 +4825,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         // Seed a row whose condition will fail.
         pg_put(
@@ -4849,6 +4922,7 @@ mod tests {
             sk_col: Some("ts"),
             sk_type: Some(KeyType::N),
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         let ops = vec![TransactWriteOp::Put {
             shape: shape.clone(),
@@ -4899,6 +4973,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         for n in ["a", "b"] {
             pg_put(
@@ -4958,6 +5033,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         pg_put(
             &backend,
@@ -5031,6 +5107,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         // Don't seed "guard" — attribute_exists(id) will fail.
         use rekt_expressions::{parse_condition_expression, substitute_condition};
@@ -5105,6 +5182,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         pg_put(
             &backend,
@@ -5166,6 +5244,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         let apply: rekt_storage::GeneralUpdateFn<'_> = Box::new(|existing| {
             let mut new_item = existing.cloned().unwrap_or_else(
@@ -5222,6 +5301,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         // Apply closure that always returns Fail — simulates a failing
         // condition wrapped inside the closure.
@@ -5273,6 +5353,7 @@ mod tests {
             sk_col: None,
             sk_type: None,
             jsonb_col: "data",
+            dual_write_cols: &[],
         };
         let ops = vec![TransactGetOp {
             shape,

@@ -967,6 +967,7 @@ impl DdlBackend for MockDdlBackend {
                         sort_attr: plan.sort_attr.clone(),
                         sort_type: plan.sort_type,
                         sort_pg_col: plan.sort_attr.clone(),
+                        is_dual_write: true,
                         serveable: false,
                         unserveable_reason: Some("DualWrite GSI in CREATING phase".into()),
                     },

@@ -1,6 +1,6 @@
 //! Table-schema metadata shared between the translator and the storage layer.
 
-use rekt_storage::{KeyType, TableShape};
+use rekt_storage::{DualWriteCol, KeyType, TableShape};
 use std::collections::HashMap;
 
 /// Description of a table that the translator and the storage layer agree on.
@@ -41,6 +41,12 @@ pub struct GsiSchema {
     pub sort_attr: Option<String>,
     pub sort_type: Option<KeyType>,
     pub sort_pg_col: Option<String>,
+    /// PLAN-9 D17 / G3. True when this GSI was created via
+    /// UpdateTable.Create (regular column populated by rektifier's
+    /// SQL at every INSERT/UPDATE). False for Generated-mode GSIs
+    /// (PG owns the column via GENERATED ALWAYS AS ... STORED;
+    /// write-path SQL ignores them).
+    pub is_dual_write: bool,
     pub serveable: bool,
     pub unserveable_reason: Option<String>,
 }
@@ -68,6 +74,26 @@ pub struct LsiSchema {
 
 impl TableSchema {
     /// Borrow as a `TableShape` for handing to the storage layer.
+    /// Caller supplies the borrowed DualWriteCol slice; use
+    /// `dual_write_cols()` to materialize it from the GSI map.
+    pub fn shape_with_dual_write<'a>(
+        &'a self,
+        dual_write_cols: &'a [DualWriteCol<'a>],
+    ) -> TableShape<'a> {
+        TableShape {
+            table: &self.pg_table,
+            pk_col: &self.pk_attr,
+            pk_type: self.pk_type,
+            sk_col: self.sk_attr.as_deref(),
+            sk_type: self.sk_type,
+            jsonb_col: &self.jsonb_col,
+            dual_write_cols,
+        }
+    }
+
+    /// Convenience: empty DualWrite slice — for read-path operations
+    /// (Get, Query, Scan) where DualWrite columns are read but never
+    /// written, the slice is irrelevant.
     pub fn shape(&self) -> TableShape<'_> {
         TableShape {
             table: &self.pg_table,
@@ -76,7 +102,68 @@ impl TableSchema {
             sk_col: self.sk_attr.as_deref(),
             sk_type: self.sk_type,
             jsonb_col: &self.jsonb_col,
+            dual_write_cols: &[],
         }
+    }
+
+    /// PLAN-9 G3. Materialize the DualWrite-mode GSI columns into a
+    /// Vec the caller borrows from when building a write-path
+    /// TableShape. Each entry is one DualWriteCol per GSI key column
+    /// (partition + optional sort). Skipped: Generated-mode GSIs
+    /// (PG owns), and DualWrite GSIs that share an attribute with the
+    /// base PK/SK or any other already-emitted DualWrite column
+    /// (refcount dedup per D9).
+    pub fn dual_write_cols(&self) -> Vec<DualWriteCol<'_>> {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        // Reserve names that PG already owns (GENERATED on base + LSI +
+        // Generated-mode GSI columns). Those columns cannot be in
+        // INSERT/UPDATE column lists.
+        seen.insert(self.pk_attr.as_str());
+        if let Some(sk) = self.sk_attr.as_deref() {
+            seen.insert(sk);
+        }
+        for lsi in self.lsis.values() {
+            seen.insert(lsi.sort_pg_col.as_str());
+        }
+        for gsi in self.gsis.values() {
+            if !gsi.is_dual_write {
+                // Generated-mode columns are PG-owned; never written.
+                seen.insert(gsi.partition_pg_col.as_str());
+                if let Some(s) = gsi.sort_pg_col.as_deref() {
+                    seen.insert(s);
+                }
+            }
+        }
+        let mut out: Vec<DualWriteCol<'_>> = Vec::new();
+        for gsi in self.gsis.values() {
+            if !gsi.is_dual_write {
+                continue;
+            }
+            if seen.insert(gsi.partition_pg_col.as_str()) {
+                out.push(DualWriteCol {
+                    col: &gsi.partition_pg_col,
+                    attr: &gsi.partition_attr,
+                    key_type: gsi.partition_type,
+                });
+            }
+            if let (Some(col), Some(attr), Some(t)) = (
+                gsi.sort_pg_col.as_deref(),
+                gsi.sort_attr.as_deref(),
+                gsi.sort_type,
+            ) {
+                if seen.insert(col) {
+                    out.push(DualWriteCol {
+                        col,
+                        attr,
+                        key_type: t,
+                    });
+                }
+            }
+        }
+        // Stable order — column name lex sort. Keeps SQL deterministic
+        // for cache-key derivation and easier debugging.
+        out.sort_by(|a, b| a.col.cmp(b.col));
+        out
     }
 
     /// PLAN-11 L4. Build a `TableShape` that targets an LSI. PK stays
@@ -92,6 +179,7 @@ impl TableSchema {
             sk_col: Some(&lsi.sort_pg_col),
             sk_type: Some(lsi.sort_type),
             jsonb_col: &self.jsonb_col,
+            dual_write_cols: &[],
         }
     }
 
@@ -106,6 +194,7 @@ impl TableSchema {
             sk_col: gsi.sort_pg_col.as_deref(),
             sk_type: gsi.sort_type,
             jsonb_col: &self.jsonb_col,
+            dual_write_cols: &[],
         }
     }
 }

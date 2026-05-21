@@ -48,6 +48,25 @@ impl KeyValue {
     }
 }
 
+/// PLAN-9 G3. Per-DualWrite-GSI column descriptor passed through
+/// `TableShape` to the storage layer. The storage layer widens
+/// INSERT/UPDATE SQL by extracting `data#>>'{attr,T}'` per column at
+/// write time (PG does the work; rektifier is "the only writer" in
+/// the sense that this SQL is the only path that touches `data` and
+/// the GSI column together). Generated-mode GSIs do NOT appear here
+/// — PG's GENERATED expression handles them.
+#[derive(Debug, Clone, Copy)]
+pub struct DualWriteCol<'a> {
+    /// PG column name (e.g. `tier`).
+    pub col: &'a str,
+    /// DDB attribute name (e.g. `tier`). Combined with `key_type` to
+    /// build the `data#>>'{attr,T}'` extraction.
+    pub attr: &'a str,
+    /// Column SQL type — also drives the cast for N (`::numeric`) and
+    /// the decoding for B.
+    pub key_type: KeyType,
+}
+
 /// Underlying-backend table shape. For PG: real table name + column names
 /// + declared key types. `sk_col = None` means hash-only.
 ///
@@ -62,6 +81,10 @@ pub struct TableShape<'a> {
     pub sk_col: Option<&'a str>,
     pub sk_type: Option<KeyType>,
     pub jsonb_col: &'a str,
+    /// PLAN-9 G3. DualWrite-mode GSI columns whose values are derived
+    /// from the JSONB at write time. Empty for the common case (no
+    /// DualWrite GSIs).
+    pub dual_write_cols: &'a [DualWriteCol<'a>],
 }
 
 #[derive(Debug, thiserror::Error)]

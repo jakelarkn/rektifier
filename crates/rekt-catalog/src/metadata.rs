@@ -159,6 +159,7 @@ pub fn row_to_entry(row: MetadataRow) -> Result<TableEntry, CatalogError> {
                     sort_attr: s.sort_attr.clone(),
                     sort_type: s.sort_type,
                     sort_pg_col: s.sort_pg_col.clone(),
+                    is_dual_write: matches!(s.mode, crate::GsiMode::DualWrite),
                     serveable: s.serveable,
                     unserveable_reason: s.unserveable_reason.clone(),
                 },

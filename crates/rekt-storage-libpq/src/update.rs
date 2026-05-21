@@ -36,6 +36,14 @@ impl RmwSqlPrep {
         let pk_cast = cast_for_keytype(shape.pk_type);
         let pk_pg = pg_type_for_keytype(shape.pk_type);
 
+        // PLAN-9 G3. DualWrite GSI SET clauses on the UPDATE side: each
+        // extracts from $1 (the new JSONB being written by the RMW path).
+        let dwc_set_from_param1: String = shape
+            .dual_write_cols
+            .iter()
+            .map(|c| format!(", {}", crate::shape::dual_write_set_from_param(1, c)))
+            .collect();
+
         let (select_sql, update_sql, key_types) = match (shape.sk_col, shape.sk_type) {
             (None, _) => (
                 format!(
@@ -43,7 +51,7 @@ impl RmwSqlPrep {
                      WHERE {pk_col} = $1{pk_cast} FOR UPDATE"
                 ),
                 format!(
-                    "UPDATE {table} SET {jsonb_col} = $1 \
+                    "UPDATE {table} SET {jsonb_col} = $1{dwc_set_from_param1} \
                      WHERE {pk_col} = $2{pk_cast}"
                 ),
                 vec![pk_pg.clone()],
@@ -58,7 +66,7 @@ impl RmwSqlPrep {
                          WHERE {pk_col} = $1{pk_cast} AND {sk_col_q} = $2{sk_cast} FOR UPDATE"
                     ),
                     format!(
-                        "UPDATE {table} SET {jsonb_col} = $1 \
+                        "UPDATE {table} SET {jsonb_col} = $1{dwc_set_from_param1} \
                          WHERE {pk_col} = $2{pk_cast} AND {sk_col_q} = $3{sk_cast}"
                     ),
                     vec![pk_pg, sk_pg],
@@ -200,14 +208,34 @@ pub(crate) fn build_update_sql(
         expr = format!("({expr}) - ${name_p}::text");
     }
 
+    // PLAN-9 G3. DualWrite GSI columns: on INSERT (no conflict),
+    // extract from the inserted JSONB param; on UPDATE (conflict),
+    // recompute from the `{expr}` value that produces the new JSONB.
+    let dwc_insert_cols: String = shape
+        .dual_write_cols
+        .iter()
+        .map(|c| format!(", {}", crate::types::quote_ident(c.col)))
+        .collect();
+    let dwc_insert_values: String = shape
+        .dual_write_cols
+        .iter()
+        .map(|c| format!(", {}", crate::shape::dual_write_extract_expr(insert_param_idx, c)))
+        .collect();
+    let dwc_do_update_set: String = shape
+        .dual_write_cols
+        .iter()
+        .map(|c| format!(", {}", crate::shape::dual_write_set_from_expr(&expr, c)))
+        .collect();
+
     // The `prev` CTE reads the pre-update row at the same statement
     // snapshot as the upsert, so old_data is the value that existed
     // *before* this statement ran.
     format!(
         "WITH prev AS (SELECT {jsonb_col} AS old_data FROM {table} WHERE {cte_where}) \
-         INSERT INTO {table} ({jsonb_col}) VALUES (${insert_param_idx}::jsonb) \
+         INSERT INTO {table} ({jsonb_col}{dwc_insert_cols}) \
+         VALUES (${insert_param_idx}::jsonb{dwc_insert_values}) \
          ON CONFLICT ({conflict_cols}) \
-         DO UPDATE SET {jsonb_col} = {expr} \
+         DO UPDATE SET {jsonb_col} = {expr}{dwc_do_update_set} \
          RETURNING {jsonb_col} AS new_data, (SELECT old_data FROM prev) AS old_data"
     )
 }
@@ -225,8 +253,23 @@ pub(crate) fn build_insert_only_sql(shape: &TableShape<'_>) -> String {
         Some(sk) => format!("{pk_col}, {sk}", sk = quote_ident(sk)),
     };
 
+    // PLAN-9 G3. DualWrite GSI columns: on the INSERT side, extract
+    // from $1 (the synthesized full row). DO NOTHING handles the
+    // conflict case — no UPDATE SET clause needed.
+    let dwc_insert_cols: String = shape
+        .dual_write_cols
+        .iter()
+        .map(|c| format!(", {}", crate::types::quote_ident(c.col)))
+        .collect();
+    let dwc_insert_values: String = shape
+        .dual_write_cols
+        .iter()
+        .map(|c| format!(", {}", crate::shape::dual_write_extract_expr(1, c)))
+        .collect();
+
     format!(
-        "INSERT INTO {table} ({jsonb_col}) VALUES ($1::jsonb) \
+        "INSERT INTO {table} ({jsonb_col}{dwc_insert_cols}) \
+         VALUES ($1::jsonb{dwc_insert_values}) \
          ON CONFLICT ({conflict_cols}) DO NOTHING \
          RETURNING {jsonb_col}"
     )
@@ -373,6 +416,14 @@ pub(crate) async fn update_with_simple_condition_raw(
     }
     let cond_sql = compile_condition(&mut builder, &data_ref, condition)?;
 
+    // PLAN-9 G3. DualWrite columns recompute from the same `{expr}`
+    // that produces the new JSONB.
+    let dwc_set_clauses: String = shape
+        .dual_write_cols
+        .iter()
+        .map(|c| format!(", {}", crate::shape::dual_write_set_from_expr(&expr, c)))
+        .collect();
+
     // The `prev` CTE captures pre-update state at the same
     // statement snapshot. The UPDATE adds the user's condition;
     // the CTE intentionally does NOT — we want the old item even
@@ -381,7 +432,7 @@ pub(crate) async fn update_with_simple_condition_raw(
     // prev).
     let sql = format!(
         "WITH prev AS (SELECT {jsonb_ident} AS old_data FROM {table_ident} WHERE {key_predicate}) \
-         UPDATE {table_ident} SET {jsonb_ident} = {expr} \
+         UPDATE {table_ident} SET {jsonb_ident} = {expr}{dwc_set_clauses} \
          WHERE {key_predicate} AND ({cond_sql}) \
          RETURNING {jsonb_ident} AS new_data, (SELECT old_data FROM prev) AS old_data"
     );

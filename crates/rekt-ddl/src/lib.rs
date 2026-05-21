@@ -641,6 +641,7 @@ pub fn entry_for_new_table(plan: &CreateTablePlan) -> TableEntry {
                     sort_attr: s.sort_attr.clone(),
                     sort_type: s.sort_type,
                     sort_pg_col: s.sort_pg_col.clone(),
+                    is_dual_write: matches!(s.mode, rekt_catalog::GsiMode::DualWrite),
                     serveable: s.serveable,
                     unserveable_reason: s.unserveable_reason.clone(),
                 },
