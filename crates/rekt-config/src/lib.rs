@@ -30,6 +30,12 @@ use serde::{Deserialize, Deserializer};
 use std::net::SocketAddr;
 use std::path::Path;
 
+pub mod auth;
+pub use auth::{
+    ApiTokenConfig, AuthConfig, JwtConfig, JwtIssuerEntry, MasterKey, PermissiveConfig,
+    PrincipalFormatEntry, Sigv4Config,
+};
+
 // DDB-spec defaults applied when the server-level [limits] field is omitted.
 const DDB_DEFAULT_ITEM_SIZE_BYTES: u64 = 409_600; // 400 KB
 const DDB_DEFAULT_PARTITION_KEY_BYTES: u64 = 2_048; // 2 KB
@@ -101,6 +107,7 @@ pub struct Config {
     pub batch_limits: BatchLimits,
     pub pg: PgConfig,
     pub catalog: CatalogConfig,
+    pub auth: AuthConfig,
 }
 
 /// Tunables for the runtime table catalog (PLAN-10 KD4). Sensible
@@ -277,6 +284,8 @@ struct RawConfig {
     pg: Option<RawPg>,
     #[serde(default)]
     catalog: Option<RawCatalog>,
+    #[serde(default)]
+    auth: Option<auth::RawAuth>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -476,6 +485,7 @@ impl RawConfig {
 
         let pg = resolve_pg(self.pg.as_ref())?;
         let catalog = resolve_catalog(self.catalog.as_ref());
+        let auth_cfg = auth::resolve_auth(self.auth)?;
 
         Ok(Config {
             server: ServerConfig {
@@ -487,6 +497,7 @@ impl RawConfig {
             batch_limits,
             pg,
             catalog,
+            auth: auth_cfg,
         })
     }
 }

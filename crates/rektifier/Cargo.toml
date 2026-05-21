@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 description = "DynamoDB-compatible API in front of PostgreSQL (binary)"
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "rektifier"
 path = "src/main.rs"

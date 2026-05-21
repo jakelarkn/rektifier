@@ -2,19 +2,30 @@
 
 Workflows for the authentication surface shipped in PLAN-13.
 
+## Configuration
+
+Everything is configured via TOML at `REKTIFIER_CONFIG`; no code edits
+required. Pick verifiers from `[auth.sigv4]` / `[auth.api_token]` /
+`[[auth.jwt.issuer]]` / `[auth.permissive]`. See
+`rektifier.toml.example` for the full schema with every preset's
+parameter set. At least one verifier must be enabled — rektifier
+refuses to start with no verifier configured.
+
 ## Master key
 
 The AES-GCM credential encryption and the HMAC API-token pepper both
-derive from a single operator-supplied 32-byte master key. Three
-sources, exactly one configured when SigV4 or API tokens are enabled:
+derive from a single operator-supplied 32-byte master key under
+`[auth]`. Three sources, exactly one configured when SigV4 or API
+tokens are enabled:
 
 ```toml
-[auth.sigv4]
-enabled = true
-# Exactly one of:
+[auth]
 master_key_env  = "REKTIFIER_AUTH_MASTER_KEY"
 # master_key_file = "/etc/rektifier/master.key"
 # master_key_kms  = "aws-kms://arn:..."   # A2a / deferred
+
+[auth.sigv4]
+enabled = true
 ```
 
 The env / file value is 32 raw bytes, or 64 hex chars, or 44 chars

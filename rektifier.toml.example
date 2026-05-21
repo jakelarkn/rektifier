@@ -53,3 +53,82 @@ invalidate_on_local_ddl = true       # immediate reconcile after Create/Update/D
 # Tables are NOT declared in TOML as of PLAN-10 D8. Use the DDB
 # `CreateTable` API to provision them at runtime — see the
 # `bootstrap-tables` justfile recipe for an example.
+
+# =============================================================================
+# Authentication (PLAN-13).
+# =============================================================================
+#
+# At least one verifier must be enabled. Pick whichever schemes
+# match your environment:
+#
+#   [auth.sigv4]        — AWS SDK clients (drop-in compatible)
+#   [auth.api_token]    — opaque Bearer tokens (rekt_pat_… / rekt_svc_…)
+#   [[auth.jwt.issuer]] — Bearer JWT (gcp / azure / snowflake /
+#                         databricks / neon / aws-cognito / generic)
+#   [auth.permissive]   — DEV ONLY: accepts everything; loopback
+#                         bind + REKTIFIER_ALLOW_UNSAFE_AUTH required
+#
+# Master key (32 bytes, hex / base64 / raw) for AES-GCM credential
+# encryption + HMAC pepper. Required when sigv4 or api_token is
+# enabled. Exactly one source.
+[auth]
+master_key_env  = "REKTIFIER_AUTH_MASTER_KEY"
+# master_key_file = "/etc/rektifier/master.key"
+# master_key_kms  = "aws-kms://arn:..."   # A2a — not yet implemented
+audit_log_enabled = false  # emit per-request `auth.audit` info line
+
+# [auth.permissive]
+# enabled = true   # requires REKTIFIER_ALLOW_UNSAFE_AUTH=I_UNDERSTAND_THIS_IS_UNSAFE
+
+# [auth.sigv4]
+# enabled                  = true
+# clock_skew_secs          = 900
+# cache_ttl_secs           = 300
+# negative_cache_ttl_secs  = 30
+
+# [auth.api_token]
+# enabled                  = true
+# accept_test_tokens       = false
+# cache_ttl_secs           = 300
+# negative_cache_ttl_secs  = 30
+
+# Ecosystem JWT presets — one [[auth.jwt.issuer]] per trusted IdP.
+# [[auth.jwt.issuer]]
+# preset            = "gcp"
+# expected_audience = ["rektifier-prod"]
+
+# [[auth.jwt.issuer]]
+# preset            = "azure"
+# tenant_id         = "11111111-2222-3333-4444-555555555555"
+# expected_audience = ["api://rektifier"]
+
+# [[auth.jwt.issuer]]
+# preset            = "snowflake"
+# account           = "ab12345.us-east-1"
+# expected_audience = ["rektifier"]
+
+# [[auth.jwt.issuer]]
+# preset            = "databricks"
+# workspace_url     = "https://my-shard.cloud.databricks.com"
+# expected_audience = ["rektifier"]
+
+# [[auth.jwt.issuer]]
+# preset            = "neon"
+# project_id        = "proj-abc"
+# region            = "us-east-1"
+# expected_audience = ["rektifier"]
+
+# [[auth.jwt.issuer]]
+# preset            = "aws-cognito"
+# user_pool_id      = "us-east-1_abc123"
+# region            = "us-east-1"
+# expected_audience = ["rektifier"]
+
+# Generic OIDC (Auth0 / Keycloak / Okta / homegrown).
+# [[auth.jwt.issuer]]
+# preset            = "generic"
+# issuer            = "https://auth.example.com/"
+# jwks_url          = "https://auth.example.com/.well-known/jwks.json"
+# expected_audience = ["rektifier"]
+# principal_format  = { kind = "subject", prefix = "external:" }
+# # or: principal_format = { custom = "external:user:{sub}" }

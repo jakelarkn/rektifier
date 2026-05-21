@@ -85,28 +85,28 @@ The default config is `rektifier.toml.example`; copy it to
 
 ## Authentication
 
-PLAN-13 ships three auth primitives via the `rekt-auth` crate:
+Clients pick a scheme by their `Authorization` header; rektifier
+routes by prefix:
 
-- **Strict SigV4** for AWS SDK clients — secrets live in
-  `_rektifier_aws_credentials` AES-GCM-encrypted at rest, decrypted +
-  cached in-process so signature verification runs against memory on
-  the hot path (no STS round-trip, no per-request KMS call).
-- **JWT (Bearer)** with JWKS validation — multi-issuer, per-key
-  algorithm pinning (kills the HS256-with-RSA-pubkey alg-confusion
-  class), HTTPS-only JWKS URLs, boot-time warm-up. Presets ship for
-  GCP / Azure / Snowflake / Databricks / Neon / AWS Cognito.
-- **Opaque API tokens** with type-prefixed format
-  (`rekt_pat_…` / `rekt_svc_…`), HMAC-peppered hashes in
-  `_rektifier_api_tokens`, in-memory `TokenCache` mirroring the
-  SigV4 secret cache.
+| `Authorization` header                              | Scheme         |
+|-----------------------------------------------------|----------------|
+| `AWS4-HMAC-SHA256 Credential=AKIA…, …, Signature=…` | Strict SigV4   |
+| `Bearer eyJhbGciOi…<JWT>…`                          | JWT + JWKS     |
+| `Bearer rekt_pat_…` / `Bearer rekt_svc_…`           | Opaque API token |
+| *(missing)*                                         | Permissive (dev only) |
 
-The master key feeding AES-GCM credential encryption and the
-API-token HMAC pepper comes from one of `master_key_env` /
-`master_key_file` / `master_key_kms`; see
-[`docs/auth/runbook.md`](./docs/auth/runbook.md) for the operator
-workflow and [`docs/auth/role_separation.sql`](./docs/auth/role_separation.sql)
-for the PG role-separation script that locks down the credential
-and token tables.
+- **SigV4** — wire-compatible with AWS SDKs; secrets stored
+  AES-GCM-encrypted in `_rektifier_aws_credentials`, cached in-process.
+- **JWT** — multi-issuer with per-key alg pinning. Presets for GCP,
+  Azure (Entra ID), Snowflake, Databricks, Neon, AWS Cognito.
+- **API tokens** — type-prefixed bearer (`rekt_pat_…` / `rekt_svc_…`),
+  HMAC-peppered in `_rektifier_api_tokens`.
+
+Secret material derives from one operator-supplied master key
+(`master_key_env` / `master_key_file` / `master_key_kms`). See
+[`docs/auth/runbook.md`](./docs/auth/runbook.md) for workflows and
+[`docs/auth/role_separation.sql`](./docs/auth/role_separation.sql)
+for the PG-role lockdown script.
 
 ## Workspace layout
 

@@ -25,13 +25,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rektifier::auth_wiring;
+
 use anyhow::{Context, Result};
 use deadpool_postgres::{Manager, Pool};
 use rekt_catalog::{Reconciler, TableCatalog};
 use rekt_ddl::PgDdlBackend;
 use rekt_config::Config;
 use rekt_server::{router, AppState};
-use rekt_auth::AuthChain;
 use rekt_storage_libpq::PgBackend;
 use tokio_postgres::NoTls;
 use tracing_subscriber::EnvFilter;
@@ -98,7 +99,7 @@ async fn main() -> Result<()> {
         reconciler,
         config.catalog.invalidate_on_local_ddl,
     ));
-    let backend = PgBackend::new(pool).with_retry_policy(rek_retry_policy(&config));
+    let backend = PgBackend::new(pool.clone()).with_retry_policy(rek_retry_policy(&config));
     tracing::info!(
         max_attempts = config.pg.retry.max_attempts,
         initial_backoff_ms = config.pg.retry.initial_backoff_ms,
@@ -107,9 +108,13 @@ async fn main() -> Result<()> {
         "PG retry policy configured"
     );
 
+    let built_auth = auth_wiring::build_auth(&pool, config.server.listen_addr, &config.auth)
+        .await
+        .context("building auth chain")?;
+
     let state = AppState {
-        auth: Arc::new(AuthChain::permissive_only()),
-        audit_enabled: false,
+        auth: built_auth.chain,
+        audit_enabled: built_auth.audit_enabled,
         backend: Arc::new(backend),
         catalog,
         ddl,
@@ -120,9 +125,10 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.server.listen_addr)
         .await
         .with_context(|| format!("binding {}", config.server.listen_addr))?;
-    tracing::warn!(
+    tracing::info!(
         addr = %config.server.listen_addr,
-        "rektifier listening — PermissiveVerifier is active, do not expose this to untrusted networks"
+        audit_enabled = state.audit_enabled,
+        "rektifier listening"
     );
 
     axum::serve(listener, router(state))

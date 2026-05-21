@@ -119,6 +119,28 @@ pub fn neon(
     }
 }
 
+/// Generic OIDC issuer for IdPs without a dedicated preset (Auth0,
+/// Keycloak, Okta, homegrown). Operator supplies issuer + jwks_url +
+/// `principal_format` directly; defaults to RS256-only + 60s skew +
+/// 600s JWKS TTL + the standard safe-to-log allowlist.
+pub fn generic(
+    issuer: impl Into<String>,
+    jwks_url: impl Into<String>,
+    audience: impl Into<String>,
+    principal_format: PrincipalFormat,
+) -> JwtIssuerConfig {
+    JwtIssuerConfig {
+        issuer: issuer.into(),
+        jwks_url: jwks_url.into(),
+        expected_audience: vec![audience.into()],
+        allowed_algs: vec![Algorithm::RS256],
+        clock_skew: DEFAULT_CLOCK_SKEW,
+        jwks_cache_ttl: DEFAULT_JWKS_TTL,
+        principal_format,
+        safe_to_log_claims: vec!["iss".into(), "sub".into(), "aud".into()],
+    }
+}
+
 /// AWS Cognito user pool (common companion when running rektifier
 /// behind a Cognito-fronted gateway). Parameterised by region and
 /// user pool id.
