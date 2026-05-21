@@ -20,6 +20,49 @@ use sha1::{Digest, Sha1};
 const PG_IDENT_MAX: usize = 63;
 const PREFIX: &str = "rekt_t_";
 
+/// PLAN-11 D11. Derive a PG index identifier for an LSI on `pg_table`
+/// named `lsi_name`. Pattern: `<pg_table>_lsi_<sanitized_lsi>_idx`.
+/// Long composites are sha1-suffixed to fit inside the 63-byte PG
+/// identifier ceiling.
+pub fn derive_lsi_index_name(pg_table: &str, lsi_name: &str) -> String {
+    let sanitized_lsi: String = lsi_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let sanitized_lsi = sanitized_lsi.trim_start_matches('_');
+    let candidate = format!("{pg_table}_lsi_{sanitized_lsi}_idx");
+    if candidate.len() <= PG_IDENT_MAX {
+        return candidate;
+    }
+    // Fit `<pg_table>_lsi_<body>_<8hex>_idx` within 63 bytes.
+    //   pg_table             ~ <= 63
+    //   "_lsi_"              = 5
+    //   8-char hash + '_'    = 9
+    //   "_idx"               = 4
+    // Truncate body so the whole thing fits. Hash of (pg_table, lsi_name)
+    // disambiguates collisions in the truncated form.
+    let mut hasher = Sha1::new();
+    hasher.update(pg_table.as_bytes());
+    hasher.update(b"::");
+    hasher.update(lsi_name.as_bytes());
+    let digest = hasher.finalize();
+    let hex8: String = digest
+        .iter()
+        .take(4)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let fixed_len = pg_table.len() + "_lsi_".len() + "_".len() + hex8.len() + "_idx".len();
+    let body_budget = PG_IDENT_MAX.saturating_sub(fixed_len);
+    let body: String = sanitized_lsi.chars().take(body_budget).collect();
+    format!("{pg_table}_lsi_{body}_{hex8}_idx")
+}
+
 pub fn sanitize_pg_table_name(ddb_name: &str) -> String {
     let lowered: String = ddb_name
         .chars()
@@ -114,5 +157,51 @@ mod tests {
     #[test]
     fn digits_preserved() {
         assert_eq!(sanitize_pg_table_name("orders2024"), "rekt_t_orders2024");
+    }
+
+    // ===== derive_lsi_index_name ============================================
+
+    #[test]
+    fn lsi_index_name_basic() {
+        assert_eq!(
+            derive_lsi_index_name("rekt_t_events", "by_status"),
+            "rekt_t_events_lsi_by_status_idx"
+        );
+    }
+
+    /// LSI names with dots/dashes from the DDB grammar collapse to
+    /// underscores in the PG identifier.
+    #[test]
+    fn lsi_index_name_sanitizes_disallowed_chars() {
+        assert_eq!(
+            derive_lsi_index_name("rekt_t_events", "by-status.v2"),
+            "rekt_t_events_lsi_by_status_v2_idx"
+        );
+    }
+
+    /// Long composite (long pg_table + long lsi_name) collapses through
+    /// the sha1-suffix path and stays under the 63-byte ceiling.
+    #[test]
+    fn lsi_index_name_long_collision_safe_under_63_bytes() {
+        let long_table = "rekt_t_aVeryLongTableNameThatFillsTheBudget";
+        let lsi = "by_some_really_long_index_attribute_name";
+        let idx = derive_lsi_index_name(long_table, lsi);
+        assert!(idx.len() <= 63, "got {idx} ({} bytes)", idx.len());
+        assert!(idx.starts_with(long_table));
+        assert!(idx.ends_with("_idx"));
+        // Deterministic for the same input.
+        assert_eq!(idx, derive_lsi_index_name(long_table, lsi));
+    }
+
+    /// Different LSI names on the same long table get distinct suffixes.
+    #[test]
+    fn lsi_index_name_distinct_on_collision_in_truncated_form() {
+        let long_table = "rekt_t_aVeryLongTableNameThatFillsTheBudget";
+        let a = "by_some_really_long_index_attribute_name_one";
+        let b = "by_some_really_long_index_attribute_name_two";
+        assert_ne!(
+            derive_lsi_index_name(long_table, a),
+            derive_lsi_index_name(long_table, b)
+        );
     }
 }

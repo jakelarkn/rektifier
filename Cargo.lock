@@ -1420,6 +1420,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "thiserror 1.0.69",
+ "tokio",
  "tokio-postgres",
  "tracing",
 ]
